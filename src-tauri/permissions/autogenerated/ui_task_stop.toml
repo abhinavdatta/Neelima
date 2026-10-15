@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-task-stop"
+description = "Enables the ui_task_stop command without any pre-configured scope."
+commands.allow = ["ui_task_stop"]
+
+[[permission]]
+identifier = "deny-ui-task-stop"
+description = "Denies the ui_task_stop command without any pre-configured scope."
+commands.deny = ["ui_task_stop"]

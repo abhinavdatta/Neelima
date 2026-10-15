@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-task-continue"
+description = "Enables the ui_task_continue command without any pre-configured scope."
+commands.allow = ["ui_task_continue"]
+
+[[permission]]
+identifier = "deny-ui-task-continue"
+description = "Denies the ui_task_continue command without any pre-configured scope."
+commands.deny = ["ui_task_continue"]

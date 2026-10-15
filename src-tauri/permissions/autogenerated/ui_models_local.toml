@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-models-local"
+description = "Enables the ui_models_local command without any pre-configured scope."
+commands.allow = ["ui_models_local"]
+
+[[permission]]
+identifier = "deny-ui-models-local"
+description = "Denies the ui_models_local command without any pre-configured scope."
+commands.deny = ["ui_models_local"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-workspace-add"
+description = "Enables the ui_workspace_add command without any pre-configured scope."
+commands.allow = ["ui_workspace_add"]
+
+[[permission]]
+identifier = "deny-ui-workspace-add"
+description = "Denies the ui_workspace_add command without any pre-configured scope."
+commands.deny = ["ui_workspace_add"]

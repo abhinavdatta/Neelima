@@ -1,0 +1,38 @@
+[package]
+name = "neelima"
+description = "Neelima — local-first agentic coding app. Embeds the AI provider's own web chat (your account, your login) or local models, and lets them read and modify files in your workspace. No cloud model APIs, no API keys, no telemetry."
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+default-run = "neelima"
+
+[lib]
+name = "neelima_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "neelima"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+portable-pty = "0.8"
+notify = "8"
+regex = "1"
+ignore = "0.4"
+globset = "0.4"
+dunce = "1"
+similar = "2"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

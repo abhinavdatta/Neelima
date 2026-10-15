@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-webview-mode"
+description = "Enables the ui_webview_mode command without any pre-configured scope."
+commands.allow = ["ui_webview_mode"]
+
+[[permission]]
+identifier = "deny-ui-webview-mode"
+description = "Denies the ui_webview_mode command without any pre-configured scope."
+commands.deny = ["ui_webview_mode"]

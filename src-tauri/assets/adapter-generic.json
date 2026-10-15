@@ -1,0 +1,17 @@
+{
+  "id": "generic-template",
+  "name": "Generic (fill with the Adapter Inspector)",
+  "url": "https://example.com/",
+  "selectors": {
+    "input": "textarea",
+    "send_button": "button[type=submit]",
+    "stop_button": null,
+    "messages": "main",
+    "new_chat": null,
+    "logged_in": null
+  },
+  "input": { "kind": "textarea", "max_chars": 8000 },
+  "quiet_ms": 2000,
+  "response_timeout_ms": 300000,
+  "built_in": true
+}

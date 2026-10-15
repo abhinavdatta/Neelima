@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-adapter-finish-inspector"
+description = "Enables the ui_adapter_finish_inspector command without any pre-configured scope."
+commands.allow = ["ui_adapter_finish_inspector"]
+
+[[permission]]
+identifier = "deny-ui-adapter-finish-inspector"
+description = "Denies the ui_adapter_finish_inspector command without any pre-configured scope."
+commands.deny = ["ui_adapter_finish_inspector"]

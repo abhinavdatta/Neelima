@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lb-bridge"
+description = "Enables the lb_bridge command without any pre-configured scope."
+commands.allow = ["lb_bridge"]
+
+[[permission]]
+identifier = "deny-lb-bridge"
+description = "Denies the lb_bridge command without any pre-configured scope."
+commands.deny = ["lb_bridge"]

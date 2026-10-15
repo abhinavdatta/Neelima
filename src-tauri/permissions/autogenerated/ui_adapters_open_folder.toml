@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-adapters-open-folder"
+description = "Enables the ui_adapters_open_folder command without any pre-configured scope."
+commands.allow = ["ui_adapters_open_folder"]
+
+[[permission]]
+identifier = "deny-ui-adapters-open-folder"
+description = "Denies the ui_adapters_open_folder command without any pre-configured scope."
+commands.deny = ["ui_adapters_open_folder"]

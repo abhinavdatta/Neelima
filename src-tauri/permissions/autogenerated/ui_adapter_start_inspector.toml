@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-adapter-start-inspector"
+description = "Enables the ui_adapter_start_inspector command without any pre-configured scope."
+commands.allow = ["ui_adapter_start_inspector"]
+
+[[permission]]
+identifier = "deny-ui-adapter-start-inspector"
+description = "Denies the ui_adapter_start_inspector command without any pre-configured scope."
+commands.deny = ["ui_adapter_start_inspector"]

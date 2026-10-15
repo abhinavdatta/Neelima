@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-history-tasks"
+description = "Enables the ui_history_tasks command without any pre-configured scope."
+commands.allow = ["ui_history_tasks"]
+
+[[permission]]
+identifier = "deny-ui-history-tasks"
+description = "Denies the ui_history_tasks command without any pre-configured scope."
+commands.deny = ["ui_history_tasks"]

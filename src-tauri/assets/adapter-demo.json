@@ -1,0 +1,17 @@
+{
+  "id": "demo",
+  "name": "Demo chat (built-in)",
+  "url": "app://demo-chat.html",
+  "selectors": {
+    "input": "#ta",
+    "send_button": "#send",
+    "stop_button": "#stop",
+    "messages": "#messages",
+    "new_chat": null,
+    "logged_in": null
+  },
+  "input": { "kind": "textarea", "max_chars": 200000 },
+  "quiet_ms": 700,
+  "response_timeout_ms": 120000,
+  "built_in": true
+}

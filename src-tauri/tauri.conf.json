@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Neelima",
+  "mainBinaryName": "neelima",
+  "version": "0.1.0",
+  "identifier": "com.neelima.app",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "beforeBuildCommand": "npm --prefix ../ui run build",
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost",
+      "assetProtocol": { "enable": false, "scope": [] },
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/icon.png", "icons/32x32.png", "icons/128x128.png"],
+    "category": "DeveloperTool",
+    "shortDescription": "Local-first agentic coding app",
+    "longDescription": "Neelima embeds the AI provider's own web chat (your account, your login) or local models (Ollama, LM Studio) and lets them read and modify files in your workspace. No cloud model APIs, no API keys, no telemetry.",
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": { "installMode": "perMachine", "languages": ["English"] }
+    },
+    "linux": { "deb": { "depends": [] } }
+  }
+}

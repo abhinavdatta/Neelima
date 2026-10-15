@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-providers-close"
+description = "Enables the ui_providers_close command without any pre-configured scope."
+commands.allow = ["ui_providers_close"]
+
+[[permission]]
+identifier = "deny-ui-providers-close"
+description = "Denies the ui_providers_close command without any pre-configured scope."
+commands.deny = ["ui_providers_close"]

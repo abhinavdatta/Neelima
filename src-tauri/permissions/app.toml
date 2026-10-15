@@ -1,0 +1,47 @@
+# Application-defined permissions. Capability files reference these hyphenated
+# identifiers; the command allow-lists use the actual snake_case command names.
+[[permission]]
+identifier = "allow-app-commands"
+description = "All Neelima UI commands (only granted to the main UI webview)."
+commands.allow = [
+  "ui_pick_workspace",
+  "ui_workspace_add",
+  "ui_workspace_list",
+  "ui_workspace_use",
+  "ui_tree",
+  "ui_settings_get",
+  "ui_settings_set",
+  "ui_adapters_list",
+  "ui_adapters_open_folder",
+  "ui_adapter_start_inspector",
+  "ui_adapter_capture",
+  "ui_adapter_finish_inspector",
+  "ui_providers_login",
+  "ui_providers_close",
+  "ui_providers_list",
+  "ui_models_local",
+  "ui_task_start",
+  "ui_task_stop",
+  "ui_task_continue",
+  "ui_approve",
+  "ui_relay_reply",
+  "ui_webview_mode",
+  "ui_webview_rect",
+  "ui_terminal_create",
+  "ui_terminal_write",
+  "ui_terminal_resize",
+  "ui_terminal_kill",
+  "ui_checkpoint_list",
+  "ui_checkpoint_create",
+  "ui_checkpoint_restore",
+  "ui_history_tasks",
+  "ui_history_open",
+  "ui_search_tasks",
+  "ui_diff_get",
+  "ui_app_info",
+]
+
+[[permission]]
+identifier = "allow-lb-bridge"
+description = "The single narrow provider-bridge intake command. Granted ONLY to provider webviews."
+commands.allow = ["lb_bridge"]

@@ -1,0 +1,16 @@
+{
+  "identifier": "provider-bridge",
+  "description": "Provider webviews (the embedded AI chat pages the user logs into). The ONLY command reachable from these pages is lb_bridge - a small, typed, size-capped intake channel for the adapter runtime. Every other app command is denied here by the app ACL manifest. Remote scope is a wildcard because adapter domains are user-configurable at runtime (capabilities are compile-time); the one-command allowlist is the security boundary, see docs/THREAT-MODEL.md.",
+  "webviews": [
+    "provider"
+  ],
+  "local": true,
+  "remote": {
+    "urls": [
+      "https://*/*"
+    ]
+  },
+  "permissions": [
+    "allow-lb-bridge"
+  ]
+}

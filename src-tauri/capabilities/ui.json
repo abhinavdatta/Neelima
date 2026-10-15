@@ -1,0 +1,17 @@
+{
+  "identifier": "main-ui",
+  "description": "The Neelima main UI webview. Granted only the commands it actually calls, plus the core event API. No fs/shell plugins exist in this app at all.",
+  "webviews": [
+    "ui"
+  ],
+  "local": true,
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "allow-app-commands"
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-checkpoint-list"
+description = "Enables the ui_checkpoint_list command without any pre-configured scope."
+commands.allow = ["ui_checkpoint_list"]
+
+[[permission]]
+identifier = "deny-ui-checkpoint-list"
+description = "Denies the ui_checkpoint_list command without any pre-configured scope."
+commands.deny = ["ui_checkpoint_list"]

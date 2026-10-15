@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-providers-list"
+description = "Enables the ui_providers_list command without any pre-configured scope."
+commands.allow = ["ui_providers_list"]
+
+[[permission]]
+identifier = "deny-ui-providers-list"
+description = "Denies the ui_providers_list command without any pre-configured scope."
+commands.deny = ["ui_providers_list"]

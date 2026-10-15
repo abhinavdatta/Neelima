@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-webview-rect"
+description = "Enables the ui_webview_rect command without any pre-configured scope."
+commands.allow = ["ui_webview_rect"]
+
+[[permission]]
+identifier = "deny-ui-webview-rect"
+description = "Denies the ui_webview_rect command without any pre-configured scope."
+commands.deny = ["ui_webview_rect"]

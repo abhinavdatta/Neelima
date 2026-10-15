@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ui-tree"
+description = "Enables the ui_tree command without any pre-configured scope."
+commands.allow = ["ui_tree"]
+
+[[permission]]
+identifier = "deny-ui-tree"
+description = "Denies the ui_tree command without any pre-configured scope."
+commands.deny = ["ui_tree"]

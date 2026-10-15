@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Neelima — Demo Chat</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: #1b1c1f; color: #e6e6e9; }
+  #app { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 15px; color: #9aa4b2; font-weight: 500; }
+  #messages { display: flex; flex-direction: column; gap: 10px; min-height: 120px; }
+  .msg { border-radius: 10px; padding: 10px 14px; background: #26282d; white-space: pre-wrap; }
+  .msg.user { background: #2b3a55; }
+  .msg .copy-btn { display: inline-block; margin-left: 8px; padding: 1px 8px; border: 1px solid #4a4d55; border-radius: 4px; font-size: 11px; color: #9aa4b2; cursor: pointer; }
+  #composer { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+  #ce { min-height: 44px; padding: 8px; border: 1px solid #4a4d55; border-radius: 10px; background: #26282d; outline: none; }
+  #ce:focus { border-color: #6c8cff; }
+  #ta { padding: 8px; border: 1px solid #4a4d55; border-radius: 10px; background: #26282d; color: inherit; font: inherit; min-height: 40px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  #send { padding: 8px 18px; border: 0; border-radius: 10px; background: #4f6dff; color: white; font-weight: 600; cursor: pointer; }
+  #send:disabled { background: #3a3d45; cursor: default; }
+  #stop { display: none; padding: 8px 14px; border: 0; border-radius: 10px; background: #d04545; color: white; cursor: pointer; }
+  #status { font-size: 12px; color: #9aa4b2; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>Neelima demo chat — simulates a provider UI (controlled textarea, contenteditable, stop button, copy-button noise, citation tokens)</h1>
+  <div id="messages"></div>
+  <div id="composer">
+    <textarea id="ta" data-testid="chat-input" placeholder="Type here… (automation uses this textarea)"></textarea>
+    <div id="ce" contenteditable="true" data-testid="chat-input-ce" aria-label="composer"></div>
+    <div class="row">
+      <button id="send" data-testid="send-button">Send</button>
+      <button id="stop" data-testid="stop-button">Stop</button>
+      <span id="status">idle</span>
+    </div>
+  </div>
+</div>
+<script>
+// Behaves like modern chat UIs so adapters must use real event-based input:
+//  - the textarea only updates page state from 'input' events read through the
+//    native value getter (React-style controlled component),
+//  - the contenteditable mirrors state only from real InputEvents,
+//  - after send: user bubble, stop button appears, a canned assistant reply
+//    arrives (contains a ```tool block, a "Copy" button and citation tokens).
+// The canned reply echoes the task's first line as the tool path. When the
+// incoming message contains a ```result block, it replies DONE instead —
+// which lets the full Neelima agent loop complete offline.
+(function () {
+  var state = { ce: "", ta: "" };
+  var ce = document.getElementById("ce");
+  var ta = document.getElementById("ta");
+  var send = document.getElementById("send");
+  var stop = document.getElementById("stop");
+  var msgs = document.getElementById("messages");
+  var statusEl = document.getElementById("status");
+  var generating = false;
+
+  function setGenerating(on) {
+    generating = on;
+    stop.style.display = on ? "inline-block" : "none";
+    statusEl.textContent = on ? "generating…" : "idle";
+  }
+
+  ce.addEventListener("input", function () { state.ce = ce.textContent; sync(); });
+  ta.addEventListener("input", function () {
+    var get = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").get;
+    state.ta = get.call(ta); sync();
+  });
+
+  function sync() { send.disabled = (!state.ce && !state.ta) || generating; }
+
+  function addMsg(kind, text) {
+    var d = document.createElement("div");
+    d.className = "msg " + kind;
+    d.setAttribute("data-kind", kind);
+    var b = document.createElement("div");
+    b.className = "bubble";
+    b.textContent = text;
+    d.appendChild(b);
+    if (kind === "assistant") {
+      var cp = document.createElement("span");
+      cp.className = "copy-btn";
+      cp.textContent = "Copy";
+      d.appendChild(cp);
+      var cite = document.createElement("span");
+      cite.textContent = " \u3010ref-1a2b3c\u3011";
+      d.appendChild(cite);
+    }
+    msgs.appendChild(d);
+    return d;
+  }
+
+  function clearComposer() {
+    var set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    set.call(ta, "");
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    ce.focus();
+    var sel = window.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(ce);
+    sel.removeAllRanges(); sel.addRange(range);
+    document.execCommand("delete");
+    state.ce = ""; state.ta = ""; sync();
+  }
+
+  send.addEventListener("click", function () {
+    if (generating || (!state.ce && !state.ta)) return;
+    var text = (state.ce && state.ta) ? state.ce + "\n" + state.ta : (state.ce || state.ta);
+    addMsg("user", text);
+    clearComposer();
+    setGenerating(true);
+    setTimeout(function () {
+      if (text.indexOf("```result") !== -1) {
+        addMsg("assistant", "All tool results received. DONE: demo task complete — workspace inspected via the tool protocol.");
+      } else {
+        var firstLine = text.split("\n").filter(function (l) { return l.trim(); }).pop() || "README.md";
+        var path = firstLine.replace(/^TASK:\s*/i, "").trim().split(/\s+/)[0] || "README.md";
+        addMsg("assistant",
+          "Got it, I will inspect the workspace.\n" +
+          "```tool\n" +
+          '{"id":"1","tool":"read_file","args":{"path":"' + path + '"}}\n' +
+          "```\n");
+      }
+      setGenerating(false);
+    }, 900);
+  });
+
+  stop.addEventListener("click", function () { setGenerating(false); });
+  sync();
+})();
+</script>
+</body>
+</html>
