@@ -1,0 +1,42 @@
+# Flatpak manifest for Neelima. Build locally:
+#   flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+#   flatpak install --user -y flathub org.gnome.Platform//47 org.gnome.Sdk//47 \
+#     org.freedesktop.Sdk.Extension.rust-stable//24.08 org.freedesktop.Sdk.Extension.node22//24.08
+#   flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/com.neelima.app.yml
+#   flatpak build-bundle repo Neelima.flatpak com.neelima.app
+# (CI does this automatically on tag push — see .github/workflows/release.yml)
+app-id: com.neelima.app
+runtime: org.gnome.Platform
+runtime-version: "47"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable//24.08
+  - org.freedesktop.Sdk.Extension.node22//24.08
+command: neelima
+separate-locales: false
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=network            # localhost model servers (Ollama/LM Studio) + provider web chats
+  - --filesystem=home          # workspace folders live in the user's home
+modules:
+  - name: neelima
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+      env:
+        CARGO_HOME: /run/build/neelima/cargo
+    build-commands:
+      - npm --prefix ui ci || npm --prefix ui install
+      - npm --prefix ui run build
+      - cargo build --release --offline || cargo build --release
+      - install -Dm755 target/release/neelima /app/bin/neelima
+      - install -Dm644 packaging/flatpak/com.neelima.app.desktop /app/share/applications/com.neelima.app.desktop
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/com.neelima.app.png
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/com.neelima.app.png
+      - install -Dm644 packaging/flatpak/com.neelima.app.metainfo.xml /app/share/metainfo/com.neelima.app.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..

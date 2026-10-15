@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.neelima.app</id>
+  <name>Neelima</name>
+  <summary>Local-first agentic coding app</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Neelima embeds the AI provider's own web chat (your account, your login — inside an isolated webview) or local models (Ollama, LM Studio) and lets them read and modify files in your workspace through a permission-gated tool protocol with git checkpoints.</p>
+    <p>No cloud model APIs. No API keys. No telemetry. No accounts.</p>
+  </description>
+  <launchable type="desktop-id">com.neelima.app.desktop</launchable>
+  <url type="homepage">https://github.com/neelima-app/neelima</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-15">
+      <description><p>First release: web-chat adapters, manual relay, Ollama + LM Studio, tool protocol with approvals and diffs, checkpoints, integrated terminal.</p></description>
+    </release>
+  </releases>
+</component>

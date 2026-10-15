@@ -1,0 +1,123 @@
+name: Release
+
+# Builds and publishes:
+#  - Windows: NSIS installer + portable exe (zip)
+#  - macOS:   .dmg (universal-ish: aarch64 + x86_64)
+#  - Linux:   .deb + .AppImage
+#  - Linux:   Flatpak (com.neelima.app)
+#  - Phase-0 spike self-test reports for all three OSes (per-OS evidence)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+            portable: true
+          - os: macos-latest
+            bundles: dmg
+          - os: ubuntu-22.04
+            bundles: appimage deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev git
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Frontend deps
+        run: npm --prefix ui ci || npm --prefix ui install
+
+      - name: Build (${{ matrix.os }})
+        run: npx --prefix ui tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Package portable exe (Windows)
+        if: matrix.portable
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/neelima.exe -DestinationPath Neelima-portable-windows-x64.zip
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          find src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} dist/ \; || true
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neelima-${{ matrix.os }}
+          path: |
+            dist/*
+            Neelima-portable-windows-x64.zip
+
+  flatpak:
+    runs-on: ubuntu-22.04
+    continue-on-error: true  # best-effort: verify after first tag build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --if-not-exists --user -y flathub org.gnome.Platform//47 org.gnome.Sdk//47 org.freedesktop.Sdk.Extension.rust-stable//24.08 org.freedesktop.Sdk.Extension.node22//24.08
+      - name: Build Flatpak
+        run: |
+          flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/com.neelima.app.yml
+          flatpak build-bundle repo Neelima.flatpak com.neelima.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neelima-flatpak
+          path: Neelima.flatpak
+
+  phase0-spike:
+    # Per-OS Phase-0 evidence: the spike app self-tests multiwebview, per-profile
+    # data dirs, the capability-scoped bridge, and DOM automation.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run spike self-test (run 1)
+        shell: bash
+        run: |
+          cd spike/src-tauri
+          cargo run -- --selftest --run 1 --report ../../docs/spike-report-${{ matrix.os }}.md
+      - name: Run spike self-test (run 2 — persistence)
+        shell: bash
+        run: |
+          cd spike/src-tauri
+          cargo run -- --selftest --run 2 --report ../../docs/spike-report-${{ matrix.os }}-run2.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase0-spike-${{ matrix.os }}
+          path: docs/spike-report-*.md

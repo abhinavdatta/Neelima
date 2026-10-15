@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Neelima
+Comment=Local-first agentic coding app — embeds provider web chats or local models
+Exec=neelima
+Icon=com.neelima.app
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=Neelima
