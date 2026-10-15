@@ -1,0 +1,12 @@
+{
+  "identifier": "spike-ui",
+  "webviews": [
+    "ui"
+  ],
+  "local": true,
+  "permissions": [
+    "allow-app-commands",
+    "allow-lb-bridge",
+    "core:event:default"
+  ]
+}

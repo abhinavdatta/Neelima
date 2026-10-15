@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>LocalBridge — Phase 0 Spike</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 13px/1.5 system-ui, sans-serif; background: #1b1c1f; color: #e6e6e9; padding: 14px; }
+  h1 { font-size: 15px; margin: 0 0 6px; }
+  p { color: #9aa4b2; margin: 4px 0 10px; }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; }
+  button { padding: 6px 14px; border: 0; border-radius: 6px; background: #4f6dff; color: #fff; font-weight: 600; cursor: pointer; }
+  button:active { background: #3b57dd; }
+  pre { background: #101114; border: 1px solid #34373d; border-radius: 8px; padding: 10px; max-height: 330px; overflow: auto; white-space: pre-wrap; }
+  .ok { color: #58c472; } .bad { color: #e06c6c; } .info { color: #9aa4b2; }
+</style>
+</head>
+<body>
+<h1>LocalBridge — Phase 0 Spike (top half)</h1>
+<p>Bottom half is the provider child webview (demo chat). This window proves multiwebview in one window, capability-scoped IPC, and DOM automation. Run with <code>--selftest</code> for the automated report.</p>
+<div class="row">
+  <button id="run">Run all tests</button>
+  <button id="ping">Ping provider webview</button>
+  <button id="results">Get results</button>
+</div>
+<pre id="log">booting…</pre>
+<script>
+  var logEl = document.getElementById("log");
+  function log(line, cls) {
+    var span = document.createElement("span");
+    span.className = cls || "info";
+    span.textContent = line + "\n";
+    logEl.appendChild(span);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  var T = window.__TAURI__;
+  async function main() {
+    if (!T) { log("FATAL: no __TAURI__ bundle (withGlobalTauri)", "bad"); return; }
+    log("bridge script injected: " + !!window.__LB_SPIKE__ + " | __TAURI_INTERNALS__: " + !!(window.__TAURI_INTERNALS__), "info");
+    try {
+      await T.event.listen("spike-log", function (e) {
+        var p = e.payload || {};
+        log("[" + p.status + "] " + p.name + (p.detail ? " — " + String(p.detail).slice(0, 400) : ""),
+          p.status === "PASS" ? "ok" : p.status === "FAIL" ? "bad" : "info");
+      });
+      log("listening for spike-log events", "info");
+    } catch (e) { log("event listen failed: " + e, "bad"); }
+
+    // Positive control: this ui webview IS allowed to call spike_action.
+    try {
+      var r = await T.core.invoke("spike_action", { action: "echo", arg: "ui-hello" });
+      log("ui capability check (spike_action from ui webview): " + JSON.stringify(r), "ok");
+    } catch (e) {
+      log("ui capability check FAILED: " + e, "bad");
+    }
+
+    document.getElementById("run").onclick = async function () {
+      log("running selftest (report written to spike-report.md next to the exe)…");
+      try {
+        var r2 = await T.core.invoke("spike_action", { action: "run_selftest", arg: "" });
+        log("selftest: " + JSON.stringify(r2), "ok");
+      } catch (e) { log("selftest failed: " + e, "bad"); }
+    };
+    document.getElementById("ping").onclick = async function () {
+      try {
+        var r3 = await T.core.invoke("spike_action", { action: "ping_provider", arg: "" });
+        log("provider ping: " + JSON.stringify(r3), "ok");
+      } catch (e) { log("ping failed: " + e, "bad"); }
+    };
+    document.getElementById("results").onclick = async function () {
+      try {
+        var r4 = await T.core.invoke("spike_action", { action: "get_results", arg: "" });
+        log(JSON.stringify(r4, null, 1), "ok");
+      } catch (e) { log("get_results failed: " + e, "bad"); }
+    };
+  }
+  main();
+</script>
+</body>
+</html>

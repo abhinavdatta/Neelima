@@ -1,0 +1,17 @@
+{
+  "identifier": "spike-provider-bridge",
+  "webviews": [
+    "provider",
+    "provider-remote"
+  ],
+  "local": true,
+  "remote": {
+    "urls": [
+      "https://example.com/*",
+      "https://example.com"
+    ]
+  },
+  "permissions": [
+    "allow-lb-bridge"
+  ]
+}

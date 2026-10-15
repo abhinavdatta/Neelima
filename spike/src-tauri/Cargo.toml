@@ -1,0 +1,20 @@
+[package]
+name = "localbridge-spike"
+description = "LocalBridge Phase 0 spike: proves Tauri v2 multiwebview, per-profile data dirs, narrow IPC, DOM automation"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+
+[features]
+# tauri multiwebview API (Window::add_child / WebviewBuilder on existing windows)
+# requires the `unstable` feature flag of the tauri crate.
+default = []

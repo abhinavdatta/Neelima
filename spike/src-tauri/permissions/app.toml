@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "Spike UI commands."
+commands.allow = ["spike_action"]
+
+[[permission]]
+identifier = "allow-lb-bridge"
+description = "The narrow bridge intake."
+commands.allow = ["lb_bridge"]
