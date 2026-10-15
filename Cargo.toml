@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["spike/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Resource budget (acceptance criteria): small binary, ~0% idle CPU.
+# opt-level=3 vs "s" benchmarked in README Performance section; 3 chosen.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
