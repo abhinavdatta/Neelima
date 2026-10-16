@@ -11,6 +11,7 @@ button { font: inherit; color: inherit; background: none; border: 0; cursor: poi
 code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
 
 #app { display: flex; }
+/* FileTree lives directly under #app, between the sidebar and main. */
 
 /* ---------- sidebar ---------- */
 .sidebar {
@@ -55,7 +56,30 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
   display: flex; align-items: center; gap: 9px; width: 100%;
   padding: 6px 10px; border-radius: 8px; color: #d6d7db; text-align: left;
 }
-.project-item:hover, .task-item:hover { background: #2b2c31; }
+.project-item { position: relative; padding: 0; }
+.pi-open {
+  display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0;
+  padding: 6px 0 6px 10px; color: #d6d7db; text-align: left;
+}
+.pi-open span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pi-menu {
+  color: #777d89; padding: 6px 8px; border-radius: 6px; flex: none; font-size: 14px;
+}
+.pi-menu:hover { background: #34353c; color: #fff; }
+.pi-menu-pop {
+  position: absolute; right: 8px; top: 30px; z-index: 40;
+  background: #2a2b30; border: 1px solid #3a3b42; border-radius: 8px;
+  padding: 4px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); min-width: 170px;
+}
+.pi-menu-pop button { display: block; width: 100%; text-align: left; padding: 6px 10px; border-radius: 6px; }
+.pi-menu-pop button:hover { background: #34353c; }
+.pi-menu-pop button.danger:hover { background: #3a2525; color: #ff9d9d; }
+.rename-input {
+  background: #16171a; border: 1px solid #4f6dff; color: #e8e9ec;
+  border-radius: 6px; padding: 5px 8px; font: inherit; width: 100%; margin: 0 6px;
+  outline: none;
+}
+.project-item, .task-item:hover { background: #2b2c31; }
 .project-item.active { background: #34353c; }
 .project-item .ic { width: 15px; height: 15px; }
 .project-item.add { color: #8f95a1; }
@@ -65,6 +89,11 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
 }
 .task-item .task-time { font-size: 11px; color: #777d89; flex: none; }
 .side-empty { color: #666b76; padding: 2px 12px; font-size: 12px; }
+.cp-head { display: flex; justify-content: space-between; align-items: center; padding-top: 14px; padding-bottom: 0; }
+.cp-item { display: flex; align-items: center; gap: 6px; padding: 3px 10px; }
+.cp-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: #d6d7db; }
+.cp-id { font: 11px/1 monospace; color: #777d89; }
+.cp-item .ghost { padding: 1px 6px; font-size: 11px; }
 .side-foot {
   display: flex; align-items: center; gap: 9px;
   padding: 10px 12px; border-top: 1px solid #2c2d31;
@@ -184,6 +213,31 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
   border: 1px solid #3a3b42; border-radius: 8px; padding: 9px; min-height: 70px; resize: vertical;
 }
 
+/* ---------- file tree ---------- */
+.filetree {
+  width: 200px; flex: none; height: 100%; display: flex; flex-direction: column;
+  border-bottom: 0; background: #1d1e22; border-right: 1px solid #26272b;
+}
+.filetree.collapsed { width: 34px; }
+.ft-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 8px 4px; color: #9aa0ad; font-size: 11.5px; text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.ft-body { flex: 1; overflow-y: auto; padding-bottom: 8px; }
+.ft-body::-webkit-scrollbar { width: 8px; }
+.ft-body::-webkit-scrollbar-thumb { background: #33353a; border-radius: 4px; }
+.ft-empty { color: #666b76; font-size: 12px; padding: 8px 10px; }
+.ft-row {
+  display: flex; align-items: center; gap: 5px;
+  padding: 2px 6px; cursor: pointer; color: #d6d7db; font-size: 13px;
+  white-space: nowrap; overflow: hidden;
+}
+.ft-row:hover { background: #26272c; }
+.ft-caret { width: 12px; color: #777d89; font-size: 10px; flex: none; }
+.ft-dir { color: #cbd0da; }
+.ft-file { color: #a6acb8; }
+
 /* ---------- composer ---------- */
 .composer { padding: 8px 8% 16px; }
 .composer-box {
@@ -235,16 +289,32 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
 }
 .row-item .grow { flex: 1; min-width: 160px; }
 .add-form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.preset-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.preset {
+  flex: 1 1 150px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  background: #202126; border: 1px solid #3a3b42; border-radius: 10px; padding: 10px 12px;
+  text-align: left;
+}
+.preset:hover { border-color: #4f6dff; background: #23252c; }
 
 /* ---------- provider pane ---------- */
 .provider-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .provider-toolbar {
-  display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  display: flex; align-items: center; gap: 10px; padding: 0 14px;
+  height: 40px; flex: none;
   border-bottom: 1px solid #26272b; background: #1d1e22;
 }
-.provider-name { font-weight: 600; }
-.provider-note { color: #8b91a0; font-size: 12px; }
-.provider-host { flex: 1; position: relative; }
+.provider-name { font-weight: 600; white-space: nowrap; }
+.provider-badge {
+  font-size: 10.5px; padding: 1px 8px; border-radius: 6px; flex: none;
+}
+.provider-badge.ok { background: #1e3a2a; color: #6fe0a6; }
+.provider-note {
+  color: #8b91a0; font-size: 12px;
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.provider-host { flex: 1; position: relative; min-height: 0; }
 /* The webview overlays this exact rect; the placeholder sits underneath. */
 .provider-placeholder {
   position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -255,6 +325,10 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
   font-weight: 800; font-size: 22px; display: flex; align-items: center; justify-content: center;
 }
 .ph-actions { display: flex; gap: 10px; margin-top: 10px; }
+.provider-badge.ok::before { content: "●"; margin-right: 5px; font-size: 8px; vertical-align: 2px; }
+
+/* Webview overlays this exact rect; pointer events pass through to it. */
+.provider-host > .provider-placeholder { z-index: 0; }
 
 /* ---------- terminal ---------- */
 .terminal-drawer {

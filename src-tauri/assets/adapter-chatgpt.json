@@ -1,0 +1,17 @@
+{
+  "id": "chatgpt",
+  "name": "ChatGPT",
+  "url": "https://chatgpt.com/",
+  "selectors": {
+    "input": "div#prompt-textarea[contenteditable=\"true\"], #prompt-textarea, div[contenteditable=\"true\"]",
+    "send_button": "button[data-testid=\"send-button\"], button[aria-label=\"Send prompt\"]",
+    "stop_button": "button[data-testid=\"stop-button\"], button[aria-label=\"Stop streaming\"]",
+    "messages": "main [data-message-author-role=\"assistant\"], div[data-message-author-role=\"assistant\"]",
+    "new_chat": "a[aria-label=\"New chat\"], button[aria-label=\"New chat\"]",
+    "logged_in": null
+  },
+  "input": { "kind": "contenteditable", "max_chars": 20000 },
+  "quiet_ms": 2000,
+  "response_timeout_ms": 420000,
+  "built_in": true
+}

@@ -5,6 +5,7 @@ import { listen } from "./tauri";
 import { cmd } from "./tauri";
 import { getState, setState, toast, useStore } from "./store";
 import Sidebar from "./components/Sidebar";
+import FileTree from "./components/FileTree";
 import TitleBar from "./components/TitleBar";
 import Chat from "./components/Chat";
 import Composer from "./components/Composer";
@@ -49,9 +50,12 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  const showTree = !!s.activeWorkspacePath && (s.view === "chat" || s.view === "task");
+
   return (
     <div id="app">
       <Sidebar />
+      {showTree ? <FileTree /> : null}
       <main class="main">
         <TitleBar />
         <section class="content">
@@ -119,6 +123,12 @@ function handleEvent(p: any) {
       break;
     case "notify":
       toast(p.level ?? "info", p.text ?? "");
+      break;
+    case "provider-mounted":
+      setState({ providerMounted: true });
+      break;
+    case "provider-unmounted":
+      setState({ providerMounted: false });
       break;
     case "adapters-reloaded":
       cmd.adaptersList().then((a) => setState({ adapters: a })).catch(() => {});

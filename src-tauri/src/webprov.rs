@@ -223,7 +223,16 @@ pub async fn mount(
     {
         builder = builder.data_store_identifier(store_id(profile_id));
     }
-    let rect = *state.rect.lock().unwrap();
+    let mut rect = *state.rect.lock().unwrap();    // Guard against geometry reported before the pane ever rendered:
+    // fall back to a sensible pane-sized rect instead of a 1px sliver.
+    if rect.w <= 1 || rect.h <= 1 {
+        if let Ok(sz) = window.inner_size() {
+            let dpr = window.scale_factor().unwrap_or(1.0);
+            let w = (sz.width as f64 / dpr).max(400.0) as i32;
+            let h = (sz.height as f64 / dpr - 120.0).max(300.0) as i32;
+            rect = Rect { x: 272, y: 46, w, h };
+        }
+    }
     let webview = window
         .add_child(
             builder,
@@ -236,13 +245,20 @@ pub async fn mount(
         adapter_id: adapter.id.clone(),
     });
     let _ = webview; // kept alive by the manager
+    let _ = app.emit(
+        "evt",
+        serde_json::json!({"kind": "provider-mounted", "profile": profile_id, "adapter": adapter.id}),
+    );
     Ok(())
 }
 
 pub fn unmount_if_any(app: &tauri::AppHandle, state: &WebviewState) {
-    *state.mounted.lock().unwrap() = None;
+    let had = state.mounted.lock().unwrap().take();
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         let _ = wv.close();
+    }
+    if had.is_some() {
+        let _ = app.emit("evt", serde_json::json!({"kind": "provider-unmounted"}));
     }
 }
 

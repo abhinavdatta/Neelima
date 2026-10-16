@@ -29,8 +29,17 @@ export function TitleBar() {
 
       <div class="tb-right">
         <div class="seg">
-          <button class={s.view === "chat" || s.view === "task" ? "seg-on" : ""} onClick={async () => { await cmd.webviewMode("chat"); setState({ view: "chat" }); }}>Chat</button>
-          <button class={s.view === "provider" ? "seg-on" : ""} onClick={() => setState({ view: "provider" })}>Provider</button>
+          <button class={s.view === "chat" || s.view === "task" ? "seg-on" : ""} onClick={async () => { await cmd.webviewMode("chat"); setState({ view: "chat" }); }}>
+            Chat
+          </button>
+          <button class={s.view === "provider" ? "seg-on" : ""} onClick={async () => {
+            setState({ view: "provider" });
+            // The pane's own effect auto-mounts the selected profile; nothing to
+            // do here besides keeping Rust's stored rect in sync.
+            await cmd.webviewMode("provider").catch(() => {});
+          }}>
+            Provider
+          </button>
         </div>
         {running ? (
           <button class="tb-stop" title="Stop the agent (Esc-safe: also Ctrl+Alt+Shift+X)" onClick={() => cmd.taskStop().catch((e) => console.error(e))}>■ Stop</button>

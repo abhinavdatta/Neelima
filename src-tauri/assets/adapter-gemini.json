@@ -1,0 +1,17 @@
+{
+  "id": "gemini",
+  "name": "Gemini",
+  "url": "https://gemini.google.com/app",
+  "selectors": {
+    "input": "rich-textarea div[contenteditable=\"true\"].ql-editor, div.ql-editor[contenteditable=\"true\"]",
+    "send_button": "button[aria-label=\"Send message\"], button.send-button",
+    "stop_button": null,
+    "messages": "model-response, div[aria-label*=\"Model response\"]",
+    "new_chat": null,
+    "logged_in": null
+  },
+  "input": { "kind": "contenteditable", "max_chars": 16000 },
+  "quiet_ms": 2500,
+  "response_timeout_ms": 420000,
+  "built_in": true
+}

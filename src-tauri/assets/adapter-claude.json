@@ -1,0 +1,17 @@
+{
+  "id": "claude",
+  "name": "Claude",
+  "url": "https://claude.ai/new",
+  "selectors": {
+    "input": "div[contenteditable=\"true\"], textarea[placeholder]",
+    "send_button": "button[aria-label=\"Send message\"], button[aria-label=\"Send Message\"], button[data-testid=\"send-button\"]",
+    "stop_button": "button[aria-label=\"Stop response\"], button[aria-label=\"Stop Response\"]",
+    "messages": "div[data-testid=\"assistant-message\"], .font-claude-message",
+    "new_chat": null,
+    "logged_in": null
+  },
+  "input": { "kind": "contenteditable", "max_chars": 20000 },
+  "quiet_ms": 3000,
+  "response_timeout_ms": 420000,
+  "built_in": true
+}

@@ -26,15 +26,38 @@ export function SettingsModal() {
     } catch (e) { toast("error", String(e)); }
   };
 
-  const addWebProvider = async () => {
-    if (!newName.trim() || !newUrl.trim() || !newAdapter) { toast("warn", "Name, URL and adapter are required."); return; }
+  const addWebProvider = async (presetArg?: { id: string; name: string; url: string } | Event) => {
+    // Buttons without arguments pass a click event; treat anything without an
+    // `id` field as "use the manual form values".
+    const preset = presetArg && typeof presetArg === "object" && "id" in presetArg
+      ? (presetArg as { id: string; name: string; url: string })
+      : undefined;
+    let name = preset?.name ?? "";
+    let url = preset?.url ?? "";
+    let adapter = preset?.id ?? "";
+    if (!preset) {
+      name = newName.trim();
+      url = newUrl.trim();
+      adapter = newAdapter;
+      if (!name || !url || !adapter) { toast("warn", "Name, URL and adapter are required."); return; }
+    }
+    if (preset) {
+      // A preset must match its bundled adapter; these ship built-in.
+      const ok = s.adapters.some((a: any) => a.id === adapter);
+      if (!ok) { toast("error", `Adapter "${adapter}" not found — is the adapters dir set up?`); return; }
+    }
     const id = `p${Math.random().toString(36).slice(2, 10)}`;
     await save({
       ...draft,
-      providers: { ...draft.providers, web: [...draft.providers.web, { id, adapter_id: newAdapter, name: newName.trim() }] },
+      providers: { ...draft.providers, web: [...draft.providers.web, { id, adapter_id: adapter, name }] },
     });
     setAdding(false); setNewName(""); setNewUrl("");
-    toast("info", "Provider added. Use 'Open / log in' to authenticate inside the embedded chat.");
+    if (preset) {
+      setState({ providerSelected: `web:${id}`, view: "provider", settingsOpen: false });
+      toast("info", `${name} connected. Log in once inside the embedded chat — after that Neelima drives it.`);
+    } else {
+      toast("info", "Provider added. Use 'Open / log in' to authenticate inside the embedded chat.");
+    }
   };
 
   const testLocal = async (kind: "ollama" | "lmstudio") => {
@@ -71,7 +94,20 @@ export function SettingsModal() {
             </div>
           ))}
           {!adding ? (
-            <button class="ghost" onClick={() => setAdding(true)}>＋ Connect a provider</button>
+            <>
+            <div class="preset-row">
+              <button class="preset" onClick={() => addWebProvider({ id: "chatgpt", name: "ChatGPT", url: "https://chatgpt.com/" })}>
+                <b>ChatGPT</b><span class="dim">chatgpt.com</span>
+              </button>
+              <button class="preset" onClick={() => addWebProvider({ id: "claude", name: "Claude", url: "https://claude.ai/new" })}>
+                <b>Claude</b><span class="dim">claude.ai</span>
+              </button>
+              <button class="preset" onClick={() => addWebProvider({ id: "gemini", name: "Gemini", url: "https://gemini.google.com/app" })}>
+                <b>Gemini</b><span class="dim">gemini.google.com</span>
+              </button>
+            </div>
+            <button class="ghost" onClick={() => setAdding(true)}>＋ Connect another (custom URL / adapter)</button>
+            </>
           ) : (
             <div class="add-form">
               <input placeholder="Display name (e.g. ChatGPT)" value={newName} onInput={(e: any) => setNewName(e.currentTarget.value)} />
@@ -81,7 +117,7 @@ export function SettingsModal() {
                 {s.adapters.map((a) => <option value={a.id} key={a.id}>{a.name}</option>)}
               </select>
               <div class="row-item">
-                <button class="btn-ok" onClick={addWebProvider}>Add</button>
+                <button class="btn-ok" onClick={() => addWebProvider()}>Add</button>
                 <button class="ghost" onClick={() => setAdding(false)}>Cancel</button>
                 <span class="dim">No suitable adapter? Use Marketplace → Create with Inspector.</span>
               </div>

@@ -93,8 +93,18 @@ pub fn load_all(dir: &PathBuf) -> Result<Vec<Adapter>, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let demo = include_str!("../assets/adapter-demo.json");
     let generic = include_str!("../assets/adapter-generic.json");
+    let chatgpt = include_str!("../assets/adapter-chatgpt.json");
+    let claude = include_str!("../assets/adapter-claude.json");
+    let gemini = include_str!("../assets/adapter-gemini.json");
     ensure_file(&dir.join("demo.json"), demo)?;
     ensure_file(&dir.join("generic-template.json"), generic)?;
+    for (id, json) in [
+        ("chatgpt.json", chatgpt),
+        ("claude.json", claude),
+        ("gemini.json", gemini),
+    ] {
+        ensure_file(&dir.join(id), json)?;
+    }
 
     let mut list = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -159,6 +169,19 @@ pub fn spawn_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_builtin_real_adapters() {
+        for (id, json) in [
+            ("chatgpt", include_str!("../assets/adapter-chatgpt.json")),
+            ("claude", include_str!("../assets/adapter-claude.json")),
+            ("gemini", include_str!("../assets/adapter-gemini.json")),
+        ] {
+            let a: Adapter = serde_json::from_str(json).unwrap();
+            assert_eq!(a.id, id);
+            assert!(a.url.starts_with("https://"), "{}", a.url);
+        }
+    }
 
     #[test]
     fn parses_demo_adapter() {

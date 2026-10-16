@@ -32,6 +32,7 @@ export interface State {
   searchQuery: string;
   taskStartedAt: number | null;
   settingsOpen: boolean;
+  providerMounted: boolean;
 }
 
 const initial: State = {
@@ -60,6 +61,7 @@ const initial: State = {
   searchQuery: "",
   taskStartedAt: null,
   settingsOpen: false,
+  providerMounted: false,
 };
 
 let state: State = initial;

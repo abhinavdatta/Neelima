@@ -44,8 +44,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ui::ui_pick_workspace,
             ui::ui_workspace_add,
-            ui::ui_workspace_list,
-            ui::ui_workspace_use,
+            ui::ui_workspace_list,            ui::ui_workspace_use,
+            ui::ui_workspace_remove,
+            ui::ui_workspace_rename,
+            ui::ui_workspace_open_in_explorer,
             ui::ui_tree,
             ui::ui_settings_get,
             ui::ui_settings_set,
