@@ -138,6 +138,13 @@ pub fn run() {
                         term.kill_all();
                     }
                 }
+                // Keep the UI child webview filling the window when maximised /
+                // fullscreened; it is added at a fixed 1280x800 in setup.
+                if let tauri::WindowEvent::Resized(size) = event {
+                    if let Some(webview) = handle2.get_webview("ui") {
+                        let _ = webview.set_size(*size);
+                    }
+                }
             });
 
             Ok(())

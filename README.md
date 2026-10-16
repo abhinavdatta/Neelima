@@ -124,6 +124,8 @@ class node_checkpoints,node_history,node_settings,node_terminal,node_web_chat,no
 ```
 ## Screenshots
 
+> **Note:** a fullscreen/maximize blank-area bug (fixed in `src-tauri/src/lib.rs`) — the UI child webview is now resized to fill the window on window-resize, so maximising/fullscreen no longer leaves a blank strip.
+
 | Main UI | Folder menu | Terminal | Settings |
 |---------|-------------|----------|----------|
 | ![Main UI](docs/screenshots/01-main.png) | ![Folder menu](docs/screenshots/02-folder-menu.png) | ![Terminal panel](docs/screenshots/03-terminal.png) | ![Settings](docs/screenshots/04-settings.png) |
