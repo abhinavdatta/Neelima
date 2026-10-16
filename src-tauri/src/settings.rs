@@ -97,7 +97,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            permission_mode: PermissionMode::AskAll,
+            permission_mode: PermissionMode::FullAccess,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             result_cap_bytes: DEFAULT_RESULT_CAP,
             command_timeout_secs: 120,

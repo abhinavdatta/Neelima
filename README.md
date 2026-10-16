@@ -181,7 +181,7 @@ Chunked writes via `append: true` because chat replies have length limits.
 ## Safety model
 
 - **Workspace confinement**: every path is rejected unless it canonicalizes inside the workspace root (traversal, absolute paths, Windows device names, and symlink escapes are refused — enforced on every tool).
-- **Permission modes**: *Ask every time* (default) · *Auto-approve reads, ask for writes/commands* · *Full access inside workspace*. Writes/edits always show a CodeMirror-6 merge diff before approval.
+- **Permission modes**: *Ask every time* · *Auto-approve reads, ask for writes/commands* · *Full access inside workspace* (**default**). With FullAccess, reads, writes and commands inside the workspace are auto-approved — no per-click approvals during the agent loop. Writes/edits still show a CodeMirror-6 merge diff before approval. Switch to *Ask every time* or *Ask writes* in Settings if you want to review each action.
 - **Command guard**: user-editable allow/deny lists on top of non-removable destructive patterns (`rm -rf /`, `format`, `shutdown`, `reg add`, `curl | sh`, `-enc` PowerShell, …). cwd is forced inside the workspace; timeouts and process-tree kill are built in.
 - **Untrusted content**: files, command output and web pages are *data, not instructions* (stated in the preamble). Suspected prompt-injection text is flagged with a warning badge.
 - **Emergency stop**: global hotkey (default `Ctrl+Alt+Shift+X`) kills running commands and halts the loop.

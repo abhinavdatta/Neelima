@@ -24,7 +24,7 @@ Capabilities in Tauri v2 are **compile-time** artifacts, but adapter domains are
 - A compromised provider page could spam bridge messages (noise) or fake tool calls (gated by approvals). It cannot read the filesystem, run commands, or reach UI commands.
 - TOCTOU on path confinement: paths are canonicalized at call time; a racing symlink swap by another process is out of scope.
 - The preamble instructs the model to treat tool results as data. Deterministic injection-proofing does not exist; the warning-badge heuristic is coarse (high recall, low precision) and approvals remain the hard gate.
-- The user's own shell environment is inherited by `run_command` (needed for PATH). The denylist blocks the classic destructive patterns but cannot enumerate all harm; that is why "Ask every time" is the default.
+- The user's own shell environment is inherited by `run_command` (needed for PATH). The denylist blocks the classic destructive patterns but cannot enumerate all harm; that is why destructive command patterns are non-removable even in *Full access* mode — they are blocked by the guard before approval is ever considered. The default permission mode is *Full access inside workspace*: reads, writes and commands run without per-click approvals; destructive commands remain blocked regardless of mode.
 
 ## Network policy
 
