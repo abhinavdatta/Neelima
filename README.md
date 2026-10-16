@@ -17,6 +17,12 @@
 └──────────────┘
 ```
 
+## Screenshots
+
+| Main UI | Folder menu | Terminal | Settings |
+|---------|-------------|----------|----------|
+| ![Main UI](docs/screenshots/01-main.png) | ![Folder menu](docs/screenshots/02-folder-menu.png) | ![Terminal panel](docs/screenshots/03-terminal.png) | ![Settings](docs/screenshots/04-settings.png) |
+
 ## Distribution: portable vs installers (our decision)
 
 **Both — portable-first.** Each release ships:
