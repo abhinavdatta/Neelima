@@ -21,9 +21,9 @@
     return !!(window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === "function");
   }
   function post(obj) {
-    if (!hasIpc()) return false;
-    try { window.__TAURI_INTERNALS__.invoke("lb_bridge", { msg: JSON.stringify(obj) }).catch(function () {}); return true; }
-    catch (e) { return false; }
+    if (!hasIpc()) return Promise.reject(new Error("no ipc"));
+    try { return window.__TAURI_INTERNALS__.invoke("lb_bridge", { msg: JSON.stringify(obj) }); }
+    catch (e) { return Promise.reject(e); }
   }
   function reply(id, value, error) {
     var v = JSON.stringify(error ? { ok: false, error: String(error && error.message || error) } : { ok: true, value: value === undefined ? null : value });
@@ -166,6 +166,25 @@
     get_last_assistant: function () { return getLastAssistant(); },
 
     // Adapter Inspector: report a robust selector for the clicked element.
+    // ---- file I/O (scoped to current workspace) ----
+    file_op: async function (a) {
+      var op = parseArg(a);
+      var msg = { t: "file_op", id: "r" + Date.now().toString(36) + Math.random().toString(36).slice(2), v: JSON.stringify(op) };
+      return await post(msg);
+    },
+    read_file: async function (a) {
+      var cfg = parseArg(a);
+      return await post({ t: "file_op", id: "r" + Date.now().toString(36), v: JSON.stringify({ op: "read_file", args: { path: cfg.path, offset: cfg.offset, limit: cfg.limit } }) });
+    },
+    write_file: async function (a) {
+      var cfg = parseArg(a);
+      return await post({ t: "file_op", id: "r" + Date.now().toString(36), v: JSON.stringify({ op: "write_file", args: { path: cfg.path, content: cfg.content, append: cfg.append } }) });
+    },
+    list_dir: async function (a) {
+      var cfg = parseArg(a);
+      return await post({ t: "file_op", id: "r" + Date.now().toString(36), v: JSON.stringify({ op: "list_dir", args: { path: cfg.path || "." } }) });
+    },
+
     inspector_start: function () {
       function robustSelector(el) {
         if (el.id) return "#" + CSS.escape(el.id);

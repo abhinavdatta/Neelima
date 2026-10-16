@@ -78,6 +78,8 @@ pub fn run() {
             ui::ui_history_open,
             ui::ui_search_tasks,
             ui::ui_diff_get,
+            ui::ui_task_rename,
+            ui::ui_task_delete,
             ui::ui_app_info,
             bridge::lb_bridge,
         ])

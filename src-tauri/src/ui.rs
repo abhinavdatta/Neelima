@@ -11,7 +11,7 @@ use tauri::{AppHandle, Manager, State, Webview};
 use crate::adapters::{Adapter, AdaptersState};
 use crate::agent::{ActiveAgent, AgentCommand, AgentInput, AgentShared, CallDecision};
 use crate::bridge::BridgeHub;
-use crate::history::{HistoryStore, TranscriptEntry};
+use crate::history::{HistoryStore, TaskMeta, TranscriptEntry};
 use crate::providers::{list_models, LocalKind, LocalProvider, ManualProvider, Provider};
 use crate::settings::{Settings, SettingsStore};
 use crate::terminal::TermState;
@@ -84,84 +84,84 @@ pub fn ui_workspace_use(webview: Webview, slot: State<'_, WorkspaceSlot>, settin
 }
 
 #[tauri::command]
-pub fn ui_workspace_remove(webview: Webview, slot: State<'_, WorkspaceSlot>, settings: State<'_, SettingsStore>, id: String) -> Result<Value, String> {
-    guard(&webview)?;
-    let s = settings.get();
-    let entry = s.workspaces.iter().find(|w| w.id == id).ok_or("workspace not found")?;
-    // If this workspace is open in the slot, close it first (tools require a
-    // workspace, so a stale open slot would keep accepting AI calls).
-    if let Some(ws) = slot.0.lock().unwrap().as_ref() {
-        if ws.root() == std::path::Path::new(&entry.path) {
-            let _ = slot.0.lock().unwrap().take();
-        }
-    }
-    settings.patch(|st| {
-        st.workspaces.retain(|w| w.id != id);
-        if st.active_workspace_id.as_deref() == Some(id.as_str()) {
-            st.active_workspace_id = None;
+pub fn ui_workspace_remove(webview: Webview, slot: State<'_, WorkspaceSlot>, settings: State<'_, SettingsStore>, id: String) -> Result<Value, String> {
+    guard(&webview)?;
+    let s = settings.get();
+    let entry = s.workspaces.iter().find(|w| w.id == id).ok_or("workspace not found")?;
+    // If this workspace is open in the slot, close it first (tools require a
+    // workspace, so a stale open slot would keep accepting AI calls).
+    if let Some(ws) = slot.0.lock().unwrap().as_ref() {
+        if ws.root() == std::path::Path::new(&entry.path) {
+            let _ = slot.0.lock().unwrap().take();
+        }
+    }
+    settings.patch(|st| {
+        st.workspaces.retain(|w| w.id != id);
+        if st.active_workspace_id.as_deref() == Some(id.as_str()) {
+            st.active_workspace_id = None;
+        }
+    })?;
+    Ok(json!({"removed": id, "path": entry.path}))
+}
+
+#[tauri::command]
+pub fn ui_workspace_rename(webview: Webview, settings: State<'_, SettingsStore>, id: String, name: String) -> Result<Value, String> {
+    guard(&webview)?;
+    let clean = name.trim();
+    if clean.is_empty() || clean.len() > 80 || clean.contains('\\') || clean.contains('/') {
+        return Err("display name must be 1..=80 chars with no path separators".into());
+    }    settings.patch(|st| {
+        if let Some(w) = st.workspaces.iter_mut().find(|w| w.id == id) {
+            w.name = clean.to_string();
         }
     })?;
-    Ok(json!({"removed": id, "path": entry.path}))
-}
-
-#[tauri::command]
-pub fn ui_workspace_rename(webview: Webview, settings: State<'_, SettingsStore>, id: String, name: String) -> Result<Value, String> {
-    guard(&webview)?;
-    let clean = name.trim();
-    if clean.is_empty() || clean.len() > 80 || clean.contains('\\') || clean.contains('/') {
-        return Err("display name must be 1..=80 chars with no path separators".into());
-    }    settings.patch(|st| {
-        if let Some(w) = st.workspaces.iter_mut().find(|w| w.id == id) {
-            w.name = clean.to_string();
-        }
-    })?;
-    let saved = settings.get();
-    if saved.workspaces.iter().any(|w| w.id == id) {
-        Ok(json!({"id": id, "name": clean}))
-    } else {
-        Err("workspace not found".into())
-    }
-}
-
-#[tauri::command]
-pub fn ui_workspace_open_in_explorer(webview: Webview, slot: State<'_, WorkspaceSlot>, settings: State<'_, SettingsStore>, id: Option<String>) -> Result<(), String> {
-    guard(&webview)?;
-    let path = match id {
-        Some(id) => settings
-            .get()
-            .workspaces
-            .iter()
-            .find(|w| w.id == id)
-            .ok_or("workspace not found")?
-            .path
-            .clone(),
-        None => ws_from(&slot)?.root().to_string_lossy().into_owned(),
-    };
-    #[cfg(windows)]
-    { std::process::Command::new("explorer").arg(&path).spawn().map_err(|e| e.to_string())?; }
-    #[cfg(target_os = "macos")]
-    { std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?; }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    { std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?; }
-    Ok(())
-}
-
-#[tauri::command]
+    let saved = settings.get();
+    if saved.workspaces.iter().any(|w| w.id == id) {
+        Ok(json!({"id": id, "name": clean}))
+    } else {
+        Err("workspace not found".into())
+    }
+}
+
+#[tauri::command]
+pub fn ui_workspace_open_in_explorer(webview: Webview, slot: State<'_, WorkspaceSlot>, settings: State<'_, SettingsStore>, id: Option<String>) -> Result<(), String> {
+    guard(&webview)?;
+    let path = match id {
+        Some(id) => settings
+            .get()
+            .workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .ok_or("workspace not found")?
+            .path
+            .clone(),
+        None => ws_from(&slot)?.root().to_string_lossy().into_owned(),
+    };
+    #[cfg(windows)]
+    { std::process::Command::new("explorer").arg(&path).spawn().map_err(|e| e.to_string())?; }
+    #[cfg(target_os = "macos")]
+    { std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?; }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn ui_tree(webview: Webview, slot: State<'_, WorkspaceSlot>, path: String) -> Result<Value, String> {
     guard(&webview)?;
     let ws = ws_from(&slot)?;
     let dir = if path.is_empty() { ws.root().to_path_buf() } else { ws.resolve(&path).map_err(|e| e.to_string())? };
-    let mut entries = Vec::new();    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') { continue; }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let child = if path.is_empty() || path == "." {
-            name.clone()
-        } else {
-            format!("{}/{}", path.trim_end_matches('/'), name)
-        };
-        entries.push(json!({"name": name, "dir": is_dir, "path": child}));
-        if entries.len() >= 400 { break; }
+    let mut entries = Vec::new();    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') { continue; }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let child = if path.is_empty() || path == "." {
+            name.clone()
+        } else {
+            format!("{}/{}", path.trim_end_matches('/'), name)
+        };
+        entries.push(json!({"name": name, "dir": is_dir, "path": child}));
+        if entries.len() >= 400 { break; }
     }
     entries.sort_by(|a, b| b["dir"].as_bool().cmp(&a["dir"].as_bool()).then(a["name"].as_str().cmp(&b["name"].as_str())));
     Ok(json!({ "path": path, "entries": entries }))
@@ -566,6 +566,33 @@ pub fn ui_search_tasks(webview: Webview, history: State<'_, Arc<HistoryStore>>, 
         .filter(|m| m.title.to_lowercase().contains(&ql) || m.workspace.to_lowercase().contains(&ql))
         .collect();
     Ok(json!(matches))
+}
+
+#[tauri::command]
+pub fn ui_task_rename(webview: Webview, history: State<'_, Arc<HistoryStore>>, id: String, title: String) -> Result<Value, String> {
+    guard(&webview)?;
+    let clean = title.trim();
+    if clean.is_empty() || clean.len() > 80 {
+        return Err("title must be 1..=80 chars".into());
+    }
+    let dir = history.task_dir(&id);
+    if !dir.exists() {
+        return Err("task not found".into());
+    }
+    let meta_path = dir.join("meta.json");
+    let bytes = std::fs::read(&meta_path).map_err(|e| e.to_string())?;
+    let mut meta: TaskMeta = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("failed to read task meta: {e}"))?;
+    meta.title = clean.to_string();
+    history.update_task(&meta).map_err(|e| e.to_string())?;
+    Ok(json!({"id": id, "title": clean}))
+}
+
+#[tauri::command]
+pub fn ui_task_delete(webview: Webview, history: State<'_, Arc<HistoryStore>>, id: String) -> Result<Value, String> {
+    guard(&webview)?;
+    history.delete_task(&id)?;
+    Ok(json!({"removed": id}))
 }
 
 #[tauri::command]

@@ -165,6 +165,17 @@ impl HistoryStore {
         Ok(entries)
     }
 
+    /// Remove a task directory (transcript + meta) entirely. Files on disk are
+    /// deleted — there is no undo.
+    pub fn delete_task(&self, id: &str) -> Result<(), String> {
+        let dir = self.task_dir(id);
+        if !dir.exists() {
+            return Err("task not found".into());
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn next_entry_id(&self) -> u64 {
         let mut n = self.next_id.lock().unwrap();
         *n += 1;

@@ -41,6 +41,8 @@ export const cmd = {
   historyOpen: (taskId: string) => invoke<TranscriptEntry[]>("ui_history_open", { taskId }),
   searchTasks: (q: string) => invoke<TaskMeta[]>("ui_search_tasks", { q }),
   diffGet: (taskId: string, entryId: number) => invoke<{ path: string; old: string; new: string }>("ui_diff_get", { taskId, entryId }),
+  taskRename: (id: string, title: string) => invoke<{ id: string; title: string }>("ui_task_rename", { id, title }),
+  taskDelete: (id: string) => invoke<{ removed: string }>("ui_task_delete", { id }),
   appInfo: () => invoke<any>("ui_app_info"),
 };
 

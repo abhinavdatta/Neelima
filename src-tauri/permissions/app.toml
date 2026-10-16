@@ -41,6 +41,8 @@ commands.allow = [
   "ui_history_open",
   "ui_search_tasks",
   "ui_diff_get",
+  "ui_task_rename",
+  "ui_task_delete",
   "ui_app_info",
 ]
 

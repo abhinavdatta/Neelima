@@ -88,6 +88,24 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
   padding-left: 10px; font-size: 13px;
 }
 .task-item .task-time { font-size: 11px; color: #777d89; flex: none; }
+.task-item { position: relative; }
+.ti-open {
+  display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0;
+  padding: 6px 0 6px 10px; color: #d6d7db; text-align: left;
+}
+.ti-open span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ti-menu {
+  color: #777d89; padding: 6px 8px; border-radius: 6px; flex: none; font-size: 14px;
+}
+.ti-menu:hover { background: #34353c; color: #fff; }
+.ti-menu-pop {
+  position: absolute; right: 8px; top: 30px; z-index: 40;
+  background: #2a2b30; border: 1px solid #3a3b42; border-radius: 8px;
+  padding: 4px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); min-width: 170px;
+}
+.ti-menu-pop button { display: block; width: 100%; text-align: left; padding: 6px 10px; border-radius: 6px; }
+.ti-menu-pop button:hover { background: #34353c; }
+.ti-menu-pop button.danger:hover { background: #3a2525; color: #ff9d9d; }
 .side-empty { color: #666b76; padding: 2px 12px; font-size: 12px; }
 .cp-head { display: flex; justify-content: space-between; align-items: center; padding-top: 14px; padding-bottom: 0; }
 .cp-item { display: flex; align-items: center; gap: 6px; padding: 3px 10px; }

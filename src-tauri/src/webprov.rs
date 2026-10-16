@@ -117,10 +117,46 @@ impl WebProvider {
         self.rpc(method, &arg, timeout_ms).await
     }
 
+    /// Poll is_logged_in until the user completes login in the provider webview.
+    /// Session persists in the profile data directory, so once logged in, future
+    /// tasks proceed without waiting.
+    async fn wait_for_login(&self, timeout_secs: u64) -> Result<(), String> {
+        let interval = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if std::time::Instant::now() > deadline {
+                return Err(format!("login timeout after {}s", timeout_secs));
+            }
+            let elapsed = started.elapsed().as_secs();
+            let _ = self.app.emit("evt", json!({
+                "kind": "provider-login-waiting",
+                "adapter": self.adapter.name,
+                "elapsed_secs": elapsed,
+            }));
+
+            let logged = self
+                .rpc_or_timeout("is_logged_in", json!(null), 5_000)
+                .await
+                .ok()
+                .and_then(|v| v.get("value").cloned())
+                .map(|v| v.as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            if logged {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     pub async fn send(&mut self, text: &str) -> Result<(), String> {
         if !is_mounted(&self.state, &self.profile_id) {
             mount(&self.app, &self.profile_id, &self.adapter, &self.state).await?;
         }
+        // Make the provider pane visible so the user can see and complete login.
+        let _ = set_visible(&self.app, &self.state, true);
+
         let logged = self
             .rpc_or_timeout("is_logged_in", json!(null), 15_000)
             .await
@@ -130,9 +166,17 @@ impl WebProvider {
             .unwrap_or(false);
         if !logged {
             let _ = self.app.emit("evt", json!({"kind": "provider-login-required", "adapter": self.adapter.name}));
-            // First-class fallback per spec: manual relay still completes the task.
-            self.state.manual_fallback_store(true);
-            return Err("NEEDS_LOGIN".into());
+            // Wait for the user to log in (session persists via profile data dir).
+            // Only fall back to manual relay if login times out.
+            match self.wait_for_login(300).await {
+                Ok(()) => {
+                    let _ = self.app.emit("evt", json!({"kind": "provider-login-complete", "adapter": self.adapter.name}));
+                }
+                Err(e) => {
+                    self.state.manual_fallback_store(true);
+                    return Err(format!("login timeout: {e} — manual relay is available"));
+                }
+            }
         }
         let _ = self.rpc_or_timeout("new_chat", json!(null), 10_000).await;
         let sent = self

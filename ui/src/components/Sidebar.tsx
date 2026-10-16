@@ -51,22 +51,77 @@ export function Sidebar() {
         <div class="side-section">Tasks</div>
         <div class="side-list tasks">
           {s.tasks.length === 0 ? <div class="side-empty">No tasks yet</div> : null}
-          {s.tasks.slice(0, 30).map((t) => (
-            <button
-              class="task-item"
-              onClick={async () => {
-                try {
-                  const entries = await cmd.historyOpen(t.id);
-                  setState({ entries, openTask: t, view: "task", pendingCalls: [], agentState: t.status === "done" ? "done" : "idle" });
-                } catch (e) { toast("error", String(e)); }
-              }}
-            >
-              <span class="task-title">{t.title}</span>
-              <span class="task-time">{relTime(t.started_ms)}</span>
-            </button>
-          ))}
+          {s.tasks.slice(0, 30).map((t) => <TaskItem key={t.id} t={t} />)}
         </div>
         {s.activeWorkspacePath ? <Checkpoints /> : null}
+
+function TaskItem({ t }: { t: TaskMeta }) {
+  const [menu, setMenu] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(t.title);
+
+  const open = async () => {
+    try {
+      const entries = await cmd.historyOpen(t.id);
+      setState({ entries, openTask: t, view: "task", pendingCalls: [], agentState: t.status === "done" ? "done" : "idle" });
+    } catch (e) { toast("error", String(e)); }
+  };
+
+  const rename = async () => {
+    setRenaming(false);
+    const title = draft.trim();
+    if (!title || title === t.title) return;
+    try {
+      await cmd.taskRename(t.id, title);
+      const tl = await cmd.historyTasks();
+      setState({ tasks: tl });
+      toast("info", `Renamed to "${title}"`);
+    } catch (e) { toast("error", String(e)); }
+  };
+
+  const remove = async () => {
+    if (!window.confirm(`Delete task "${t.title}"? This cannot be undone.`)) return;
+    try {
+      await cmd.taskDelete(t.id);
+      const tl = await cmd.historyTasks();
+      setState({ tasks: tl });
+      if (s.openTask?.id === t.id) setState({ openTask: null, entries: [], view: "chat" });
+      toast("info", `Deleted "${t.title}"`);
+    } catch (e) { toast("error", String(e)); }
+  };
+
+  return (
+    <div class={`task-item ${menu ? "active" : ""}`}>
+      {renaming ? (
+        <input
+          class="rename-input"
+          value={draft}
+          autoFocus
+          onInput={(e: any) => setDraft(e.currentTarget.value)}
+          onKeyDown={(e: KeyboardEvent) => {
+            if (e.key === "Enter") rename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          onBlur={rename}
+        />
+      ) : (
+        <>
+          <button class="ti-open" onClick={open} title={t.title}>
+            <span class="task-title">{t.title}</span>
+            <span class="task-time">{relTime(t.started_ms)}</span>
+          </button>
+          <button class="ti-menu" title="Task options" onClick={() => setMenu(!menu)}>⋯</button>
+        </>
+      )}
+      {menu ? (
+        <div class="ti-menu-pop">
+          <button onClick={() => { setMenu(false); setRenaming(true); }}>Rename</button>
+          <button class="danger" onClick={remove}>Delete</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
       </nav>
 
       <div class="side-foot">
