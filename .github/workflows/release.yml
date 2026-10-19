@@ -49,17 +49,111 @@ jobs:
       - name: Build (${{ matrix.os }})
         run: npx --prefix ui tauri build --bundles ${{ matrix.bundles }}
 
+      - name: Import Windows signing certificate
+        if: matrix.portable
+        id: signing-certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_PFX_BASE64) -or
+              [string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "Configure WINDOWS_CERTIFICATE_PFX_BASE64 and WINDOWS_CERTIFICATE_PASSWORD as GitHub Actions secrets before creating a Windows release."
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "neelima-signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfxPath `
+              -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+              Where-Object {
+                $_.HasPrivateKey -and
+                $_.EnhancedKeyUsageList.ObjectId.Value -contains "1.3.6.1.5.5.7.3.3"
+              } |
+              Select-Object -First 1
+
+            if ($null -eq $cert) {
+              throw "The PFX did not contain a private-key certificate valid for code signing."
+            }
+            if ($cert.EnhancedKeyUsageList.ObjectId.Value -notcontains "1.3.6.1.5.5.7.3.3") {
+              throw "The imported certificate is not valid for code signing."
+            }
+
+            "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+          finally {
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Sign and verify Windows executables
+        if: matrix.portable
+        id: sign-windows
+        shell: pwsh
+        env:
+          CERTIFICATE_THUMBPRINT: ${{ steps.signing-certificate.outputs.thumbprint }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter signtool.exe -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signtool) {
+            throw "Windows SDK signtool.exe was not found on the runner."
+          }
+
+          $releaseDirs = @("target/release", "src-tauri/target/release")
+          $appBinaries = @($releaseDirs | ForEach-Object {
+            $candidate = Join-Path $_ "neelima.exe"
+            if (Test-Path $candidate) { Get-Item $candidate }
+          })
+          if ($appBinaries.Count -ne 1) {
+            throw "Expected exactly one release neelima.exe, found $($appBinaries.Count)."
+          }
+
+          $installerBinaries = @($releaseDirs | ForEach-Object {
+            $bundlePath = Join-Path $_ "bundle/nsis"
+            if (Test-Path $bundlePath) {
+              Get-ChildItem $bundlePath -Filter "*.exe" -File
+            }
+          })
+          $binaries = @($appBinaries) + @($installerBinaries)
+          if ($binaries.Count -lt 2) {
+            throw "Expected the app executable and at least one NSIS installer to sign."
+          }
+
+          foreach ($binary in $binaries) {
+            & $signtool.FullName sign /s My /sha1 $env:CERTIFICATE_THUMBPRINT `
+              /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 $binary.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signing failed for $($binary.FullName)."
+            }
+
+            & $signtool.FullName verify /pa /all /v $binary.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signature verification failed for $($binary.FullName)."
+            }
+          }
+
+          "app_exe=$($appBinaries[0].FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Package portable exe (Windows)
         if: matrix.portable
         shell: pwsh
+        env:
+          APP_EXE_PATH: ${{ steps.sign-windows.outputs.app_exe }}
         run: |
-          Compress-Archive -Path target/release/neelima.exe -DestinationPath Neelima-portable-windows-x64.zip
+          if (-not (Test-Path $env:APP_EXE_PATH)) {
+            throw "Signed portable executable was not found: $env:APP_EXE_PATH"
+          }
+          Compress-Archive -Path $env:APP_EXE_PATH -DestinationPath Neelima-portable-windows-x64.zip
 
       - name: Collect artifacts
         shell: bash
         run: |
           mkdir -p dist
-          find src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} dist/ \; || true
+          find target/release/bundle src-tauri/target/release/bundle -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) -exec cp {} dist/ \; 2>/dev/null || true
           ls -la dist
 
       - uses: actions/upload-artifact@v4

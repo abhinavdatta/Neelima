@@ -238,6 +238,21 @@ cd src-tauri && cargo test     # unit tests: protocol, confinement, tools, guard
 npx --prefix ui tauri build    # release + installer for your OS
 ```
 
+### Signed Windows releases
+
+Windows releases are Authenticode-signed in GitHub Actions. Before creating a
+Windows release, configure these repository Actions secrets:
+
+- `WINDOWS_CERTIFICATE_PFX_BASE64`: base64-encoded PFX containing the publisher
+  certificate and private key.
+- `WINDOWS_CERTIFICATE_PASSWORD`: the PFX password.
+
+Keep the PFX and password out of the repository and logs. The workflow signs and
+verifies the app executable and NSIS installer, then packages the signed app
+executable in the portable ZIP. A valid signature identifies the publisher; it
+does not guarantee that antivirus products will never flag a file. Submit
+suspected false positives to the relevant vendors for review.
+
 ## Performance
 
 Measured on the dev machine (Windows 11, x64, Rust 1.98.1, tauri 2.12.4). Reproduce with `scripts/measure.ps1`.
