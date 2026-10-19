@@ -44,6 +44,8 @@ commands.allow = [
   "ui_task_rename",
   "ui_task_delete",
   "ui_app_info",
+  "ui_provider_diagnose",
+  "ui_provider_login_override",
 ]
 
 [[permission]]

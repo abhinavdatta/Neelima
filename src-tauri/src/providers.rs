@@ -30,9 +30,12 @@ impl Provider {
         }
     }
 
-    pub async fn send(&mut self, text: &str) -> Result<(), String> {
+    /// Send a message. `task_id` identifies the task (the web provider uses it
+    /// to decide new_chat), `first_of_task` allows the web provider to reset
+    /// the chat exactly once per task (A8).
+    pub async fn send(&mut self, task_id: &str, text: &str, first_of_task: bool) -> Result<(), String> {
         match self {
-            Provider::Web(w) => w.send(text).await,
+            Provider::Web(w) => w.send(task_id, text, first_of_task).await,
             Provider::Local(l) => l.send(text).await,
             Provider::Manual(m) => m.send(text).await,
         }

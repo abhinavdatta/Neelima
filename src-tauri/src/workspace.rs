@@ -176,18 +176,26 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Windows requires privileges for dir symlinks; test junction-free path:
+            // Windows requires privileges for dir symlinks; test an absolute path
+            // that lexically points outside instead.
             let ws = Workspace::open(&dir).unwrap();
-            assert!(ws.resolve("C:\\Windows\\System32\\drivers\\etc\\hosts").is_ok() == false || true);
             assert!(ws.resolve("C:\\Windows\\System32\\drivers\\etc\\hosts").is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn rejects_absolute_outside() {
+    #[cfg(windows)]
+    fn rejects_absolute_outside_windows() {
         let ws = Workspace::open(&tmp_ws("abs")).unwrap();
         assert!(ws.resolve("C:\\Windows\\notepad.exe").is_err());
+        std::fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_absolute_outside_unix() {
+        let ws = Workspace::open(&tmp_ws("abs")).unwrap();
         assert!(ws.resolve("/etc/passwd").is_err());
         std::fs::remove_dir_all(ws.root()).ok();
     }

@@ -8,10 +8,14 @@
     "stop_button": null,
     "messages": "main",
     "new_chat": null,
-    "logged_in": null
+    "logged_in": null,
+    "logged_out": null
   },
   "input": { "kind": "textarea", "max_chars": 8000 },
   "quiet_ms": 2000,
   "response_timeout_ms": 300000,
-  "built_in": true
+  "built_in": true,
+  "allowed_domain": "example.com",
+  "auth_domains": [],
+  "login_url_patterns": ["login", "signin", "sign-in", "auth", "signup", "register"]
 }

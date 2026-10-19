@@ -327,6 +327,9 @@ code, pre { font: 12px/1.45 "Cascadia Code", Consolas, monospace; }
   font-size: 10.5px; padding: 1px 8px; border-radius: 6px; flex: none;
 }
 .provider-badge.ok { background: #1e3a2a; color: #6fe0a6; }
+.provider-badge.wait { background: #3a2f1c; color: #e5b96f; }
+.provider-badge.wait::before { content: "⟳"; margin-right: 5px; font-size: 8px; vertical-align: 1px; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .provider-note {
   color: #8b91a0; font-size: 12px;
   flex: 1; min-width: 0;

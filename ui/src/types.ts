@@ -5,7 +5,7 @@ export interface WebProfile { id: string; adapter_id: string; name: string }
 export interface LocalCfg { url: string; model?: string | null; context_chars?: number | null; temperature?: number | null }
 export interface Adapter {
   id: string; name: string; url: string; built_in: boolean;
-  selectors: { input: string; send_button: string; stop_button?: string | null; messages: string; new_chat?: string | null; logged_in?: string | null };
+  selectors: { input: string; send_button: string; stop_button?: string | null; messages: string; new_chat?: string | null; logged_in?: string | null; logged_out?: string | null };
   input: { kind: "textarea" | "contenteditable"; max_chars?: number | null };
   quiet_ms: number; response_timeout_ms: number;
 }

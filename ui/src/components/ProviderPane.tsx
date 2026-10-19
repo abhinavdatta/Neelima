@@ -82,13 +82,17 @@ export function ProviderPane() {
         {selectedProfile ? (
           <>
             <span class="provider-name">{selectedProfile.name}</span>
-            {s.providerMounted
-              ? <span class="provider-badge ok">live</span>
-              : <button class="tb-btn" onClick={openLogin}>Open / log in</button>}
+            {s.providerLoginWaiting
+              ? <span class="provider-badge wait">Waiting for login…</span>
+              : s.providerMounted
+                ? <span class="provider-badge ok">live</span>
+                : <button class="tb-btn" onClick={openLogin}>Open / log in</button>}
             <span class="provider-note">
-              {s.providerMounted
-                ? "Runs in an isolated webview — with its own login. Close it any time."
-                : "Credentials stay inside the webview's own profile — Neelima never reads them."}
+              {s.providerLoginWaiting
+                ? "Log in inside the embedded chat. Your session persists — you only need to do this once per provider."
+                : s.providerMounted
+                  ? "Runs in an isolated webview — with its own login. Close it any time."
+                  : "Credentials stay inside the webview's own profile — Neelima never reads them."}
             </span>
           </>
         ) : (

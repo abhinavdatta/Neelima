@@ -144,14 +144,18 @@ impl HistoryStore {
                 }
             }
         }
-        metas.sort_by(|a, b| b.started_ms.cmp(&a.started_ms));
+        metas.sort_by_key(|meta| std::cmp::Reverse(meta.started_ms));
         metas.truncate(cap);
         metas
     }
 
     pub fn read_transcript(&self, task_id: &str, tail: usize) -> Result<Vec<TranscriptEntry>, String> {
         let path = self.task_dir(task_id).join("transcript.jsonl");
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.to_string()),
+        };
         let mut entries = Vec::new();
         for line in data.split(|b| *b == b'\n') {
             if line.is_empty() { continue; }

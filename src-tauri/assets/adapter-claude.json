@@ -8,10 +8,14 @@
     "stop_button": "button[aria-label=\"Stop response\"], button[aria-label=\"Stop Response\"]",
     "messages": "div[data-testid=\"assistant-message\"], .font-claude-message",
     "new_chat": null,
-    "logged_in": null
+    "logged_in": "div[contenteditable=\"true\"]",
+    "logged_out": "a[href*=\"/login\"], button:has-text(\"Log in\"), [data-testid=\"login-button\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 20000 },
   "quiet_ms": 3000,
   "response_timeout_ms": 420000,
-  "built_in": true
+  "built_in": true,
+  "allowed_domain": "claude.ai",
+  "auth_domains": ["accounts.google.com", "login.microsoftonline.com", "auth0.com", "appleid.apple.com"],
+  "login_url_patterns": ["claude.ai/login", "claude.ai/signup", "/oauth/"]
 }

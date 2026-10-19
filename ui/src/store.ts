@@ -33,6 +33,7 @@ export interface State {
   taskStartedAt: number | null;
   settingsOpen: boolean;
   providerMounted: boolean;
+  providerLoginWaiting: boolean;
 }
 
 const initial: State = {
@@ -62,6 +63,7 @@ const initial: State = {
   taskStartedAt: null,
   settingsOpen: false,
   providerMounted: false,
+  providerLoginWaiting: false,
 };
 
 let state: State = initial;

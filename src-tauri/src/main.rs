@@ -1,5 +1,7 @@
-// Prevents an additional console window on Windows in release.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// E2: no console window on Windows — release AND dev builds alike. All
+// diagnostics go to a log file in the app data dir (see lib::filelog) instead
+// of a console the user never asked for.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
     neelima_lib::run()

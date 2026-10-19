@@ -51,6 +51,10 @@ pub struct LocalProvider {
     pub context_chars: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// C3: Ollama context window for num_ctx (Ollama's small default silently
+    /// truncates the preamble). Default 8192.
+    #[serde(default)]
+    pub num_ctx: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -73,6 +77,7 @@ pub struct WorkspaceEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// B3: default AskAll — every risky action needs explicit approval.
     pub permission_mode: PermissionMode,
     pub max_iterations: u32,
     pub result_cap_bytes: usize,
@@ -97,7 +102,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            permission_mode: PermissionMode::FullAccess,
+            permission_mode: PermissionMode::AskAll,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             result_cap_bytes: DEFAULT_RESULT_CAP,
             command_timeout_secs: 120,
@@ -122,8 +127,24 @@ impl SettingsStore {
     pub fn load(config_dir: &Path) -> Result<Self, String> {
         let path = config_dir.join("settings.json");
         let settings = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)
-                .map_err(|e| format!("settings.json is invalid: {e}; defaults loaded"))?,
+            Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    // F2: a corrupt settings.json must not abort startup with a
+                    // message that lies about "defaults loaded". Back the bad
+                    // file up, load real defaults, keep going.
+                    let backup = config_dir.join(format!(
+                        "settings.corrupt-{}.json",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0)
+                    ));
+                    let _ = std::fs::rename(&path, &backup);
+                    eprintln!("[settings] settings.json invalid ({e}); backed up to {} and loaded defaults", backup.display());
+                    Settings::default()
+                }
+            },
             Err(_) => Settings::default(),
         };
         Ok(SettingsStore {
@@ -176,6 +197,37 @@ impl SettingsStore {
     pub fn path(&self) -> PathBuf {
         self.path.clone()
     }
+}
+
+pub fn always_ask_patterns() -> &'static [&'static str] {
+    &[
+        // D6: deletes targeting home / parents / outside the workspace /
+        // drive roots. Matched case-insensitively.
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(~|\$HOME|%USERPROFILE%)([/\\\s]|$)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+\.\.(\s|/|$)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/\*|[a-z]:\\)(\s|$)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/[a-z]|~?/|\$HOME|\%USERPROFILE%|[a-z]:\\|\.\.)",
+        r"\b(rmdir|rd)\s+(/[sq]\s*)+.*(~|\$HOME|%USERPROFILE%|[a-z]:\\|[a-z]:\s*$|\.\.)",
+        r"\bdel\s+(/[qfs]\s*)+.*(~|\$HOME|%USERPROFILE%|[a-z]:\\|\.\.)",
+        r"\bremove-item\b.*(-recurse|-force).*([a-z]:\\|\.\.|~|\$HOME|%USERPROFILE%)",
+        r"\brm\s+-[^ ]*r[^ ]*\s+/\*",
+        r#"\bshutil\.rmtree\b\s*\(\s*(['"])~?[\w.]*/[a-z]"#,
+        // Destructive git
+        r"\bgit\s+(push|pull)\b[^|;]*--force\b",
+        r"\bgit\s+push\b[^|;]*\s-f(\s|$)",
+        r"\bgit\s+reset\s+--hard\b",
+        r"\bgit\s+clean\b[^|;]*-f",
+        r"\bgit\s+checkout\s+--\s+\.",
+        r"\bgit\s+branch\s+-[a-z]*D",
+        // Publishing / irreversible installs
+        r"\bnpm\s+publish\b",
+        r"\bcargo\s+publish\b",
+        r"\bpip\s+install\b[^|;]*--(system|break-system-packages)",
+        r"\bdocker\s+(system\s+prune|volume\s+rm)\b",
+        // Remote auth / secrets
+        r"\bssh\b[^|;]*\b(rm|mv)\b",
+        r"\bchmod\s+(-R\s+)?777\b",
+    ]
 }
 
 pub fn default_deny_patterns() -> &'static [&'static str] {

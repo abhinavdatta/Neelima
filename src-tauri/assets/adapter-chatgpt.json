@@ -8,10 +8,14 @@
     "stop_button": "button[data-testid=\"stop-button\"], button[aria-label=\"Stop streaming\"]",
     "messages": "main [data-message-author-role=\"assistant\"], div[data-message-author-role=\"assistant\"]",
     "new_chat": "a[aria-label=\"New chat\"], button[aria-label=\"New chat\"]",
-    "logged_in": null
+    "logged_in": "div#prompt-textarea[contenteditable=\"true\"], #prompt-textarea, div[contenteditable=\"true\"]",
+    "logged_out": "[aria-label=\"Log in or sign up\"], a[data-testid=\"login-button\"], a[href*=\"/auth/login\"], form[action*=\"login\"], button[data-testid=\"welcome-login-button\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 20000 },
   "quiet_ms": 2000,
   "response_timeout_ms": 420000,
-  "built_in": true
+  "built_in": true,
+  "allowed_domain": "chatgpt.com",
+  "auth_domains": ["auth.openai.com", "auth0.openai.com", "accounts.google.com", "login.microsoftonline.com", "ios.chat.openai.com"],
+  "login_url_patterns": ["/auth/login", "accounts.google.com/o/oauth2", "auth0.openai.com", "ios.chat.openai.com/auth"]
 }

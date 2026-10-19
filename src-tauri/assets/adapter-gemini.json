@@ -8,10 +8,14 @@
     "stop_button": null,
     "messages": "model-response, div[aria-label*=\"Model response\"]",
     "new_chat": null,
-    "logged_in": null
+    "logged_in": "rich-textarea div[contenteditable=\"true\"].ql-editor, div.ql-editor[contenteditable=\"true\"]",
+    "logged_out": "a[href*=\"accounts.google.com/ServiceLogin\"], [aria-label=\"Sign in\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 16000 },
   "quiet_ms": 2500,
   "response_timeout_ms": 420000,
-  "built_in": true
+  "built_in": true,
+  "allowed_domain": "gemini.google.com",
+  "auth_domains": ["accounts.google.com", "accounts.youtube.com"],
+  "login_url_patterns": ["accounts.google.com/ServiceLogin", "accounts.google.com/o/oauth2"]
 }

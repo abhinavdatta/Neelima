@@ -16,6 +16,7 @@ pub mod bridge;
 pub mod checkpoints;
 pub mod exec;
 pub mod history;
+pub mod procspawn;
 pub mod protocol;
 pub mod providers;
 pub mod sec;
@@ -29,6 +30,14 @@ pub mod workspace;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // F2: a second instance must not fight over the global hotkey — make
+        // single-instance the FIRST plugin so it wins the race.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -81,6 +90,8 @@ pub fn run() {
             ui::ui_task_rename,
             ui::ui_task_delete,
             ui::ui_app_info,
+            ui::ui_provider_diagnose,
+            ui::ui_provider_login_override,
             bridge::lb_bridge,
         ])
         .setup(|app| {
@@ -130,7 +141,11 @@ pub fn run() {
                 .map_err(|e| e.to_string())?;
 
             // Emergency-stop hotkey (default Ctrl+Alt+Shift+X, user-editable).
-            register_hotkey(&handle, &hotkey)?;
+            // F2: never fatal — a busy global shortcut must not kill the app.
+            if let Err(e) = register_hotkey(&handle, &hotkey) {
+                eprintln!("[hotkey] {e}");
+                let _ = handle.emit(agent::EVT, serde_json::json!({"kind": "notify", "level": "warn", "text": format!("Emergency-stop hotkey could not be registered: {e}") }));
+            }
 
             // Kill leftover state on window close.
             let handle2 = handle.clone();
@@ -167,6 +182,14 @@ pub fn emergency_stop(app: &tauri::AppHandle) {
         }
     }
     let _ = app.emit(agent::EVT, serde_json::json!({"kind": "notify", "level": "warn", "text": "Emergency stop: commands killed, agent halted."}));
+}
+
+/// A1 self-check: report the state types the app manages. A command whose
+/// `State<T>` does not match a managed type is silently rejected by Tauri for
+/// EVERY call (that is how every RPC timed out once). `managed_types_expected`
+/// is kept in sync with this list by a unit test in bridge.rs.
+pub fn run_checks() -> String {
+    format!("managed: {}", bridge::managed_types_expected().join(", "))
 }
 
 pub fn register_hotkey(app: &tauri::AppHandle, hotkey: &str) -> Result<(), String> {

@@ -203,7 +203,16 @@ pub async fn run(mut input: AgentInput) {
     }
 
     let tree = tree_summary(&input.ws, 2, 400);
-    let preamble = protocol::preamble(&tree, &tools::tool_names(), input.settings.result_cap_bytes);
+    // B4: per-task tool-call nonce. Manual relay stays nonce-free (a human
+    // copies/pastes; blocks would not carry the nonce).
+    let task_nonce: Option<String> = match input.provider {
+        Provider::Manual(_) => None,
+        Provider::Web(_) | Provider::Local(_) => {
+            let full = uuid::Uuid::new_v4().simple().to_string();
+            Some(full[..8].to_string())
+        }
+    };
+    let preamble = protocol::preamble(&tree, &tools::tool_names(), input.settings.result_cap_bytes, task_nonce.as_deref());
     push(entry("system", format!("protocol preamble sent to {}", input.provider.describe())));
 
     let guard = match CommandGuard::new(&input.settings.command_allow, &input.settings.command_deny) {
@@ -230,7 +239,7 @@ pub async fn run(mut input: AgentInput) {
     push(entry("user_prompt", input.prompt.clone()));
     let first_message = format!("{preamble}\n\n---\n\nTASK: {0}", input.prompt);
     set_state(AgentState::WaitingForAi);
-    if let Err(e) = ensure_sent(&mut input, &first_message, &push).await {
+    if let Err(e) = ensure_sent(&mut input, &first_message, true, &push).await {
         finish_error(&shared, &app, &input.task_id, &e);
         return;
     }
@@ -276,7 +285,7 @@ pub async fn run(mut input: AgentInput) {
             injection_warning: injection_heuristic(&reply),
         });
 
-        match protocol::parse_reply(&reply) {
+        match protocol::parse_reply(&reply, task_nonce.as_deref()) {
             Parsed::Done(summary) => {
                 push(entry("done", summary.clone()));
                 finish(&shared, &app, &mut meta, &input, AgentState::Done, summary);
@@ -294,7 +303,7 @@ pub async fn run(mut input: AgentInput) {
                     "Your last tool block was malformed and could not be parsed:\n{e}\nResend it as a correct ```tool block: one JSON object, double quotes, no trailing commas, fields id (string), tool, args."
                 );
                 push(entry("system", correction.clone()));
-                if let Err(se) = ensure_sent(&mut input, &correction, &push).await {
+                if let Err(se) = ensure_sent(&mut input, &correction, false, &push).await {
                     finish_error(&shared, &app, &input.task_id, &se);
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
@@ -311,7 +320,7 @@ pub async fn run(mut input: AgentInput) {
                 }
                 let nudge = "Reminder: reply with tool calls (```tool blocks) to act, or \"DONE: <summary>\" when the task is complete.";
                 push(entry("system", nudge.into()));
-                if let Err(se) = ensure_sent(&mut input, nudge, &push).await {
+                if let Err(se) = ensure_sent(&mut input, nudge, false, &push).await {
                     finish_error(&shared, &app, &input.task_id, &se);
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
@@ -323,15 +332,22 @@ pub async fn run(mut input: AgentInput) {
                 nudge_count = 0;
 
                 // ---- approvals -----------------------------------------
-                let needs_approval = |risk: &str| -> bool {
-                    match risk {
+                let needs_approval = |c: &ToolCall| -> bool {
+                    // B5/D6: always-ask list overrides FullAccess.
+                    if c.tool == "run_command" {
+                        let command = c.args.get("command").and_then(Value::as_str).unwrap_or("");
+                        if guard.needs_ask(command) {
+                            return true;
+                        }
+                    }
+                    match call_risk(&c.tool) {
                         "read" => !input.settings.permission_mode.auto_approve_read(),
                         "write" => !input.settings.permission_mode.auto_approve_write(),
                         "command" => !input.settings.permission_mode.auto_approve_command(),
                         _ => !input.settings.permission_mode.auto_approve_write(),
                     }
                 };
-                let any_needs = calls.iter().any(|c| needs_approval(call_risk(&c.tool)));
+                let any_needs = calls.iter().any(needs_approval);
                 let decisions: Vec<(ToolCall, bool)> = if any_needs {
                     set_state(AgentState::AwaitingApproval);
                     let mut pending = Vec::new();
@@ -440,7 +456,7 @@ pub async fn run(mut input: AgentInput) {
                 }
 
                 set_state(AgentState::WaitingForAi);
-                if let Err(e) = ensure_sent(&mut input, &result_blocks, &push).await {
+                if let Err(e) = ensure_sent(&mut input, &result_blocks, false, &push).await {
                     finish_error(&shared, &app, &input.task_id, &e);
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
@@ -450,23 +466,36 @@ pub async fn run(mut input: AgentInput) {
     }
 }
 
-/// Send through the provider; on NEEDS_LOGIN fall back to manual relay once.
+/// Send through the provider. Typed provider errors (A10) decide the fallback:
+/// NeedsLogin/PageChanged/BridgeUnreachable (after brief notice) switch to the
+/// manual relay once; Timeout/SendFailed only after two attempts. Never mistakes
+/// a bridge failure for "logged out".
 async fn ensure_sent(
     input: &mut AgentInput,
     text: &str,
+    first_of_task: bool,
     push: &impl Fn(TranscriptEntry) -> TranscriptEntry,
 ) -> Result<(), String> {
-    if let Err(e) = input.provider.send(text).await {
-        if e.contains("NEEDS_LOGIN") {
+    match input.provider.send(&input.task_id, text, first_of_task).await {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let relayable = e.contains("NEEDS_LOGIN")
+                || e.contains("can't reach the provider page")
+                || e.contains("provider page changed");
+            if !relayable {
+                // One retry covers transient send failures; then surface it.
+                match input.provider.send(&input.task_id, text, first_of_task).await {
+                    Ok(()) => return Ok(()),
+                    Err(e2) => return Err(e2),
+                }
+            }
             input.provider = Provider::Manual(ManualProvider::new(input.app.clone(), input.relay.clone()));
-            input.webview_state.manual_fallback_store(true);
-            push(entry("system", "provider web chat needs login — switched to manual relay. Copy the message in the relay card into your chat, then paste the reply back.".into()));
+            *input.webview_state.manual_fallback.lock().unwrap() = true;
+            push(entry("system", format!("provider chat unavailable ({e}) — switched to manual relay. Copy the message in the relay card into your chat, then paste the reply back.")));
             let _ = input.app.emit(EVT, json!({"kind": "manual-fallback", "task_id": input.task_id}));
-            return input.provider.send(text).await;
+            return input.provider.send(&input.task_id, text, first_of_task).await;
         }
-        return Err(e);
     }
-    Ok(())
 }
 
 fn finish_error(shared: &Arc<AgentShared>, app: &tauri::AppHandle, task_id: &str, msg: &str) {

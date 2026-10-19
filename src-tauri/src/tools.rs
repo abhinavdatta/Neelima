@@ -54,7 +54,7 @@ pub fn tool_names() -> Vec<(&'static str, &'static str)> {
         ("list_dir", "list_dir(path) — one directory level: [type] name."),
         ("glob", "glob(pattern) — workspace-relative glob, .gitignore respected."),
         ("grep", "grep(pattern, path?, include?) — regex search, .gitignore respected, returns path:line: text."),
-        ("run_command", "run_command(command, timeout?) — run a shell command inside the workspace; output is streamed and capped."),
+        ("run_command", "run_command(command, cwd?, timeout?) — run a shell command inside the workspace (cwd is an optional workspace-relative folder, default the workspace root); output is streamed and capped."),
         ("delete_file", "delete_file(path) — remove a file (checkpoints can restore it)."),
         ("move_file", "move_file(from, to) — rename/move within the workspace."),
     ]
@@ -121,35 +121,114 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
 
     match std::fs::File::open(&path) {
         Ok(f) => {
-            let mut reader = std::io::BufReader::with_capacity(64 * 1024, f);
+            // D4: read lines AS BYTES with a per-line byte cap (a huge minified
+            // single line must not load fully), then decode lossily so
+            // latin-1/cp1252 files read with a note instead of erroring out.
+            const MAX_LINE_BYTES: usize = 128 * 1024;
+            let mut mut_reader = std::io::BufReader::with_capacity(64 * 1024, f);
             let mut collected = String::new();
             let mut line_no = 0usize;
-            let mut buf = String::new();
+            let mut lossy = false;
+            let mut byte_line: Vec<u8> = Vec::new();
+            let mut saw_any_byte = false;
             loop {
-                buf.clear();
-                match reader.read_line(&mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        line_no += 1;
-                        if line_no > offset {
-                            collected.push_str(&buf);
-                            if let Some(l) = limit {
-                                if line_no - offset >= l { break; }
+                byte_line.clear();
+                saw_any_byte = false;
+                let mut one = [0u8; 1];
+                loop {
+                    match mut_reader.read(&mut one) {
+                        Ok(0) => break,
+                        Ok(1) => {
+                            saw_any_byte = true;
+                            byte_line.push(one[0]);
+                            if one[0] == b'\n' || byte_line.len() >= MAX_LINE_BYTES {
+                                break;
                             }
-                            if collected.len() > cap { break; }
+                        }
+                        Ok(_) => continue, // read returned without filling?? treat as retry
+                        Err(e) => return err_out(format!("read_file: {e}")),
+                    }
+                }
+                if byte_line.is_empty() {
+                    break; // EOF (with or without a final newline)
+                }
+                let _ = saw_any_byte;
+                line_no += 1;
+                if line_no > offset {
+                    if String::from_utf8(byte_line.clone()).is_err() {
+                        lossy = true;
+                    }
+                    if byte_line.len() >= MAX_LINE_BYTES {
+                        // Keep the head of the huge line + a marker INSIDE the
+                        // normal output cap, then skip the rest of the line.
+                        collected.push_str(&String::from_utf8_lossy(&byte_line[..4096]));
+                        collected.push_str("[line truncated at 131072 bytes]\n");
+                    } else {
+                        collected.push_str(&String::from_utf8_lossy(&byte_line));
+                    }
+                    if byte_line.len() >= MAX_LINE_BYTES {
+                        // Skip to the next line terminator so the next offset
+                        // line starts cleanly; partial reads at the cap are not
+                        // propagated further.
+                        let mut sink = [0u8; 8192];
+                        'skip: loop {
+                            match mut_reader.read(&mut sink) {
+                                Ok(0) | Err(_) => {
+                                    // EOF: the huge line was the last one.
+                                    break 'skip;
+                                }
+                                Ok(n) => {
+                                    if let Some(pos) = sink[..n].iter().position(|&b| b == b'\n') {
+                                        if pos + 1 < n && (limit.is_none() || line_no - offset + 1 < limit.unwrap_or(usize::MAX)) {
+                                            // Remainder bytes start the next line
+                                            // for plain lossless accounting.
+                                            line_no += 1;
+                                            if line_no > offset {
+                                                let rest = &sink[pos + 1..n];
+                                                if String::from_utf8(rest.to_vec()).is_err() {
+                                                    lossy = true;
+                                                }
+                                                collected.push_str(&String::from_utf8_lossy(rest));
+                                                if collected.len() > cap {
+                                                    break 'skip;
+                                                }
+                                                if let Some(l) = limit {
+                                                    if line_no - offset >= l {
+                                                        break 'skip;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break 'skip;
+                                    }
+                                    if n < sink.len() {
+                                        // No newline left in the file.
+                                        break 'skip;
+                                    }
+                                }
+                            }
                         }
                     }
-                    Err(e) => return err_out(format!("read_file: {e}")),
+                    if let Some(l) = limit {
+                        if line_no - offset >= l {
+                            break;
+                        }
+                    }
+                    if collected.len() > cap {
+                        break;
+                    }
                 }
             }
             let (body, was_capped) = cap_str(&collected, cap);
             let mut out = body.trim_end().to_string();
+            if lossy {
+                out = format!("[note: file is not valid UTF-8 (latin-1/cp1252?); non-ASCII bytes decoded lossily]\n{out}");
+            }
             if was_capped {
                 out.push_str(&cap_note(cap));
             }
             if offset > 0 || limit.is_some() {
-                out.push_str(&format!("
-[{line_no} lines total, showing from line {}]", offset + 1));
+                out.push_str(&format!("[{} lines read from line {}]", line_no.saturating_sub(offset), offset + 1));
             }
             ok_out(out)
         }
@@ -174,7 +253,13 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         Err(e) => return err_out(format!("write_file: {e}")),
     };
     let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    // D2: append into a NEW folder must work — create parents for both branches.
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err_out(format!("write_file: {e}"));
+        }
+    }
+    let diff: Option<(String, String, String)>;
     if append {
         use std::io::Write;
         match std::fs::OpenOptions::new().create(true).append(true).open(&path)
@@ -183,16 +268,30 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
             Ok(()) => {}
             Err(e) => return err_out(format!("write_file: {e}")),
         }
-    } else if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err_out(format!("write_file: {e}"));
-        }
+        // No whole-file diff for appends (the file may be a chunked stream).
+        diff = None;
+    } else {
+        // D4: skip the old/new full read for diff on files over 2 MB.
+        let over_cap = std::fs::metadata(&path).map(|m| m.len() as usize > MAX_WRITE_BYTES).unwrap_or(false);
+        let old = if over_cap {
+            String::new()
+        } else {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
         if let Err(e) = std::fs::write(&path, content) {
             return err_out(format!("write_file: {e}"));
         }
+        diff = if over_cap {
+            Some((
+                ws.display(&path),
+                "[diff skipped: file exceeds 2 MB]".to_string(),
+                "[diff skipped: file exceeds 2 MB]".to_string(),
+            ))
+        } else {
+            let new = content.to_string();
+            if old != new { Some((ws.display(&path), old, new)) } else { None }
+        };
     }
-    let new = std::fs::read_to_string(&path).unwrap_or_default();
-    let diff = if old != new { Some((ws.display(&path), old, new)) } else { None };
     ok_out(format!("wrote {} bytes to {}", content.len(), ws.display(&path)))
         .with_diff(diff)
 }
@@ -222,7 +321,20 @@ pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         Ok(c) => c,
         Err(e) => return err_out(format!("edit_file: cannot read {}: {e}", ws.display(&path))),
     };
-    let count = content.matches(&old_string).count();
+    // D3: compare on LF-normalized text, write back with the file's ORIGINAL
+    // line endings. The exact-match/ambiguity semantics are unchanged.
+    let is_crlf = content.contains("\r\n");
+    let (content_norm, old_norm, new_norm);
+    if is_crlf {
+        content_norm = content.replace("\r\n", "\n");
+        old_norm = old_string.replace("\r\n", "\n");
+        new_norm = new_string.replace("\r\n", "\n");
+    } else {
+        content_norm = content.clone();
+        old_norm = old_string.clone();
+        new_norm = new_string.clone();
+    }
+    let count = content_norm.matches(&old_norm).count();
     if count == 0 {
         return err_out(format!(
             "edit_file: old_string not found in {}. It must match EXACTLY (whitespace included). Read the file again and copy the exact text.",
@@ -235,10 +347,16 @@ pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
             ws.display(&path)
         ));
     }
-    let updated = if replace_all {
-        content.replace(&old_string, &new_string)
+    let updated_norm = if replace_all {
+        content_norm.replace(&old_norm, &new_norm)
     } else {
-        content.replacen(&old_string, &new_string, 1)
+        content_norm.replacen(&old_norm, &new_norm, 1)
+    };
+    // Restore the file's original line endings.
+    let updated = if is_crlf {
+        updated_norm.replace('\n', "\r\n")
+    } else {
+        updated_norm
     };
     if let Err(e) = std::fs::write(&path, &updated) {
         return err_out(format!("edit_file: {e}"));
@@ -367,7 +485,7 @@ pub fn grep(ws: &Workspace, args: &Value) -> ToolOutcome {
                 continue;
             }
         }
-        if let Ok(mut f) = std::fs::File::open(p) {
+        if let Ok(f) = std::fs::File::open(p) {
             let mut buf = String::new();
             let mut reader = std::io::BufReader::with_capacity(64 * 1024, f);
             let mut line_no = 0usize;
@@ -568,5 +686,86 @@ mod tests {
         assert!(d.contains("+++ b/a.txt"));
         assert!(d.contains("-two"));
         assert!(d.contains("+TWO"));
+    }
+
+    /// D2: append into a NEW folder creates the parent directories.
+    #[test]
+    fn append_creates_parent_dirs() {
+        let w = ws("append-new-dir");
+        let s = crate::settings::Settings::default();
+        let out = execute(&w, &call("1", "write_file", json!({"path":"newdir/inner/log.txt","content":"first chunk","append":true})), &s);
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(), "first chunk");
+        let out2 = execute(&w, &call("2", "write_file", json!({"path":"newdir/inner/log.txt","content":"/second","append":true})), &s);
+        assert!(out2.ok, "{}", out2.output);
+        assert_eq!(std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(), "first chunk/second");
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// D3: edit a CRLF file keeps its line endings; LF needle matches CRLF text.
+    #[test]
+    fn edit_file_preserves_crlf() {
+        let w = ws("crlf");
+        let s = crate::settings::Settings::default();
+        std::fs::write(w.root().join("c.txt"), b"first line\r\nsecond line\r\n").unwrap();
+        let out = execute(&w, &call("1", "edit_file", json!({"path":"c.txt","old_string":"second line","new_string":"SECOND line\nthird"})), &s);
+        assert!(out.ok, "{}", out.output);
+        let bytes = std::fs::read(w.root().join("c.txt")).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\r\n"), "CRLF endings must be preserved: {text:?}");
+        assert!(!text.contains("\n\r"), "only \r\n pairs expected, got: {text:?}");
+        assert_eq!(text, "first line\r\nSECOND line\r\nthird\r\n");
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// D4: latin-1 bytes do not fail read_file; a note is added instead.
+    #[test]
+    fn read_file_decodes_lossy_with_note() {
+        let w = ws("latin1");
+        std::fs::write(w.root().join("l1.txt"), b"plain\xe9text\n").unwrap(); // invalid UTF-8 byte
+        let s = crate::settings::Settings::default();
+        let out = execute(&w, &call("1", "read_file", json!({"path":"l1.txt"})), &s);
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("not valid UTF-8"));
+        assert!(out.output.contains("plain\u{FFFD}text"));
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// D4: a giant single line is truncated per line instead of loading fully.
+    #[test]
+    fn read_file_caps_single_huge_line() {
+        let w = ws("minified");
+        let mut line = String::new();
+        for _ in 0..(200 * 1024) {
+            line.push('x');
+        }
+        std::fs::write(w.root().join("m.js"), &line).unwrap();
+        let s = crate::settings::Settings::default();
+        let out = execute(&w, &call("1", "read_file", json!({"path":"m.js"})), &s);
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("line truncated at 131072 bytes"));
+        assert!(out.output.len() < 160 * 1024, "output must be capped");
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// F4: symlink escape must be refused at the TOOLS level too.
+    #[test]
+    fn tools_refuse_symlink_escape() {
+        let w = ws("symlink-escape");
+        let s = crate::settings::Settings::default();
+        let outside = std::env::temp_dir().join(format!("neelima-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, w.root().join("out-link")).unwrap();
+            let out = execute(&w, &call("1", "read_file", json!({"path":"out-link/secret.txt"})), &s);
+            assert!(!out.ok, "symlink escape must fail: {}", out.output);
+            let out = execute(&w, &call("2", "write_file", json!({"path":"out-link/evil.txt","content":"x"})), &s);
+            assert!(!out.ok, "write through symlink must fail: {}", out.output);
+        }
+        let _ = &s;
+        std::fs::remove_dir_all(w.root()).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

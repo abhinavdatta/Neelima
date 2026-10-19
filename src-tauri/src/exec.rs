@@ -1,7 +1,11 @@
 //! run_command execution: guarded, streamed, capped, cancellable.
 //! The denylist/allowlist check happens in the agent before calling in here.
 //! Cancellation (Stop button / global hotkey) kills the child AND, on Windows,
-//! its process tree via `taskkill /T /F`.
+//! its process tree via `taskkill /T /F`; on Unix the whole process group.
+//!
+//! E1: EVERY spawned process (cmd, git, taskkill, explorer, ...) is created
+//! with CREATE_NO_WINDOW on Windows so nothing opens a console the user can
+//! see — including git subprocesses kicked off from checkpoints.rs.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,6 +13,9 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
+
+pub use crate::procspawn::hidden_std;
+pub use crate::procspawn::hidden_tokio;
 
 use crate::workspace::Workspace;
 
@@ -42,16 +49,28 @@ pub async fn run_command_streaming(
 
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = tokio::process::Command::new("cmd");
+        let mut c = hidden_tokio("cmd");
         c.args(["/C", command]);
         c
     };
     #[cfg(not(windows))]
     let mut cmd = {
-        let mut c = tokio::process::Command::new("sh");
+        let mut c = hidden_tokio("sh");
         c.args(["-c", command]);
         c
     };
+    // E3: on Unix, run in our own process group so a kill can take the whole
+    // tree down (the shell's children included), not just the shell itself.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
 
     cmd.current_dir(&cwd)
         .stdin(Stdio::null())
@@ -134,14 +153,12 @@ pub async fn run_command_streaming(
                                     truncated = true;
                                 }
                                 let mut out = String::new();
-                                if truncated { out.push_str("[earlier output truncated; showing the tail]
-"); }
+                                if truncated { out.push_str("[earlier output truncated; showing the tail]\n"); }
                                 out.push_str(retained.trim_end());
                                 if out.is_empty() {
                                     out = if code == 0 { "(no output, exit 0)".into() } else { format!("(no output, exit {code})") };
                                 }
-                                return RunOutcome { ok: code == 0, output: format!("{out}
-[exit code: {code}]"), timed_out: false, killed: false };
+                                return RunOutcome { ok: code == 0, output: format!("{out}\n[exit code: {code}]"), timed_out: false, killed: false };
                             }
                             Err(e) => return RunOutcome { ok: false, output: format!("run_command: wait failed: {e}"), timed_out: false, killed: false },
                         }
@@ -162,44 +179,40 @@ pub async fn run_command_streaming(
         truncated = true;
     }
     let mut out = String::new();
-    if truncated { out.push_str("[earlier output truncated; showing the tail]
-"); }
+    if truncated { out.push_str("[earlier output truncated; showing the tail]\n"); }
     out.push_str(retained.trim_end());
-    if timed_out { out.push_str(&format!("
-[timed out after {timeout_secs}s — process killed]")); }
-    if killed { out.push_str("
-[cancelled by user — process tree killed]"); }
+    if timed_out { out.push_str(&format!("\n[timed out after {timeout_secs}s — process killed]")); }
+    if killed { out.push_str("\n[cancelled by user — process tree killed]"); }
     RunOutcome { ok: !killed && !timed_out, output: out, timed_out, killed }
 }
 
+/// Kill the child process tree. On Windows `taskkill /T /F`; on Unix kill the
+/// process group (+ pid) first, then the bare pid as a fallback.
 async fn kill_tree(pid: &u32) {
     if *pid == 0 { return; }
     #[cfg(windows)]
     {
-        let _ = tokio::process::Command::new("taskkill")
+        let _ = hidden_tokio("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .await;
     }
     #[cfg(unix)]
     {
-        let _ = tokio::process::Command::new("kill")
+        // Negative pid targets the whole process group (setsid made pgid==pid).
+        let _ = hidden_tokio("kill")
+            .args(["-9", &format!("-{pid}")])
+            .output()
+            .await;
+        let _ = hidden_tokio("kill")
             .args(["-9", &pid.to_string()])
             .output()
             .await;
     }
 }
 
-#[cfg(windows)]
-trait CreationFlags {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self;
-}
-#[cfg(windows)]
-impl CreationFlags for tokio::process::Command {
-    fn creation_flags(&mut self, flags: u32) -> &mut Self {
-        use std::os::windows::process::CommandExt;
-        self.as_std_mut().creation_flags(flags);
-        self
-    }
+/// D6 helper: which pgid marker to use in tests.
+#[cfg(unix)]
+pub fn is_process_group_leader_note() -> &'static str {
+    "children run in setsid'd groups; kill -9 -PID takes the whole tree"
 }

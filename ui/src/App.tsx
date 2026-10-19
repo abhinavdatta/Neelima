@@ -130,6 +130,16 @@ function handleEvent(p: any) {
     case "provider-unmounted":
       setState({ providerMounted: false });
       break;
+    case "provider-login-waiting":
+      setState({ providerLoginWaiting: true, view: "provider" });
+      break;
+    case "provider-bridge-unreachable":
+      // The chip would keep lying "Waiting for login…" — say what's actually wrong.
+      toast("warn", `Can't reach the embedded ${p.adapter} page (bridge). Reopen the provider view; if it persists, restart Neelima.`);
+      break;
+    case "provider-login-complete":
+      setState({ providerLoginWaiting: false, providerMounted: true });
+      break;
     case "adapters-reloaded":
       cmd.adaptersList().then((a) => setState({ adapters: a })).catch(() => {});
       break;

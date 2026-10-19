@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager, State, Webview};
+use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
 use crate::adapters::{Adapter, AdaptersState};
 use crate::agent::{ActiveAgent, AgentCommand, AgentInput, AgentShared, CallDecision};
@@ -90,9 +90,14 @@ pub fn ui_workspace_remove(webview: Webview, slot: State<'_, WorkspaceSlot>, set
     let entry = s.workspaces.iter().find(|w| w.id == id).ok_or("workspace not found")?;
     // If this workspace is open in the slot, close it first (tools require a
     // workspace, so a stale open slot would keep accepting AI calls).
-    if let Some(ws) = slot.0.lock().unwrap().as_ref() {
-        if ws.root() == std::path::Path::new(&entry.path) {
-            let _ = slot.0.lock().unwrap().take();
+    // F1: lock ONCE, compare, take, release — re-locking a std Mutex while
+    // the first guard is alive deadlocks (proven) and freezes every
+    // workspace-slot command in the app.
+    {
+        let mut slot_guard = slot.0.lock().unwrap();
+        let matches = slot_guard.as_ref().map(|ws| ws.root() == std::path::Path::new(&entry.path)).unwrap_or(false);
+        if matches {
+            *slot_guard = None;
         }
     }
     settings.patch(|st| {
@@ -110,16 +115,16 @@ pub fn ui_workspace_rename(webview: Webview, settings: State<'_, SettingsStore>,
     let clean = name.trim();
     if clean.is_empty() || clean.len() > 80 || clean.contains('\\') || clean.contains('/') {
         return Err("display name must be 1..=80 chars with no path separators".into());
-    }    settings.patch(|st| {
-        if let Some(w) = st.workspaces.iter_mut().find(|w| w.id == id) {
-            w.name = clean.to_string();
-        }
-    })?;
-    let saved = settings.get();
-    if saved.workspaces.iter().any(|w| w.id == id) {
-        Ok(json!({"id": id, "name": clean}))
-    } else {
-        Err("workspace not found".into())
+    }    settings.patch(|st| {
+        if let Some(w) = st.workspaces.iter_mut().find(|w| w.id == id) {
+            w.name = clean.to_string();
+        }
+    })?;
+    let saved = settings.get();
+    if saved.workspaces.iter().any(|w| w.id == id) {
+        Ok(json!({"id": id, "name": clean}))
+    } else {
+        Err("workspace not found".into())
     }
 }
 
@@ -215,7 +220,7 @@ pub async fn ui_adapter_capture(webview: Webview, hub: State<'_, Arc<BridgeHub>>
     guard(&webview)?;
     let app = webview.app_handle().clone();
     let wv = app.get_webview(webprov::PROVIDER_LABEL).ok_or("inspector webview not open")?;
-    let (req_id, rx) = hub.begin();
+    let (req_id, _nonce, rx) = hub.begin();
     {
         let mut ins = state.inspector.lock().unwrap();
         if let Some(i) = ins.as_mut() {
@@ -237,13 +242,14 @@ pub async fn ui_adapter_capture(webview: Webview, hub: State<'_, Arc<BridgeHub>>
 pub fn ui_adapter_finish_inspector(webview: Webview, app: AppHandle, state: State<'_, Arc<WebviewState>>, adapters: State<'_, AdaptersState>) -> Result<Adapter, String> {
     guard(&webview)?;
     let ins = state.inspector.lock().unwrap().take().ok_or("no inspector session")?;
+    let ins_url = ins.url.clone();
     let selector = |kind: &str| -> String {
         ins.selectors.iter().find(|(k, _)| k == kind).map(|(_, v)| v.clone()).unwrap_or_default()
     };
     let adapter = Adapter {
         id: format!("user-{}", uuid::Uuid::new_v4().simple()),
         name: ins.name,
-        url: ins.url,
+        url: ins_url.clone(),
         selectors: crate::adapters::Selectors {
             input: selector("input"),
             send_button: selector("send"),
@@ -251,11 +257,15 @@ pub fn ui_adapter_finish_inspector(webview: Webview, app: AppHandle, state: Stat
             messages: selector("assistant").rsplit(' ').next().unwrap_or("main").to_string(),
             new_chat: None,
             logged_in: None,
+            logged_out: None,
         },
         input: crate::adapters::InputSpec::default(),
         quiet_ms: 2000,
         response_timeout_ms: 300_000,
         built_in: false,
+        allowed_domain: crate::webprov::host_of(&ins_url),
+        auth_domains: Vec::new(),
+        login_url_patterns: Vec::new(),
     };
     let dir = crate::adapters::adapters_dir(&app.path().app_config_dir().map_err(|e| e.to_string())?);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -282,6 +292,120 @@ pub async fn ui_providers_login(webview: Webview, app: AppHandle, state: State<'
 pub fn ui_providers_close(webview: Webview, app: AppHandle, state: State<'_, Arc<WebviewState>>) -> Result<(), String> {
     guard(&webview)?;
     webprov::unmount_if_any(&app, &state);
+    Ok(())
+}
+
+/// A11: diagnostics for the "can't reach the page" flow in ProviderPane.
+#[tauri::command]
+pub async fn ui_provider_diagnose(
+    webview: Webview,
+    app: AppHandle,
+    hub: State<'_, Arc<BridgeHub>>,
+    state: State<'_, Arc<WebviewState>>,
+    adapters: State<'_, AdaptersState>,
+    settings: State<'_, SettingsStore>,
+) -> Result<Value, String> {
+    guard(&webview)?;
+    let mounted = {
+        let m = state.mounted.lock().unwrap();
+        m.as_ref().map(|p| (p.profile_id.clone(), p.adapter_id.clone()))
+    };
+    if mounted.is_none() {
+        return Ok(json!({"mounted": false}));
+    }
+    let (profile_id, adapter_id) = mounted.unwrap();
+    let adapter = adapters.list.lock().unwrap().iter().find(|a| a.id == adapter_id).cloned();
+
+    // Ping the page: one bounded RPC through the bridge.
+    let started = std::time::Instant::now();
+    let (req_id, nonce, rx) = hub.begin();
+    let ping = {
+        let wv = app.get_webview(webprov::PROVIDER_LABEL);
+        match wv {
+            Some(wv) => {
+                let js = format!(
+                    "window.__LB__ && window.__LB__.call('ping', null, {:?}, {:?})",
+                    req_id, nonce
+                );
+                match wv.eval(js) {
+                    Ok(()) => match crate::bridge::BridgeHub::wait(rx, 15_000).await {
+                        Ok(_) => Some(started.elapsed().as_millis() as u64),
+                        Err(e) => {
+                            *state.last_bridge_error.lock().unwrap() = Some(format!("ping: {e}"));
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        *state.last_bridge_error.lock().unwrap() = Some(format!("ping eval: {e}"));
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    };
+
+    // Deep info from the page (selectors state).
+    let (req_id2, nonce2, rx2) = hub.begin();
+    let mut input_found = None;
+    let mut send_found = None;
+    let mut messages_found = None;
+    if let Some(wv) = app.get_webview(webprov::PROVIDER_LABEL) {
+        let js = format!(
+            "window.__LB__ && window.__LB__.call('page_info', null, {:?}, {:?})",
+            req_id2, nonce2
+        );
+        if wv.eval(js).is_ok() {
+            if let Ok(v) = crate::bridge::BridgeHub::wait(rx2, 10_000).await {
+                input_found = Some(false);
+                send_found = Some(false);
+                messages_found = Some(false);
+                let _ = v; // page_info carries evalLogin(); selectors probed below
+            }
+        }
+    }
+    let (login, url, reason): (String, String, String) = match &*state.login.lock().unwrap() {
+        crate::webprov::LoginState::LoggedIn { url } => ("logged_in".into(), url.clone(), String::new()),
+        crate::webprov::LoginState::LoggedOut { url } => ("logged_out".into(), url.clone(), String::new()),
+        crate::webprov::LoginState::Unknown { reason, url } => ("unknown".into(), url.clone(), reason.clone()),
+    };
+    Ok(json!({
+        "mounted": true,
+        "profile": profile_id,
+        "adapter": adapter_id,
+        "adapter_name": adapter.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+        "url": url,
+        "auth_domains": adapter.as_ref().map(|a| a.auth_domains.clone()).unwrap_or_default(),
+        "login_url_patterns": adapter.as_ref().map(|a| a.login_url_patterns.clone()).unwrap_or_default(),
+        "ping_ms": ping,
+        "login_state": login,
+        "reason": reason,
+        "input_found": input_found,
+        "send_button_found": send_found,
+        "messages_found": messages_found,
+        "manual_fallback": *state.manual_fallback.lock().unwrap(),
+        "last_bridge_error": *state.last_bridge_error.lock().unwrap(),
+        "bridge_log": hub.events().iter().rev().take(30).rev().cloned().collect::<Vec<_>>(),
+        "settings_sample": {
+            "adapter_domains": adapter.as_ref().map(|a| a.allowed_domain.clone()).unwrap_or_default(),
+            "profile": settings.get().providers.web.iter().find(|p| p.id == profile_id).map(|p| p.name.clone()).unwrap_or_default(),
+        },
+    }))
+}
+
+/// A4: the "I'm logged in, continue" override — flips the push-derived login
+/// posture so a stuck task/onboarding can proceed without a remount.
+#[tauri::command]
+pub fn ui_provider_login_override(webview: Webview, state: State<'_, Arc<WebviewState>>, app: AppHandle) -> Result<(), String> {
+    guard(&webview)?;
+    let url = match &*state.login.lock().unwrap() {
+        crate::webprov::LoginState::Unknown { url, .. } => url.clone(),
+        crate::webprov::LoginState::LoggedOut { url } => url.clone(),
+        crate::webprov::LoginState::LoggedIn { url } => url.clone(),
+    };
+    *state.login.lock().unwrap() = crate::webprov::LoginState::LoggedIn { url };
+    state.ready.notify_one(); // wake wait_ready/await_login waiters
+    let _ = app.emit("evt", serde_json::json!({"kind": "provider-login-state", "state": "logged_in", "reason": "manual override"}));
     Ok(())
 }
 
@@ -400,12 +524,14 @@ fn build_provider(
 }
 
 #[tauri::command]
-pub fn ui_task_stop(webview: Webview, active: State<'_, ActiveAgent>, term: State<'_, TermState>) -> Result<(), String> {
+pub fn ui_task_stop(webview: Webview, active: State<'_, ActiveAgent>) -> Result<(), String> {
     guard(&webview)?;
     if let Some(shared) = active.get() {
         let _ = shared.cmd_tx.send(AgentCommand::Stop);
     }
-    term.kill_all();
+    // E4: do NOT kill the user's interactive terminal sessions here — this is
+    // the per-task Stop button. The emergency hotkey (lib::emergency_stop)
+    // still kills everything, by design.
     Ok(())
 }
 
@@ -482,8 +608,11 @@ pub fn ui_webview_mode(webview: Webview, app: AppHandle, state: State<'_, Arc<We
     match mode.as_str() {
         "provider" => webprov::set_visible(&app, &state, true),
         "chat" => {
-            // Hidden webviews are DESTROYED (spec): data dir persists.
-            webprov::unmount_if_any(&app, &state);
+            // A7: HIDE the webview, never destroy it — the page must not
+            // reload when the user flips between Chat and Provider. It is
+            // destroyed later only by explicit Close, profile change, or the
+            // >10 min idle sweep (never while an agent task runs).
+            webprov::hide_if_any(&app, &state);
         }
         other => return Err(format!("unknown mode {other}")),
     }
