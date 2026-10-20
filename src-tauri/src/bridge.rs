@@ -260,7 +260,7 @@ pub async fn lb_bridge(
         hub.note(format!(
             "rejected {} from disallowed origin {}",
             parsed.t,
-            safe_url_for_log(current_url.as_str())
+            safe_url_origin(current_url.as_str())
         ));
         return Err(format!(
             "lb_bridge: message '{}' rejected from disallowed origin",
@@ -282,7 +282,7 @@ pub async fn lb_bridge(
         "hello" => {
             hub.note(format!(
                 "hello from {}",
-                safe_url_for_log(parsed.url.as_deref().unwrap_or_default())
+                safe_url_origin(parsed.url.as_deref().unwrap_or_default())
             ));
             Ok(Value::Null)
         }
@@ -298,13 +298,13 @@ pub async fn lb_bridge(
             let reason = parsed.reason.clone().unwrap_or_default();
             hub.note(format!(
                 "login_state {st} url={} reason={reason}",
-                safe_url_for_log(&url)
+                safe_url_origin(&url)
             ));
             crate::webprov::on_login_state(
                 &webview,
                 &webview.app_handle().clone(),
                 st,
-                url,
+                safe_url_origin(&url),
                 reason,
             );
             Ok(Value::Null)
@@ -344,16 +344,17 @@ pub async fn lb_bridge(
     }
 }
 
-fn safe_url_for_log(value: &str) -> String {
-    tauri::Url::parse(value)
-        .map(|mut url| {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.set_query(None);
-            url.set_fragment(None);
-            url.to_string()
-        })
-        .unwrap_or_else(|_| "<invalid-url>".into())
+fn safe_url_origin(value: &str) -> String {
+    let Ok(url) = tauri::Url::parse(value) else {
+        return "[invalid URL]".into();
+    };
+    match (url.scheme(), url.host_str()) {
+        ("http" | "https", Some(host)) => {
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            format!("{}://{}{}", url.scheme(), host, port)
+        }
+        _ => "[non-web URL]".into(),
+    }
 }
 
 fn nonce_matches(expected: &str, provided: Option<&str>) -> bool {
@@ -456,8 +457,14 @@ mod tests {
         }
         assert!(hub.events().len() <= 200);
         assert_eq!(
-            safe_url_for_log("https://user:pass@example.com/path?token=secret#fragment"),
-            "https://example.com/path"
+            safe_url_origin("https://user:pass@example.com/path?token=secret#fragment"),
+            "https://example.com"
         );
+        let sanitized =
+            safe_url_origin("https://example.com/path?token=secret#access_token=secret");
+        assert!(!sanitized.contains("secret"));
+        assert_eq!(sanitized, "https://example.com");
+        assert_eq!(safe_url_origin("file:///C:/secret"), "[non-web URL]");
+        assert_eq!(safe_url_origin("not a URL"), "[invalid URL]");
     }
 }

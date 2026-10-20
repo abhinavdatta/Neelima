@@ -119,8 +119,14 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return err_out(e),
     };
-    let offset = get_usize(args, "offset").unwrap_or(None).unwrap_or(0);
-    let limit = get_usize(args, "limit").unwrap_or(None);
+    let offset = match get_usize(args, "offset") {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => return err_out(format!("read_file: {error}")),
+    };
+    let limit = match get_usize(args, "limit") {
+        Ok(value) => value,
+        Err(error) => return err_out(format!("read_file: {error}")),
+    };
 
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
@@ -281,7 +287,11 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return err_out(format!("write_file: {e}")),
     };
-    let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+    let append = match args.get("append") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return err_out("write_file: 'append' must be a boolean".into()),
+    };
     // D2: append into a NEW folder must work — create parents for both branches.
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -788,6 +798,50 @@ mod tests {
             &s,
         );
         assert!(out.output.contains("line 4999"));
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_pagination_arguments() {
+        let w = ws("invalid-pagination");
+        std::fs::write(w.root().join("data.txt"), "keep\nreading\n").unwrap();
+        let s = crate::settings::Settings::default();
+        for args in [
+            json!({"path":"data.txt", "offset":-1}),
+            json!({"path":"data.txt", "offset":"1"}),
+            json!({"path":"data.txt", "limit":false}),
+            json!({"path":"data.txt", "limit":-2}),
+        ] {
+            let out = execute(&w, &call("invalid", "read_file", args), &s);
+            assert!(!out.ok, "invalid pagination argument was accepted");
+        }
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    #[test]
+    fn invalid_append_flag_does_not_overwrite_existing_file() {
+        let w = ws("invalid-append");
+        let path = w.root().join("important.txt");
+        std::fs::write(&path, "preserve this content").unwrap();
+        let s = crate::settings::Settings::default();
+        let out = execute(
+            &w,
+            &call(
+                "invalid",
+                "write_file",
+                json!({
+                    "path":"important.txt",
+                    "content":"replacement",
+                    "append":"true"
+                }),
+            ),
+            &s,
+        );
+        assert!(!out.ok);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "preserve this content"
+        );
         std::fs::remove_dir_all(w.root()).ok();
     }
 

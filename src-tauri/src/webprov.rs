@@ -807,22 +807,39 @@ pub fn destroy_if_idle(app: &tauri::AppHandle, state: &WebviewState, force: bool
 }
 
 pub fn open_in_system_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
-    let parsed = tauri::Url::parse(url).map_err(|e| format!("invalid external URL: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!(
-            "refusing to open unsupported external URL scheme '{}'",
-            parsed.scheme()
-        ));
-    }
+    let parsed = tauri::Url::parse(url).map_err(|_| "invalid external URL".to_string())?;
+    validate_external_url(&parsed)?;
+    let safe_origin = safe_web_origin(&parsed);
     use tauri_plugin_opener::OpenerExt;
     app.opener()
         .open_url(parsed.to_string(), None::<&str>)
         .map_err(|e| format!("could not open external URL: {e}"))?;
     let _ = app.emit(
         "evt",
-        json!({"kind": "notify", "text": format!("Opened {url} in your system browser.")}),
+        json!({"kind": "notify", "text": format!("Opened {safe_origin} in your system browser.")}),
     );
     Ok(())
+}
+
+fn validate_external_url(url: &tauri::Url) -> Result<(), String> {
+    if matches!(url.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to open unsupported external URL scheme '{}'",
+            url.scheme()
+        ))
+    }
+}
+
+fn safe_web_origin(url: &tauri::Url) -> String {
+    match (url.scheme(), url.host_str()) {
+        ("http" | "https", Some(host)) => {
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            format!("{}://{}{}", url.scheme(), host, port)
+        }
+        _ => "[non-web URL]".into(),
+    }
 }
 
 #[cfg(test)]
@@ -880,6 +897,17 @@ mod tests {
             &auth,
             false
         ));
+        for raw in [
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "custom://host/path",
+        ] {
+            let url = tauri::Url::parse(raw).unwrap();
+            assert!(
+                !provider_url_allowed(&url, "https://chatgpt.com", "chatgpt.com", &auth, false),
+                "unexpectedly allowed {raw}"
+            );
+        }
         assert!(provider_url_allowed(
             &tauri::Url::parse("http://tauri.localhost/index.html").unwrap(),
             "app://localhost/demo",
@@ -894,6 +922,45 @@ mod tests {
             &[],
             false
         ));
+        assert!(!provider_url_allowed(
+            &tauri::Url::parse("app://evil.example/demo").unwrap(),
+            "app://localhost/demo",
+            "",
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn external_url_policy_is_web_only_and_notice_is_origin_only() {
+        for raw in [
+            "https://example.com/path?token=secret#fragment",
+            "http://example.com/a&b",
+        ] {
+            let parsed = tauri::Url::parse(raw).unwrap();
+            assert!(validate_external_url(&parsed).is_ok());
+            assert_eq!(
+                safe_web_origin(&parsed),
+                format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap())
+            );
+        }
+        for raw in [
+            "file:///C:/secret",
+            "javascript:alert(1)",
+            "mailto:user@example.com",
+            "custom://host/path",
+        ] {
+            let parsed = tauri::Url::parse(raw).unwrap();
+            assert!(
+                validate_external_url(&parsed).is_err(),
+                "unexpectedly accepted {raw}"
+            );
+        }
+        assert!(tauri::Url::parse("not a URL").is_err());
+        let parsed = tauri::Url::parse("https://example.com/path?token=secret#fragment").unwrap();
+        let notice = safe_web_origin(&parsed);
+        assert!(!notice.contains("secret"));
+        assert!(!notice.contains("/path"));
     }
 
     /// A4: a bridge failure must never classify as logged out.
