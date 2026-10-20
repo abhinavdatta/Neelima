@@ -12,6 +12,9 @@ export interface State {
   agentState: AgentState;
   agentText: string | null;
   taskId: string | null;
+  taskStartPending: boolean;
+  taskStartRequestId: string | null;
+  activeTaskSkills: string[];
   pendingCalls: PendingCall[];
   relayOutbound: string | null;
   commandChunks: Record<string, string>;
@@ -34,8 +37,9 @@ export interface State {
   settingsOpen: boolean;
   composerText: string;
   providerMounted: boolean;
+  providerAuthOpen: boolean;
   providerLoginWaiting: boolean;
-  providerLoginState: "unknown" | "logged_in" | "logged_out";
+  providerLoginState: "unknown" | "loading" | "challenge" | "logged_in" | "logged_out";
   providerBridgeError: string | null;
 }
 
@@ -45,6 +49,9 @@ const initial: State = {
   agentState: "idle",
   agentText: null,
   taskId: null,
+  taskStartPending: false,
+  taskStartRequestId: null,
+  activeTaskSkills: [],
   pendingCalls: [],
   relayOutbound: null,
   commandChunks: {},
@@ -67,6 +74,7 @@ const initial: State = {
   settingsOpen: false,
   composerText: "",
   providerMounted: false,
+  providerAuthOpen: false,
   providerLoginWaiting: false,
   providerLoginState: "unknown",
   providerBridgeError: null,
@@ -104,7 +112,7 @@ export function toast(level: Toast["level"], text: string) {
 
 export function resetTask() {
   setState({
-    entries: [], taskId: null, agentState: "idle", agentText: null, pendingCalls: [],
+    entries: [], taskId: null, taskStartPending: false, taskStartRequestId: null, activeTaskSkills: [], agentState: "idle", agentText: null, pendingCalls: [],
     relayOutbound: null, commandChunks: {}, openTask: null, taskStartedAt: null, view: "chat", composerText: "",
   });
 }

@@ -13,6 +13,17 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum Theme {
+    Light,
+    #[default]
+    Dark,
+    PureDark,
+    System,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     /// Ask every time (default).
     #[default]
@@ -40,6 +51,10 @@ pub struct WebProfile {
     pub id: String,
     pub adapter_id: String,
     pub name: String,
+    /// Optional user-selected start URL. The adapter's built-in URL is used
+    /// when absent; ui::build_provider checks overrides against its host policy.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +92,10 @@ pub struct WorkspaceEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// UI color theme preference; defaults to Dark to preserve the current appearance.
+    pub theme: Theme,
+    /// User-edited JSON token map or CSS :root variable block for Custom theme.
+    pub custom_theme: String,
     /// B3: default AskAll — every risky action needs explicit approval.
     pub permission_mode: PermissionMode,
     pub max_iterations: u32,
@@ -102,6 +121,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            theme: Theme::Dark,
+            custom_theme: String::new(),
             permission_mode: PermissionMode::AskAll,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             result_cap_bytes: DEFAULT_RESULT_CAP,
@@ -202,6 +223,9 @@ impl SettingsStore {
 }
 
 fn validate_settings(next: &Settings) -> Result<(), String> {
+    if next.custom_theme.len() > 16 * 1024 {
+        return Err("custom_theme must be 16 KiB or smaller".into());
+    }
     if next.max_iterations == 0 || next.max_iterations > 200 {
         return Err("max_iterations must be 1..=200".into());
     }
@@ -224,6 +248,23 @@ fn validate_settings(next: &Settings) -> Result<(), String> {
                 .is_some_and(|t| !t.is_finite() || !(0.0..=2.0).contains(&t))
             {
                 return Err(format!("{name} temperature must be 0..=2"));
+            }
+        }
+    }
+    for profile in &next.providers.web {
+        if let Some(url) = profile.url.as_deref() {
+            let parsed = tauri::Url::parse(url)
+                .map_err(|_| format!("web provider '{}' has an invalid URL", profile.name))?;
+            if parsed.scheme() != "https"
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.port().is_some_and(|port| port != 443)
+            {
+                return Err(format!(
+                    "web provider '{}' URL must be HTTPS without credentials or a custom port",
+                    profile.name
+                ));
             }
         }
     }
@@ -296,6 +337,23 @@ mod tests {
         assert!(!settings.permission_mode.auto_approve_read());
         assert!(!settings.permission_mode.auto_approve_write());
         assert!(!settings.permission_mode.auto_approve_command());
+    }
+
+    #[test]
+    fn theme_defaults_for_existing_settings_files() {
+        let old_settings = serde_json::json!({ "permission_mode": "ask_all" });
+        let settings: Settings = serde_json::from_value(old_settings).unwrap();
+        assert_eq!(settings.theme, Theme::Dark);
+        assert!(settings.custom_theme.is_empty());
+        assert_eq!(Settings::default().theme, Theme::Dark);
+        assert_eq!(
+            serde_json::from_value::<Theme>(serde_json::json!("pure_dark")).unwrap(),
+            Theme::PureDark
+        );
+        assert_eq!(
+            serde_json::from_value::<Theme>(serde_json::json!("custom")).unwrap(),
+            Theme::Custom
+        );
     }
 
     #[test]

@@ -43,8 +43,43 @@
   }
   function parseArg(a) { return typeof a === "string" ? JSON.parse(a) : (a || {}); }
   function q(sel) { try { return document.querySelector(sel); } catch (e) { return null; } }
+  function qAll(sel) { try { return Array.prototype.slice.call(document.querySelectorAll(sel)); } catch (e) { return []; } }
   function visible(el) {
-    return !!(el && (el.getClientRects().length > 0 || el === document.activeElement));
+    if (!el || !(el.getClientRects().length > 0 || el === document.activeElement)) return false;
+    var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return !style || (style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0");
+  }
+  function editable(el) {
+    return !!(el && !el.disabled && !el.readOnly && (el.isContentEditable || /^(TEXTAREA|INPUT)$/.test(el.tagName)));
+  }
+  function findComposer() {
+    var configured = S.input ? q(S.input) : null;
+    if (visible(configured) && editable(configured)) return { element: configured, selector: S.input };
+    // ChatGPT has changed the prompt element's attributes over time. Keep a
+    // narrow, provider-specific fallback set; never select arbitrary buttons
+    // or page text as an input.
+    if (A.id === "chatgpt") {
+      var fallbacks = [
+        '[data-testid="prompt-textarea"]',
+        '#prompt-textarea[contenteditable="true"]',
+        'main [contenteditable="true"][role="textbox"]',
+        'main textarea[placeholder*="Message"]',
+        'main textarea[placeholder*="Ask"]'
+      ];
+      for (var i = 0; i < fallbacks.length; i++) {
+        var candidates = qAll(fallbacks[i]);
+        for (var j = 0; j < candidates.length; j++) {
+          if (visible(candidates[j]) && editable(candidates[j])) return { element: candidates[j], selector: fallbacks[i] };
+        }
+      }
+    }
+    return { element: null, selector: S.input || "(no input selector configured)" };
+  }
+  function challengeReason() {
+    var href = (location.href || "").toLowerCase();
+    if (/captcha|challenge|\/verify(?:\/|$)/.test(href)) return "provider challenge or verification page";
+    if (q('iframe[src*="captcha"], [data-sitekey], [id*="captcha"], [class*="captcha"]')) return "provider challenge or CAPTCHA detected";
+    return "";
   }
 
   // ---- input setting -------------------------------------------------------
@@ -93,22 +128,34 @@
     return false;
   }
   function evalLogin() {
+    if (document.readyState !== "complete" || !document.body) {
+      return { state: "loading", reason: "provider document is still loading" };
+    }
+    var challenge = challengeReason();
+    if (challenge) return { state: "challenge", reason: challenge };
     if (onLoginPage()) {
       return { state: "logged_out", reason: "on a login/auth page" };
     }
-    var composer = S.input ? q(S.input) : null;
+    var found = findComposer();
+    var composer = found.element;
     var composerVisible = visible(composer);
     if (composerVisible) {
       if (S.logged_out && visible(q(S.logged_out))) {
         return { state: "logged_out", reason: "logged-out marker visible" };
       }
-      return { state: "logged_in", reason: "composer visible" };
+      return { state: "logged_in", reason: "supported message composer found" };
     }
     var out = S.logged_out ? q(S.logged_out) : null;
     if (visible(out)) {
       return { state: "logged_out", reason: "logged-out marker visible, composer absent" };
     }
-    return { state: "unknown", reason: "composer not found yet" };
+    var app = document.querySelector("main");
+    return {
+      state: "unknown",
+      reason: app
+        ? "chat page loaded, but no supported message composer was found; refresh the provider sign-in window or choose a configured API/local model"
+        : "provider page loaded without a chat application root; check sign-in, network, or provider availability"
+    };
   }
 
   // SPA navigation: patch pushState/replaceState, listen to popstate.
@@ -126,7 +173,7 @@
   var lastReported = "";
   function reportLogin() {
     var r = evalLogin();
-    var key = r.state + "|" + location.href;
+    var key = r.state + "|" + r.reason + "|" + location.href;
     if (key === lastReported) return r;
     lastReported = key;
     post({ t: "login_state", state: r.state, url: location.href, reason: r.reason, nonce: currentNonce() }).catch(function () {});
@@ -196,8 +243,10 @@
     var cfg = parseArg(arg);
     var quiet = cfg.quiet_ms || A.quiet_ms || 2000;
     var deadlineMs = cfg.timeout_ms || A.response_timeout_ms || 300000;
-    return new Promise(function (resolve) {
+    var cancelWait = null;
+    var promise = new Promise(function (resolve) {
       var container = stableContainer();
+      if (!container) { resolve({ error: "provider conversation area is not available" }); return; }
       var obs = null, quietTimer = null, startTimer = null, deadlineTimer = null;
       var startedAt = Date.now();
       var phase = "waiting_start"; // waiting_start -> generating -> done
@@ -212,6 +261,7 @@
         if (deadlineTimer) clearTimeout(deadlineTimer);
         resolve(v);
       }
+      cancelWait = function () { finish({ error: "prompt submission was not confirmed" }); };
 
       function reportPush(text) {
         ASSIST_SEQ += 1;
@@ -263,6 +313,69 @@
         finish({ error: "response timeout" });
       }, deadlineMs);
     });
+    promise.cancel = function () { if (cancelWait) cancelWait(); };
+    return promise;
+  }
+
+  function composerText(el) {
+    return el && (el.isContentEditable ? (el.innerText || el.textContent || "") : (el.value || ""));
+  }
+
+  function waitSubmission(input, text, baselineUserCount, timeoutMs) {
+    return new Promise(function (resolve) {
+      var observer = null, timer = null, done = false;
+      function finish(ok) {
+        if (done) return;
+        done = true;
+        if (observer) observer.disconnect();
+        if (timer) clearTimeout(timer);
+        resolve(ok);
+      }
+      function confirmed() {
+        var current = composerText(input).trim();
+        if (!current) return true;
+        var users = qAll('main [data-message-author-role="user"]');
+        return users.length > baselineUserCount && (users[users.length - 1].innerText || "").trim() === text.trim();
+      }
+      function check() { if (confirmed()) finish(true); }
+      if (document.body) {
+        observer = new MutationObserver(check);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+      }
+      timer = setTimeout(function () { finish(confirmed()); }, timeoutMs);
+      check();
+    });
+  }
+
+  function findSendButton() {
+    var selectors = [S.send_button, '[data-testid="send-button"]', 'button[aria-label="Send prompt"]'].filter(Boolean);
+    for (var i = 0; i < selectors.length; i++) {
+      var candidates = qAll(selectors[i]);
+      for (var j = 0; j < candidates.length; j++) {
+        if (visible(candidates[j]) && !candidates[j].disabled) return candidates[j];
+      }
+    }
+    return null;
+  }
+
+  function waitForSendButton(timeoutMs) {
+    return new Promise(function (resolve) {
+      var observer = null, timer = null, done = false;
+      function finish(button) {
+        if (done) return;
+        done = true;
+        if (observer) observer.disconnect();
+        if (timer) clearTimeout(timer);
+        resolve(button);
+      }
+      function check() { var button = findSendButton(); if (button) finish(button); }
+      if (document.body) {
+        observer = new MutationObserver(check);
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+      }
+      timer = setTimeout(function () { finish(null); }, timeoutMs);
+      check();
+    });
   }
 
   // ---- extraction -----------------------------------------------------------
@@ -298,7 +411,9 @@
         url: location.href,
         logged_in: r.state === "logged_in",
         login: r,
-        input_found: found(S.input),
+        input_found: !!findComposer().element,
+        input_selector: findComposer().selector,
+        ready_state: document.readyState,
         send_button_found: found(S.send_button),
         messages_found: messages
       };
@@ -313,28 +428,27 @@
 
     send_message: function (a) {
       var cfg = parseArg(a);
-      var input = S.input ? q(S.input) : null;
-      if (!input) return { error_type: "page_changed", error: "input not found: " + S.input };
+      var found = findComposer();
+      var input = found.element;
+      if (!input) return { error_type: "page_changed", error: "ChatGPT message composer was not found. Expected a supported editable prompt field (last checked: " + found.selector + "). Open the sign-in window to refresh it, or choose a configured API/local model." };
+      if (!visible(input) || !editable(input)) return { error_type: "page_changed", error: "the detected message composer is not visible or editable; refresh the provider window or choose a configured API/local model" };
+      var beforeUsers = qAll('main [data-message-author-role="user"]').length;
       setEditorText(input, String(cfg.text || ""), A.input && A.input.kind);
-      // Give the site a beat to enable its send button, human-paced.
-      return new Promise(function (resolve) {
-        // Capture assistant-message count/text and begin observing BEFORE the
-        // send action can cause the first response mutation.
-        waitResponse(cfg).catch(function (e) {
-          if (window.console && console.warn) console.warn("[neelima] wait_response error", e);
-        });
-        setTimeout(function () {
-          var send = S.send_button ? q(S.send_button) : null;
-          if (!send || send.disabled) {
-            // Some sites enable via Enter
-            input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-            input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-            // Kick wait_response ourselves: the reply watcher lives per send.
-          } else {
-            send.click();
+      // Start response observation before triggering a single, configured send.
+      var responseWatch = waitResponse(cfg);
+      return waitForSendButton(5000).then(function (send) {
+        if (!send) {
+          responseWatch.cancel();
+          return { error_type: "page_changed", error: "the prompt field is available but no enabled supported Send button appeared; refresh the provider page or use a configured API/local model" };
+        }
+        send.click();
+        return waitSubmission(input, String(cfg.text || ""), beforeUsers, 8000).then(function (confirmed) {
+          if (!confirmed) {
+            responseWatch.cancel();
+            return { error_type: "send_not_confirmed", error: "ChatGPT did not confirm that the prompt entered its conversation. No retry was made to avoid sending it twice." };
           }
-          resolve({ sent: true });
-        }, 250);
+          return { sent: true };
+        });
       });
     },
 

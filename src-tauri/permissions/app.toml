@@ -21,6 +21,7 @@ commands.allow = [
   "ui_adapter_finish_inspector",
   "ui_providers_login",
   "ui_providers_close",
+  "ui_provider_clear_session",
   "ui_providers_list",
   "ui_models_local",
   "ui_task_start",
@@ -36,6 +37,7 @@ commands.allow = [
   "ui_terminal_kill",
   "ui_checkpoint_list",
   "ui_checkpoint_create",
+  "ui_checkpoint_restore_preview",
   "ui_checkpoint_restore",
   "ui_history_tasks",
   "ui_history_open",
@@ -44,8 +46,16 @@ commands.allow = [
   "ui_task_rename",
   "ui_task_delete",
   "ui_app_info",
+  "ui_skills_list",
+  "ui_skill_preview",
+  "ui_skill_install",
+  "ui_skill_set_enabled",
+  "ui_skill_uninstall",
+  "ui_skill_reveal",
+  "ui_skill_update_preview",
+  "ui_skill_read",
+  "ui_open_github",
   "ui_provider_diagnose",
-  "ui_provider_login_override",
 ]
 
 [[permission]]

@@ -1,5 +1,5 @@
 // Automations pane: live agent activity, running-command output, emergency stop.
-import { useStore } from "../store";
+import { toast, useStore } from "../store";
 import { cmd } from "../tauri";
 
 export function AutomationsPane() {
@@ -25,7 +25,7 @@ export function AutomationsPane() {
       </div>
       <div class="card">
         <h3>Checkpoints</h3>
-        <button class="ghost" onClick={async () => { try { await cmd.checkpointCreate("manual"); } catch (e) { console.error(e); } }}>Create checkpoint now</button>
+        <button class="ghost" onClick={async () => { try { const result = await cmd.checkpointCreate("manual"); toast("info", `Checkpoint created: ${String(result.id ?? "saved").slice(0, 12)}`); } catch (e) { toast("error", `Could not create checkpoint: ${String(e)}`); } }}>Create checkpoint now</button>
       </div>
     </div>
   );

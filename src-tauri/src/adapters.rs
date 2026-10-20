@@ -80,6 +80,31 @@ pub struct Adapter {
     pub login_url_patterns: Vec<String>,
 }
 
+/// Validate a per-profile start URL without widening the adapter's navigation
+/// boundary. The URL must be HTTPS and on the adapter's primary host or a
+/// subdomain of it; auth domains remain login-only.
+pub fn validate_profile_url(url: &str, allowed_domain: &str) -> Result<tauri::Url, String> {
+    let parsed = tauri::Url::parse(url).map_err(|_| "invalid provider URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "provider URL has no host".to_string())?
+        .to_ascii_lowercase();
+    let allowed = allowed_domain.trim_start_matches('.').to_ascii_lowercase();
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some_and(|port| port != 443)
+        || allowed.is_empty()
+        || !(host == allowed || host.ends_with(&format!(".{allowed}")))
+    {
+        return Err(
+            "provider URL must be HTTPS and remain within the selected adapter's allowed domain"
+                .into(),
+        );
+    }
+    Ok(parsed)
+}
+
 impl Default for Adapter {
     fn default() -> Self {
         Adapter {
@@ -216,6 +241,24 @@ pub fn spawn_watcher(dir: PathBuf, state: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_url_cannot_expand_adapter_origin_policy() {
+        assert!(validate_profile_url("https://chatgpt.com/custom", "chatgpt.com").is_ok());
+        assert!(validate_profile_url("https://sub.chatgpt.com/custom", "chatgpt.com").is_ok());
+        for url in [
+            "http://chatgpt.com/",
+            "https://chatgpt.com.evil.example/",
+            "https://user@chatgpt.com/",
+            "https://chatgpt.com:8443/",
+            "file:///C:/Windows/win.ini",
+        ] {
+            assert!(
+                validate_profile_url(url, "chatgpt.com").is_err(),
+                "accepted {url}"
+            );
+        }
+    }
 
     #[test]
     fn migrates_uncustomized_chatgpt_copy() {

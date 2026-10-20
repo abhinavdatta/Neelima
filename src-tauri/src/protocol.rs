@@ -68,6 +68,40 @@ pub fn parse_reply(reply: &str, nonce: Option<&str>) -> Parsed {
     Parsed::Neither
 }
 
+/// Return only user-facing prose from a provider response. Tool and result
+/// fences are protocol data and must not be shown as the assistant's answer.
+pub fn display_reply(reply: &str, parsed: &Parsed) -> String {
+    if let Parsed::Done(summary) = parsed {
+        return summary.trim().to_string();
+    }
+
+    let cleaned = strip_page_artifacts(reply);
+    let mut visible = Vec::new();
+    let mut lines = cleaned.lines().peekable();
+    while let Some(line) = lines.next() {
+        let hidden_protocol = is_open_fence(line) || is_result_open_fence(line);
+        if hidden_protocol {
+            while let Some(body_line) = lines.next() {
+                if is_close_fence(body_line) {
+                    break;
+                }
+            }
+        } else {
+            visible.push(line);
+        }
+    }
+    let prose = visible.join("\n").trim().to_string();
+    if prose.is_empty() {
+        return prose;
+    }
+    // For malformed tool responses, avoid exposing raw protocol fragments.
+    // The parser's concise error is emitted separately as a system activity.
+    if matches!(parsed, Parsed::Error(_)) && prose.starts_with('{') {
+        return String::new();
+    }
+    prose
+}
+
 /// Remove chat-UI artifacts that pollute extracted text: zero-width chars,
 /// citation tokens like 【1-b3d480】, stray soft hyphens.
 fn strip_page_artifacts(text: &str) -> String {
@@ -381,6 +415,7 @@ pub fn preamble(
 ```
 - One JSON object per block. Use straight double quotes, no trailing commas, no comments. Multiple blocks per reply are executed in order.
 - You will receive results as ```result blocks with matching ids. Send your next batch only after results arrive.
+- Neelima calls are handled by this text protocol; they do not appear as provider-native tools. When workspace work is needed, emit the requested ```tool block instead of claiming the tools are unavailable.
 - When the task is complete, reply exactly "DONE: <one-line summary>" and nothing else.
 - If a call fails, read the error and fix the call. Never invent results.
 
@@ -466,6 +501,22 @@ mod tests {
             Parsed::Done("finished up".into())
         );
         assert_eq!(parse_reply("working on it", None), Parsed::Neither);
+    }
+
+    #[test]
+    fn display_reply_hides_tool_protocol_and_shows_completion_once() {
+        let reply =
+            "I will inspect this.\n```tool\n{\"id\":\"1\",\"tool\":\"list_dir\",\"args\":{}}\n```";
+        let parsed = parse_reply(reply, None);
+        assert_eq!(display_reply(reply, &parsed), "I will inspect this.");
+
+        let done = "DONE: Files are ready";
+        let parsed = parse_reply(done, None);
+        assert_eq!(display_reply(done, &parsed), "Files are ready");
+
+        let only_call = "```tool\n{\"id\":\"1\",\"tool\":\"list_dir\",\"args\":{}}\n```";
+        let parsed = parse_reply(only_call, None);
+        assert!(display_reply(only_call, &parsed).is_empty());
     }
 
     #[test]

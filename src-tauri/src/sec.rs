@@ -58,7 +58,40 @@ impl CommandGuard {
     /// absolute paths / drive roots, plus inherently dangerous workflows
     /// (git push --force, git reset --hard, git clean, npm publish, ...).
     pub fn needs_ask(&self, command: &str) -> bool {
-        self.ask.iter().any(|re| re.is_match(command))
+        // Shells execute each side of compound commands/pipelines. Evaluate every
+        // segment independently so a harmless prefix cannot hide a destructive tail.
+        let segments = Self::split_command_segments(command);
+        segments.iter().any(|segment| {
+            self.ask.iter().any(|re| re.is_match(segment))
+                || Self::extra_always_ask_patterns().iter().any(|pattern| {
+                    RegexBuilder::new(pattern)
+                        .case_insensitive(true)
+                        .build()
+                        .map(|re| re.is_match(segment))
+                        .unwrap_or(true)
+                })
+        })
+    }
+
+    fn split_command_segments(command: &str) -> Vec<&str> {
+        // Conservative lexical split. Splitting inside quoted strings can cause
+        // extra approval prompts, which is safer than missing a destructive command.
+        command
+            .split(|c| matches!(c, '&' | '|' | ';' | '\n' | '\r'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn extra_always_ask_patterns() -> &'static [&'static str] {
+        &[
+            r"\bfind\b[^|;]*\s-delete\b",
+            r"\brm\s+-[^ ]*r[^ ]*\s+.*(\*|\?|\.\.)",
+            r"\bmv\b[^|;]*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE)",
+            r"\bshutil\.rmtree\s*\(",
+            r"\bpython(?:3)?\s+-c\b[^\n]*(shutil\.rmtree|os\.remove|os\.unlink)",
+            r"\bremove-item\b[^|;]*-recurse",
+        ]
     }
 }
 
@@ -188,5 +221,19 @@ mod tests {
         assert!(!g.needs_ask("git status"));
         assert!(!g.needs_ask("cargo test"));
         assert!(!g.needs_ask("npm test"));
+    }
+
+    #[test]
+    fn compound_commands_cannot_hide_destructive_segments() {
+        let g = CommandGuard::new(&[], &[]).unwrap();
+        for cmd in [
+            "cd .. && rm -rf *",
+            "python -c \"import shutil;shutil.rmtree('/')\"",
+            "find . -delete",
+            "mv ~ /tmp/x",
+            "Get-ChildItem C:\\ | Remove-Item -Recurse",
+        ] {
+            assert!(g.needs_ask(cmd), "must ask before: {cmd}");
+        }
     }
 }

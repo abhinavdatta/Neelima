@@ -155,10 +155,38 @@ pub fn kill(state: &TermState, id: u32) -> Result<(), String> {
 fn default_shell() -> String {
     #[cfg(windows)]
     {
+        // Prefer modern PowerShell when installed, while keeping Windows
+        // PowerShell as the out-of-box fallback on stock Windows machines.
+        for candidate in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+            if executable_in_path(candidate) {
+                return if candidate == "pwsh.exe" || candidate == "powershell.exe" {
+                    format!("{candidate} -NoLogo")
+                } else {
+                    candidate.into()
+                };
+            }
+        }
         "powershell.exe -NoLogo".into()
     }
     #[cfg(not(windows))]
     {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+        if let Ok(shell) = std::env::var("SHELL") {
+            if std::path::Path::new(&shell).is_file() {
+                return shell;
+            }
+        }
+        ["/bin/bash", "/bin/zsh", "/bin/sh"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).is_file())
+            .unwrap_or("/bin/sh")
+            .into()
     }
+}
+
+#[cfg(windows)]
+fn executable_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|directory| directory.join(name).is_file())
 }

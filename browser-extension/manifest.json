@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Neelima Browser Bridge",
+  "short_name": "Neelima Bridge",
+  "version": "0.1.0",
+  "description": "Connect compatible browser AI chats to Neelima's local, permission-controlled workspace tools.",
+  "permissions": ["nativeMessaging", "storage", "activeTab", "scripting"],
+  "optional_host_permissions": ["https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Neelima Browser Bridge", "default_popup": "popup/index.html" },
+  "options_page": "options/index.html",
+  "content_scripts": [
+    { "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"], "js": ["content/chatgpt.js"], "run_at": "document_idle" },
+    { "matches": ["https://claude.ai/*"], "js": ["content/claude.js"], "run_at": "document_idle" },
+    { "matches": ["https://gemini.google.com/*"], "js": ["content/gemini.js"], "run_at": "document_idle" }
+  ]
+}

@@ -154,6 +154,9 @@ macOS/Linux/Flatpak artifacts are built by CI on their native OSes (see `.github
 
 ## The bridge protocol
 
+Skills import, storage, trust, and task-selection behavior is documented in
+[`docs/SKILLS.md`](docs/SKILLS.md).
+
 Web chat UIs have no tool calling, so Neelima teaches the AI a small text protocol on the first turn (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md)):
 
 ````
@@ -178,6 +181,10 @@ Loop until the AI replies `DONE: <summary>`. Hard limits: max iterations (defaul
 
 Chunked writes via `append: true` because chat replies have length limits.
 
+## Browser extension (integration in progress)
+
+The repository includes the source for a Chrome and Edge Manifest V3 extension with ChatGPT, Claude, Gemini, generic-site, and manual relay adapters. The current extension package does **not** include a registered Native Messaging host or a browser-request handler in Neelima, so it cannot perform file operations yet. See [`docs/BROWSER_EXTENSION.md`](docs/BROWSER_EXTENSION.md) for the current status, installation, protocol, and security limitations.
+
 ## Safety model
 
 - **Workspace confinement**: every path is rejected unless it canonicalizes inside the workspace root (traversal, absolute paths, Windows device names, and symlink escapes are refused — enforced on every tool).
@@ -194,6 +201,7 @@ Chunked writes via `append: true` because chat replies have length limits.
 
 - The provider web chat runs in a **separate child webview** with a **per-profile persistent data directory** (`data_directory` on Windows/Linux, `data_store_identifier` on macOS ≥ 14) — logins survive restarts, one webview alive at a time, hidden/unused webviews are **destroyed** to free memory.
 - **Neelima never reads, stores, logs or transmits credentials, cookies or tokens.** Auth happens entirely inside the webview.
+- **Cloud data flow:** when using ChatGPT, Claude, Gemini, or another embedded cloud chat, prompts and tool results are sent through that provider's website. A local file read may therefore send its contents to the provider, subject to its policies. There is no per-provider/session content-consent gate or automatic sensitive-file exclusion yet; avoid sending sensitive files to cloud chats. Local-model use stays on the configured local endpoint.
 - The provider page's capability grants **exactly one command** (`lb_bridge`), a small typed, size-capped intake. The app ACL manifest denies it every other command; every other command additionally label-checks its caller. See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md).
 - **Pace**: actions are human-paced (no hammering, no multi-account rotation, no rate-limit evasion). Automating a site's UI may violate that provider's terms — that is between you and the provider.
 - **Manual relay is first-class**: with no adapter configured (or on adapter failure) the task continues via copy/paste with identical parsing, approvals and checkpoints.
@@ -235,7 +243,7 @@ spike/         Phase-0 spike proving multiwebview + data-dir isolation + narrow 
 Prereqs: Rust (MSVC on Windows), Node 20+, and on Linux `libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev`.
 
 ```bash
-npm --prefix ui install
+npm ci --prefix ui           # run from the repository root; the lockfile is in ui/
 npm --prefix ui run build      # required before a plain cargo build
 cd src-tauri && cargo test     # unit tests: protocol, confinement, tools, guard
 cargo build --release          # standalone app; serves the bundled UI

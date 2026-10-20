@@ -4,6 +4,7 @@ import { useEffect, useState } from "preact/hooks";
 import { resetTask, setState, toast, useStore } from "../store";
 import type { TaskMeta, WorkspaceEntry } from "../types";
 import { cmd } from "../tauri";
+import { Icon } from "./Icon";
 
 function TaskItem({ t }: { t: TaskMeta }) {
   const s = useStore();
@@ -61,7 +62,7 @@ function TaskItem({ t }: { t: TaskMeta }) {
             <span class="task-title">{t.title}</span>
             <span class="task-time">{relTime(t.started_ms)}</span>
           </button>
-          <button class="ti-menu" title="Task options" onClick={() => setMenu(!menu)}>⋯</button>
+          <button class="ti-menu icon-button" title="Task options" aria-label={`Options for ${t.title}`} onClick={() => setMenu(!menu)}><Icon name="more" size={16} /></button>
         </>
       )}
       {menu ? (
@@ -88,32 +89,29 @@ export function Sidebar() {
     <aside class="sidebar">
       <nav class="rail-nav" aria-label="Main navigation">
         <button class="rail-button rail-new" title={s.activeWorkspacePath ? "New task" : "Choose a project folder"} aria-label={s.activeWorkspacePath ? "New task" : "Choose a project folder"} onClick={start}>
-          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+          <Icon name="add" />
         </button>
         <button class={`rail-button ${s.view === "search" ? "active" : ""}`} title="Search" aria-label="Search" onClick={() => { setPanel(null); setState({ view: "search" }); }}>
-          <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4.5 4.5" /></svg>
-        </button>
-        <button class={`rail-button ${s.view === "provider" ? "active" : ""}`} title="Providers" aria-label="Providers" onClick={() => { setPanel(null); setState({ view: "provider" }); }}>
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="m14.8 8.3-2.1 5.1-5.1 2.3 2.2-5.2 5-2.2Z" /></svg>
+          <Icon name="search" />
         </button>
         <button class={`rail-button ${panel === "tools" ? "active" : ""}`} title="Tools and files" aria-label="Tools and files" onClick={() => setPanel(panel === "tools" ? null : "tools")}>
-          <svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1.4" /><rect x="14" y="4" width="6" height="6" rx="1.4" /><rect x="4" y="14" width="6" height="6" rx="1.4" /><rect x="14" y="14" width="6" height="6" rx="1.4" /></svg>
+          <Icon name="grid" />
         </button>
         <button class={`rail-button ${panel === "history" ? "active" : ""}`} title="Projects and recent tasks" aria-label="Projects and recent tasks" onClick={() => setPanel(panel === "history" ? null : "history")}>
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></svg>
+          <Icon name="history" />
         </button>
       </nav>
       {panel ? (
         <div class="rail-popover">
           <div class="rail-popover-head">
             <strong>{panel === "history" ? "Projects & recent tasks" : "Workspace tools"}</strong>
-            <button class="rail-close" aria-label="Close panel" onClick={() => setPanel(null)}>×</button>
+            <button class="rail-close icon-button" aria-label="Close panel" onClick={() => setPanel(null)}><Icon name="close" size={16} /></button>
           </div>
           {panel === "history" ? (
             <>
               <div class="rail-popover-section">Projects</div>
               {s.workspaces.map((w) => <ProjectItem key={w.id} w={w} active={s.activeWorkspace === w.id} />)}
-              <button class="rail-add" onClick={() => void addWorkspace()}>＋ Add project folder</button>
+              <button class="rail-add" onClick={() => void addWorkspace()}><Icon name="add" size={16} /> Add project folder</button>
               <div class="rail-popover-section">Recent tasks</div>
               {s.tasks.length === 0 ? <div class="side-empty">No tasks yet</div> : null}
               {s.tasks.slice(0, 20).map((t) => <TaskItem key={t.id} t={t} />)}
@@ -124,11 +122,15 @@ export function Sidebar() {
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "files" }); }}>Browse project files</button>
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "automations" }); }}>Automations</button>
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "marketplace" }); }}>Plugin marketplace</button>
+              <button class="rail-action" onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>Settings</button>
             </>
           )}
         </div>
       ) : null}
       <div class="rail-bottom">
+        <button class={`rail-button rail-settings ${s.settingsOpen ? "active" : ""}`} title="Settings" aria-label="Open Settings" aria-expanded={s.settingsOpen} onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>
+          <Icon name="settings" size={19} />
+        </button>
         <button class="rail-logo" title="Neelima home" aria-label="Neelima home" onClick={start}>N</button>
       </div>
     </aside>
@@ -189,10 +191,10 @@ function ProjectItem({ w, active }: { w: WorkspaceEntry; active: boolean }) {
       ) : (
         <>
           <button class="pi-open" onClick={open} title={w.path}>
-            <svg viewBox="0 0 16 16" class="ic folder"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5H13A1.5 1.5 0 0 1 14.5 6v5A1.5 1.5 0 0 1 13 12.5H3.5A1.5 1.5 0 0 1 2 11V4.5Z" fill="#5b8def" /></svg>
+            <Icon name="folder" class="ic folder" size={16} />
             <span>{w.name}</span>
           </button>
-          <button class="pi-menu" title="Folder options" onClick={() => setMenu(!menu)}>⋯</button>
+          <button class="pi-menu icon-button" title="Folder options" aria-label={`Options for ${w.name}`} onClick={() => setMenu(!menu)}><Icon name="more" size={16} /></button>
         </>
       )}
       {menu ? (
@@ -233,7 +235,7 @@ function Checkpoints() {
     <>
       <div class="side-section cp-head">
         <span>Checkpoints</span>
-        <button class="ghost" onClick={() => setOpen(!open)}>{open ? "▾" : "▸"}</button>
+        <button class="ghost icon-button" aria-label={open ? "Collapse checkpoints" : "Expand checkpoints"} onClick={() => setOpen(!open)}><Icon name="chevron" size={16} class={open ? "chevron-open" : ""} /></button>
       </div>
       {open ? (
         <div class="side-list checkpoints">

@@ -4,6 +4,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { toast, useStore } from "../store";
 import { cmd } from "../tauri";
+import { Icon } from "./Icon";
 
 interface TreeNode {
   name: string;
@@ -61,8 +62,8 @@ export function FileTree() {
         <span>Files</span>
         <button class="ghost" title="Refresh" onClick={async () => {
           try { const r = await cmd.tree(""); setRoots(r.entries.map((e: any) => ({ ...e }))); } catch { /* ignore */ }
-        }}>↻</button>
-        <button class="ghost" title="Collapse" onClick={() => setShow(!show)}>{show ? "‹" : "›"}</button>
+        }}><Icon name="refresh" size={16} /></button>
+        <button class="ghost" title={show ? "Collapse" : "Expand"} aria-label={show ? "Collapse file tree" : "Expand file tree"} onClick={() => setShow(!show)}><Icon name={show ? "chevron-left" : "chevron-right"} size={16} /></button>
       </div>
       {show ? (
         <div class="ft-body">
@@ -87,7 +88,7 @@ function NodeView({ node, depth, onToggle }: { node: TreeNode; depth: number; on
   return (
     <>
       <div class="ft-row" style={`padding-left: ${depth * 14 + 6}px`} onClick={() => onToggle(node)}>
-        <span class="ft-caret">{node.dir ? (open ? "▾" : "▸") : ""}</span>
+        <span class={`ft-caret ${open ? "ft-caret-open" : ""}`}>{node.dir ? <Icon name="chevron-right" size={13} /> : null}</span>
         <span class={`ft-name ${node.dir ? "ft-dir" : "ft-file"}`}>{node.name}</span>
       </div>
       {open && node.children ? node.children.map((c) => <NodeView node={c} depth={depth + 1} onToggle={onToggle} />) : null}

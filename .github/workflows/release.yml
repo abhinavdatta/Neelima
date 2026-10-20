@@ -149,6 +149,11 @@ jobs:
           }
           Compress-Archive -Path $env:APP_EXE_PATH -DestinationPath Neelima-portable-windows-x64.zip
 
+      - name: Package browser extension and checksum (Windows)
+        if: matrix.portable
+        shell: pwsh
+        run: ./scripts/package-browser-extension.ps1
+
       - name: Collect artifacts
         shell: bash
         run: |
@@ -162,6 +167,8 @@ jobs:
           path: |
             dist/*
             Neelima-portable-windows-x64.zip
+            dist/Neelima-Browser-Extension.zip
+            dist/Neelima-Browser-Extension.zip.sha256
 
   flatpak:
     runs-on: ubuntu-22.04

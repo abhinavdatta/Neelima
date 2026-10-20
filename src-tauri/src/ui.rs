@@ -379,7 +379,9 @@ pub async fn ui_adapter_start_inspector(
         url,
     });
     let profile = "inspector";
-    webprov::mount(&app, profile, &adapter, &state).await
+    webprov::mount(&app, profile, &adapter, &state).await?;
+    webprov::set_visible(&app, &state, true);
+    Ok(())
 }
 
 #[tauri::command]
@@ -505,7 +507,11 @@ pub async fn ui_providers_login(
         .find(|a| a.id == profile.adapter_id)
         .cloned()
         .ok_or("adapter missing for profile")?;
-    webprov::mount(&app, &profile_id, &adapter, &state).await
+    webprov::mount(&app, &profile_id, &adapter, &state).await?;
+    // The user explicitly opened provider sign-in, so reveal the isolated
+    // authentication view. Agent sends only mount/use it while hidden.
+    webprov::set_visible(&app, &state, true);
+    Ok(())
 }
 
 #[tauri::command]
@@ -520,6 +526,27 @@ pub fn ui_providers_close(
     }
     webprov::unmount_if_any(&app, &state);
     Ok(())
+}
+
+#[tauri::command]
+pub fn ui_provider_clear_session(
+    webview: Webview,
+    app: AppHandle,
+    state: State<'_, Arc<WebviewState>>,
+    settings: State<'_, SettingsStore>,
+    profile_id: String,
+) -> Result<(), String> {
+    guard(&webview)?;
+    if !settings
+        .get()
+        .providers
+        .web
+        .iter()
+        .any(|profile| profile.id == profile_id)
+    {
+        return Err("provider profile not found".into());
+    }
+    webprov::clear_profile_session(&app, &state, &profile_id)
 }
 
 /// A11: diagnostics for the "can't reach the page" flow in ProviderPane.
@@ -623,6 +650,12 @@ pub async fn ui_provider_diagnose(
         crate::webprov::LoginState::Unknown { reason, url } => {
             ("unknown".into(), url.clone(), reason.clone())
         }
+        crate::webprov::LoginState::Loading { reason, url } => {
+            ("loading".into(), url.clone(), reason.clone())
+        }
+        crate::webprov::LoginState::Challenge { reason, url } => {
+            ("challenge".into(), url.clone(), reason.clone())
+        }
     };
     Ok(json!({
         "mounted": true,
@@ -638,7 +671,6 @@ pub async fn ui_provider_diagnose(
         "input_found": input_found,
         "send_button_found": send_found,
         "messages_found": messages_found,
-        "manual_fallback": *state.manual_fallback.lock().unwrap(),
         "last_bridge_error": *state.last_bridge_error.lock().unwrap(),
         "bridge_log_path": hub.log_path().map(|p| p.display().to_string()),
         "bridge_log_write_error": hub.log_write_error(),
@@ -648,26 +680,6 @@ pub async fn ui_provider_diagnose(
             "profile": settings.get().providers.web.iter().find(|p| p.id == profile_id).map(|p| p.name.clone()).unwrap_or_default(),
         },
     }))
-}
-
-/// A4: the "I'm logged in, continue" override — flips the push-derived login
-/// posture so a stuck task/onboarding can proceed without a remount.
-#[tauri::command]
-pub fn ui_provider_login_override(
-    webview: Webview,
-    state: State<'_, Arc<WebviewState>>,
-    app: AppHandle,
-) -> Result<(), String> {
-    guard(&webview)?;
-    let url = match &*state.login.lock().unwrap() {
-        crate::webprov::LoginState::Unknown { url, .. } => url.clone(),
-        crate::webprov::LoginState::LoggedOut { url } => url.clone(),
-        crate::webprov::LoginState::LoggedIn { url } => url.clone(),
-    };
-    *state.login.lock().unwrap() = crate::webprov::LoginState::LoggedIn { url };
-    state.login_changed.notify_waiters();
-    let _ = app.emit("evt", serde_json::json!({"kind": "provider-login-state", "state": "logged_in", "reason": "manual override"}));
-    Ok(())
 }
 
 #[tauri::command]
@@ -735,13 +747,30 @@ pub fn ui_task_start(
     active: State<'_, ActiveAgent>,
     prompt: String,
     provider_id: String,
+    skill_ids: Vec<String>,
+    skill_budget: usize,
+    request_id: String,
 ) -> Result<String, String> {
     guard(&webview)?;
+    if request_id.len() != 32 || !request_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid task start request ID".into());
+    }
     let mut active_guard = active.0.lock().unwrap();
     if active_guard.is_some() {
         return Err("a task is already running — stop it first".into());
     }
     let ws = ws_from(&slot)?;
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let app_skills = config_dir.join("skills");
+    let workspace_skills = ws.root().join(".neelima").join("skills");
+    crate::skills::validate_root_under(&config_dir, &app_skills)?;
+    crate::skills::validate_root_under(ws.root(), &workspace_skills)?;
+    let skill_context = crate::skills::task_context(
+        &app_skills,
+        Some(&workspace_skills),
+        &skill_ids,
+        skill_budget,
+    )?;
     let settings_snapshot = settings.get();
     let provider = build_provider(
         &app,
@@ -753,7 +782,8 @@ pub fn ui_task_start(
         &provider_id,
     )?;
 
-    let task_id = format!("t{}", uuid::Uuid::new_v4().simple());
+    let task_id = uuid::Uuid::new_v4().simple().to_string();
+    let response_task_id = task_id.clone();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(AgentShared {
         cmd_tx,
@@ -767,18 +797,22 @@ pub fn ui_task_start(
         app: app.clone(),
         task_id,
         prompt,
+        skill_context,
         provider,
         ws,
         settings: settings_snapshot,
         history: history.inner().clone(),
         webview_state: webview_state.inner().clone(),
-        relay: relay.inner().clone(),
         shared,
         prior_entries: Vec::new(),
     };
+    let _ = app.emit(
+        crate::agent::EVT,
+        json!({"kind":"task-started", "task_id":response_task_id, "request_id":request_id}),
+    );
     tauri::async_runtime::spawn(crate::agent::run(input));
     drop(active_guard);
-    Ok("started".into())
+    Ok(response_task_id)
 }
 
 fn build_provider(
@@ -797,7 +831,7 @@ fn build_provider(
             .iter()
             .find(|p| p.id == profile_id)
             .ok_or("profile not found")?;
-        let adapter = adapters
+        let mut adapter = adapters
             .list
             .lock()
             .unwrap()
@@ -805,6 +839,10 @@ fn build_provider(
             .find(|a| a.id == profile.adapter_id)
             .cloned()
             .ok_or("adapter missing")?;
+        if let Some(url) = profile.url.as_deref() {
+            crate::adapters::validate_profile_url(url, &adapter.allowed_domain)?;
+            adapter.url = url.to_string();
+        }
         return Ok(Provider::Web(Box::new(crate::webprov::WebProvider {
             app: app.clone(),
             profile_id: profile_id.to_string(),
@@ -876,7 +914,8 @@ pub fn ui_task_continue(
     provider_id: String,
 ) -> Result<String, String> {
     guard(&webview)?;
-    if active.get().is_some() {
+    let mut active_guard = active.0.lock().unwrap();
+    if active_guard.is_some() {
         return Err("a task is already running — stop it first".into());
     }
     let prior = history.read_transcript(&task_id, 100)?;
@@ -897,7 +936,8 @@ pub fn ui_task_continue(
         relay.inner(),
         &provider_id,
     )?;
-    let new_task_id = format!("t{}", uuid::Uuid::new_v4().simple());
+    let new_task_id = uuid::Uuid::new_v4().simple().to_string();
+    let response_task_id = new_task_id.clone();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(AgentShared {
         cmd_tx,
@@ -905,22 +945,23 @@ pub fn ui_task_continue(
         state: std::sync::Mutex::new(crate::agent::AgentState::Idle),
         task_id: std::sync::Mutex::new(Some(new_task_id.clone())),
     });
-    *active.0.lock().unwrap() = Some(shared.clone());
+    *active_guard = Some(shared.clone());
     let input = AgentInput {
         app: app.clone(),
         task_id: new_task_id,
         prompt: format!("Continue the previous task: {last_prompt}"),
+        skill_context: String::new(),
         provider,
         ws,
         settings: settings_snapshot,
         history: history.inner().clone(),
         webview_state: webview_state.inner().clone(),
-        relay: relay.inner().clone(),
         shared,
         prior_entries: prior,
     };
     tauri::async_runtime::spawn(crate::agent::run(input));
-    Ok("started".into())
+    drop(active_guard);
+    Ok(response_task_id)
 }
 
 #[tauri::command]
@@ -1138,6 +1179,9 @@ pub fn ui_task_rename(
     title: String,
 ) -> Result<Value, String> {
     guard(&webview)?;
+    if !crate::history::valid_task_id(&id) {
+        return Err("invalid task ID".into());
+    }
     let clean = title.trim();
     if clean.is_empty() || clean.len() > 80 {
         return Err("title must be 1..=80 chars".into());
@@ -1185,6 +1229,218 @@ pub fn ui_diff_get(
     Err("entry has no diff".into())
 }
 
+fn skill_root(
+    app: &AppHandle,
+    slot: &WorkspaceSlot,
+    location: &str,
+) -> Result<std::path::PathBuf, String> {
+    match location {
+        "app" => {
+            let base = app.path().app_config_dir().map_err(|e| e.to_string())?;
+            let root = base.join("skills");
+            crate::skills::validate_root_under(&base, &root)?;
+            Ok(root)
+        }
+        "workspace" => {
+            let base = ws_from(slot)?.root().to_path_buf();
+            let root = base.join(".neelima").join("skills");
+            crate::skills::validate_root_under(&base, &root)?;
+            Ok(root)
+        }
+        _ => Err("skill location must be app or workspace".into()),
+    }
+}
+
+#[tauri::command]
+pub fn ui_skills_list(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+) -> Result<Vec<crate::skills::InstalledSkill>, String> {
+    guard(&webview)?;
+    let mut skills = crate::skills::installed(&skill_root(&app, &slot, "app")?, "app")?;
+    if slot.0.lock().unwrap().is_some() {
+        skills.extend(crate::skills::installed(
+            &skill_root(&app, &slot, "workspace")?,
+            "workspace",
+        )?);
+    }
+    Ok(skills)
+}
+
+#[tauri::command]
+pub async fn ui_skill_preview(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    repo_url: String,
+    branch: String,
+    path: String,
+    location: String,
+) -> Result<crate::skills::SkillPreview, String> {
+    guard(&webview)?;
+    let root = skill_root(&app, &slot, &location)?;
+    crate::skills::preview(&repo_url, &branch, &path, &root).await
+}
+
+#[tauri::command]
+pub async fn ui_skill_install(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    preview: crate::skills::SkillPreview,
+    location: String,
+    replace_existing: bool,
+) -> Result<crate::skills::InstalledSkill, String> {
+    guard(&webview)?;
+    let root = skill_root(&app, &slot, &location)?;
+    let mut result = crate::skills::install(&preview, &root, replace_existing).await?;
+    result.location = location;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn ui_skill_set_enabled(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    location: String,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    guard(&webview)?;
+    crate::skills::set_enabled(&skill_root(&app, &slot, &location)?, &id, enabled)
+}
+
+#[tauri::command]
+pub fn ui_skill_uninstall(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    location: String,
+    id: String,
+) -> Result<(), String> {
+    guard(&webview)?;
+    crate::skills::uninstall(&skill_root(&app, &slot, &location)?, &id)
+}
+
+#[tauri::command]
+pub fn ui_skill_reveal(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    location: String,
+    id: String,
+) -> Result<(), String> {
+    guard(&webview)?;
+    crate::skills::safe_skill_id(&id)?;
+    let dir = skill_root(&app, &slot, &location)?.join(&id);
+    if !dir.join(".neelima-skill.json").is_file() {
+        return Err("installed skill not found".into());
+    }
+    #[cfg(windows)]
+    {
+        crate::procspawn::hidden_std("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::procspawn::hidden_std("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::procspawn::hidden_std("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ui_skill_update_preview(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    location: String,
+    id: String,
+) -> Result<crate::skills::SkillPreview, String> {
+    guard(&webview)?;
+    crate::skills::safe_skill_id(&id)?;
+    let root = skill_root(&app, &slot, &location)?;
+    let list = crate::skills::installed(&root, &location)?;
+    let skill = list
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or("installed skill not found")?;
+    crate::skills::preview(
+        &format!("https://github.com/{}", skill.source_repo),
+        &skill.branch,
+        &skill.source_path,
+        &root,
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn ui_skill_read(
+    webview: Webview,
+    app: AppHandle,
+    slot: State<'_, WorkspaceSlot>,
+    location: String,
+    id: String,
+) -> Result<String, String> {
+    guard(&webview)?;
+    crate::skills::read_skill(&skill_root(&app, &slot, &location)?, &id)
+}
+
+#[tauri::command]
+pub fn ui_open_github(webview: Webview, url: String) -> Result<(), String> {
+    guard(&webview)?;
+    let parsed = validate_github_url(&url)?;
+    #[cfg(windows)]
+    {
+        crate::procspawn::hidden_std("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::procspawn::hidden_std("open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        crate::procspawn::hidden_std("xdg-open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn validate_github_url(url: &str) -> Result<tauri::Url, String> {
+    let parsed = tauri::Url::parse(url).map_err(|_| "invalid GitHub URL")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || !matches!(parsed.port(), None | Some(443))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("only HTTPS github.com links on the default port can be opened".into());
+    }
+    Ok(parsed)
+}
+
 #[tauri::command]
 pub fn ui_app_info(webview: Webview, settings: State<'_, SettingsStore>) -> Result<Value, String> {
     guard(&webview)?;
@@ -1195,4 +1451,28 @@ pub fn ui_app_info(webview: Webview, settings: State<'_, SettingsStore>) -> Resu
         "settings_path": settings.path().to_string_lossy(),
         "os": std::env::consts::OS,
     }))
+}
+
+#[cfg(test)]
+mod github_url_tests {
+    use super::validate_github_url;
+
+    #[test]
+    fn accepts_https_github_links() {
+        assert!(validate_github_url("https://github.com/search?q=SKILL.md").is_ok());
+        assert!(validate_github_url("https://github.com:443/org/repo").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_github_or_unsafe_urls() {
+        for url in [
+            "http://github.com/org/repo",
+            "https://github.com.evil.example/org/repo",
+            "https://user@github.com/org/repo",
+            "https://github.com:8443/org/repo",
+            "javascript:alert(1)",
+        ] {
+            assert!(validate_github_url(url).is_err(), "accepted {url}");
+        }
+    }
 }

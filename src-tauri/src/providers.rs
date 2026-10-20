@@ -43,7 +43,10 @@ impl Provider {
         match self {
             Provider::Web(w) => w.send(task_id, text, first_of_task).await,
             Provider::Local(l) => l.send(text).await.map_err(ProviderError::SendFailed),
-            Provider::Manual(m) => m.send(text).await.map_err(ProviderError::SendFailed),
+            Provider::Manual(m) => m
+                .send(task_id, text)
+                .await
+                .map_err(ProviderError::SendFailed),
         }
     }
 
@@ -88,11 +91,12 @@ impl ManualProvider {
         ManualProvider { app, relay }
     }
 
-    pub async fn send(&mut self, text: &str) -> Result<(), String> {
+    pub async fn send(&mut self, task_id: &str, text: &str) -> Result<(), String> {
         use tauri::Emitter;
-        let _ = self
-            .app
-            .emit("evt", json!({"kind": "relay-outbound", "text": text}));
+        let _ = self.app.emit(
+            "evt",
+            json!({"kind": "relay-outbound", "task_id": task_id, "text": text}),
+        );
         Ok(())
     }
 
@@ -100,7 +104,10 @@ impl ManualProvider {
         let (tx, rx) = oneshot::channel();
         *self.relay.0.lock().unwrap() = Some(tx);
         tokio::select! {
-            r = rx => r.map_err(|_| "manual relay closed".to_string()),
+            r = tokio::time::timeout(std::time::Duration::from_secs(600), rx) => match r {
+                Ok(reply) => reply.map_err(|_| "manual relay closed".to_string()),
+                Err(_) => Err("manual relay timed out after 10 minutes; retry the task or choose another provider".into()),
+            },
             _ = cancel.notified() => Err("stopped".into()),
         }
     }
@@ -274,7 +281,7 @@ impl LocalProvider {
         let url = match self.kind {
             LocalKind::Ollama => format!("{}/api/chat", self.cfg.url.trim_end_matches('/')),
             LocalKind::LmStudio => {
-                format!("{}/v1/chat/completions", self.cfg.url.trim_end_matches('/'))
+                format!("{}/chat/completions", openai_compatible_base(&self.cfg.url))
             }
         };
         let (tx, mut rx) = mpsc::channel::<String>(64);
@@ -368,12 +375,19 @@ impl LocalProvider {
     }
 }
 
+/// Normalize an OpenAI-compatible endpoint base. Accept both http://host:port
+/// and http://host:port/v1 without ever generating /v1/v1/... URLs.
+fn openai_compatible_base(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string() + "/v1"
+}
+
 /// List models from a local server (GET only).
 pub async fn list_models(kind: LocalKind, base_url: &str) -> Result<Vec<String>, String> {
     let client = LocalProvider::client()?;
     let url = match kind {
         LocalKind::Ollama => format!("{}/api/tags", base_url.trim_end_matches('/')),
-        LocalKind::LmStudio => format!("{}/v1/models", base_url.trim_end_matches('/')),
+        LocalKind::LmStudio => format!("{}/models", openai_compatible_base(base_url)),
     };
     let resp = client
         .get(&url)
@@ -456,5 +470,21 @@ mod tests {
         assert_eq!(body["options"]["num_ctx"], 16_384);
         assert_eq!(body["options"]["temperature"], 0.25);
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn openai_compatible_base_normalizes_v1_suffix() {
+        for input in [
+            "http://localhost:1234",
+            "http://localhost:1234/",
+            "http://localhost:1234/v1",
+            "http://localhost:1234/v1/",
+        ] {
+            assert_eq!(
+                openai_compatible_base(input),
+                "http://localhost:1234/v1",
+                "input: {input}"
+            );
+        }
     }
 }

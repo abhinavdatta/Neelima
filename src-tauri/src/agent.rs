@@ -16,7 +16,7 @@ use crate::checkpoints;
 use crate::exec;
 use crate::history::{self, CallRecord, DiffInfo, HistoryStore, TranscriptEntry};
 use crate::protocol::{self, Parsed, ToolCall};
-use crate::providers::{ManualProvider, Provider, RelaySlot};
+use crate::providers::Provider;
 use crate::sec::{injection_heuristic, CommandGuard};
 use crate::settings::Settings;
 use crate::tools;
@@ -41,6 +41,7 @@ pub enum AgentState {
     Executing,
     Done,
     Error,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -108,12 +109,12 @@ pub struct AgentInput {
     pub app: tauri::AppHandle,
     pub task_id: String,
     pub prompt: String,
+    pub skill_context: String,
     pub provider: Provider,
     pub ws: Workspace,
     pub settings: Settings,
     pub history: Arc<HistoryStore>,
     pub webview_state: Arc<WebviewState>,
-    pub relay: Arc<RelaySlot>,
     pub shared: Arc<AgentShared>,
     pub prior_entries: Vec<TranscriptEntry>,
 }
@@ -139,12 +140,52 @@ fn call_risk(tool: &str) -> &'static str {
     }
 }
 
+fn tool_needs_approval(
+    tool: &str,
+    args: &Value,
+    mode: crate::settings::PermissionMode,
+    guard: &CommandGuard,
+) -> bool {
+    if tool == "run_command" {
+        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        if guard.needs_ask(command) {
+            return true;
+        }
+    }
+    match call_risk(tool) {
+        "read" => !mode.auto_approve_read(),
+        "write" => !mode.auto_approve_write(),
+        "command" => !mode.auto_approve_command(),
+        _ => !mode.auto_approve_write(),
+    }
+}
+
 const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "delete_file", "move_file"];
+
+fn completion_reports_unavailable_tools(summary: &str) -> bool {
+    let summary = summary.to_ascii_lowercase();
+    summary.contains("tool")
+        && [
+            "not available",
+            "unavailable",
+            "not accessible",
+            "cannot access",
+            "unable to access",
+        ]
+        .iter()
+        .any(|phrase| summary.contains(phrase))
+}
 
 pub async fn run(mut input: AgentInput) {
     let app = input.app.clone();
     let shared = input.shared.clone();
-    let _provider_task = ProviderTaskGuard::start(app.clone(), input.webview_state.clone());
+    let _lifecycle = AgentLifecycleGuard::start(
+        app.clone(),
+        input.task_id.clone(),
+        shared.clone(),
+        input.history.clone(),
+        input.webview_state.clone(),
+    );
 
     let stop = Arc::new(Notify::new());
     let halted = Arc::new(AtomicBool::new(false));
@@ -174,6 +215,7 @@ pub async fn run(mut input: AgentInput) {
 
     let ws_name = input.ws.display_name();
     let mut meta = match input.history.create_task(
+        &input.task_id,
         input.prompt.lines().next().unwrap_or("task"),
         &ws_name,
         &input.provider.describe(),
@@ -195,18 +237,30 @@ pub async fn run(mut input: AgentInput) {
     let push = |e: TranscriptEntry| -> TranscriptEntry {
         let mut e = e;
         e.id = history.next_entry_id();
-        let _ = history.append(&task_id, &e);
-        emit(
-            &app,
-            AgentEvent {
-                kind: "transcript".into(),
-                state: None,
-                task_id: Some(task_id.clone()),
-                entry: Some(e.clone()),
-                pending_calls: None,
-                text: None,
-            },
-        );
+        match history.append_once(&task_id, &e) {
+            Ok(true) => emit(
+                &app,
+                AgentEvent {
+                    kind: "transcript".into(),
+                    state: None,
+                    task_id: Some(task_id.clone()),
+                    entry: Some(e.clone()),
+                    pending_calls: None,
+                    text: None,
+                },
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                let _ = app.emit(
+                    EVT,
+                    json!({
+                        "kind": "notify",
+                        "level": "error",
+                        "text": format!("Could not save task transcript: {error}"),
+                    }),
+                );
+            }
+        }
         e
     };
 
@@ -253,12 +307,17 @@ pub async fn run(mut input: AgentInput) {
         "system",
         format!("protocol preamble sent to {}", input.provider.describe()),
     ));
+    if !input.skill_context.is_empty() {
+        push(entry(
+            "system",
+            "Selected skills were added to this task as untrusted reference content.".into(),
+        ));
+    }
 
     let guard = match CommandGuard::new(&input.settings.command_allow, &input.settings.command_deny)
     {
         Ok(g) => g,
         Err(e) => {
-            push(entry("error", format!("command guard: {e}")));
             finish_error(
                 &shared,
                 &app,
@@ -292,10 +351,24 @@ pub async fn run(mut input: AgentInput) {
 
     // ---- first send: preamble + task --------------------------------------
     push(entry("user_prompt", input.prompt.clone()));
-    let first_message = format!("{preamble}\n\n---\n\nTASK: {0}", input.prompt);
+    let first_message = format!(
+        "{preamble}{}\n\n---\n\nTASK: {}",
+        input.skill_context, input.prompt
+    );
     set_state(AgentState::WaitingForAi);
-    if let Err(e) = ensure_sent(&mut input, &first_message, true, &push).await {
-        finish_error(&shared, &app, &input.task_id, &e);
+    if let Err(e) = ensure_sent(&mut input, &first_message, true, stop.clone()).await {
+        if halted.load(Ordering::SeqCst) {
+            finish(
+                &shared,
+                &app,
+                &mut meta,
+                &input,
+                AgentState::Cancelled,
+                "stopped by user".into(),
+            );
+        } else {
+            finish_error(&shared, &app, &input.task_id, &e);
+        }
         return;
     }
 
@@ -307,7 +380,7 @@ pub async fn run(mut input: AgentInput) {
                 &app,
                 &mut meta,
                 &input,
-                AgentState::Error,
+                AgentState::Cancelled,
                 "stopped by user".into(),
             );
             input.app.state::<ActiveAgent>().clear(&input.task_id);
@@ -345,19 +418,31 @@ pub async fn run(mut input: AgentInput) {
         };
 
         set_state(AgentState::Parsing);
-        push(TranscriptEntry {
-            id: 0,
-            ts: history::now_ms(),
-            kind: "assistant".into(),
-            text: protocol::truncate(&reply, 20_000).to_string(),
-            calls: Vec::new(),
-            diff: None,
-            injection_warning: injection_heuristic(&reply),
-        });
+        let parsed = protocol::parse_reply(&reply, task_nonce.as_deref());
+        let visible_reply = protocol::display_reply(&reply, &parsed);
+        if !visible_reply.is_empty() {
+            push(TranscriptEntry {
+                id: 0,
+                ts: history::now_ms(),
+                kind: "assistant".into(),
+                text: protocol::truncate(&visible_reply, 20_000).to_string(),
+                calls: Vec::new(),
+                diff: None,
+                injection_warning: injection_heuristic(&reply),
+            });
+        }
 
-        match protocol::parse_reply(&reply, task_nonce.as_deref()) {
+        match parsed {
             Parsed::Done(summary) => {
-                push(entry("done", summary.clone()));
+                if completion_reports_unavailable_tools(&summary) {
+                    let error = format!(
+                        "The provider reported that Neelima's workspace tools are unavailable, so this task did not complete: {summary}. Confirm a workspace is open and start the task from Neelima's composer."
+                    );
+                    finish_error(&shared, &app, &input.task_id, &error);
+                    input.app.state::<ActiveAgent>().clear(&input.task_id);
+                    return;
+                }
+                push(entry("done", "Completed".into()));
                 finish(&shared, &app, &mut meta, &input, AgentState::Done, summary);
                 input.app.state::<ActiveAgent>().clear(&input.task_id);
                 return;
@@ -378,8 +463,19 @@ pub async fn run(mut input: AgentInput) {
                     "Your last tool block was malformed and could not be parsed:\n{e}\nResend it as a correct ```tool block: one JSON object, double quotes, no trailing commas, fields id (string), tool, args."
                 );
                 push(entry("system", correction.clone()));
-                if let Err(se) = ensure_sent(&mut input, &correction, false, &push).await {
-                    finish_error(&shared, &app, &input.task_id, &se);
+                if let Err(se) = ensure_sent(&mut input, &correction, false, stop.clone()).await {
+                    if halted.load(Ordering::SeqCst) {
+                        finish(
+                            &shared,
+                            &app,
+                            &mut meta,
+                            &input,
+                            AgentState::Cancelled,
+                            "stopped by user".into(),
+                        );
+                    } else {
+                        finish_error(&shared, &app, &input.task_id, &se);
+                    }
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -405,8 +501,19 @@ pub async fn run(mut input: AgentInput) {
                 }
                 let nudge = "Reminder: reply with tool calls (```tool blocks) to act, or \"DONE: <summary>\" when the task is complete.";
                 push(entry("system", nudge.into()));
-                if let Err(se) = ensure_sent(&mut input, nudge, false, &push).await {
-                    finish_error(&shared, &app, &input.task_id, &se);
+                if let Err(se) = ensure_sent(&mut input, nudge, false, stop.clone()).await {
+                    if halted.load(Ordering::SeqCst) {
+                        finish(
+                            &shared,
+                            &app,
+                            &mut meta,
+                            &input,
+                            AgentState::Cancelled,
+                            "stopped by user".into(),
+                        );
+                    } else {
+                        finish_error(&shared, &app, &input.task_id, &se);
+                    }
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -417,20 +524,8 @@ pub async fn run(mut input: AgentInput) {
                 nudge_count = 0;
 
                 // ---- approvals -----------------------------------------
-                let needs_approval = |c: &ToolCall| -> bool {
-                    // B5/D6: always-ask list overrides FullAccess.
-                    if c.tool == "run_command" {
-                        let command = c.args.get("command").and_then(Value::as_str).unwrap_or("");
-                        if guard.needs_ask(command) {
-                            return true;
-                        }
-                    }
-                    match call_risk(&c.tool) {
-                        "read" => !input.settings.permission_mode.auto_approve_read(),
-                        "write" => !input.settings.permission_mode.auto_approve_write(),
-                        "command" => !input.settings.permission_mode.auto_approve_command(),
-                        _ => !input.settings.permission_mode.auto_approve_write(),
-                    }
+                let needs_approval = |c: &ToolCall| {
+                    tool_needs_approval(&c.tool, &c.args, input.settings.permission_mode, &guard)
                 };
                 let any_needs = calls.iter().any(needs_approval);
                 let decisions: Vec<(ToolCall, bool)> = if any_needs {
@@ -460,7 +555,7 @@ pub async fn run(mut input: AgentInput) {
                         Some(d) = approve_rx.recv() => d,
                         _ = stop.notified() => {
                             push(entry("system", "stopped by user during approval".into()));
-                            finish(&shared, &app, &mut meta, &input, AgentState::Error, "stopped during approval".into());
+                            finish(&shared, &app, &mut meta, &input, AgentState::Cancelled, "stopped during approval".into());
                             input.app.state::<ActiveAgent>().clear(&input.task_id);
                             return;
                         }
@@ -594,8 +689,19 @@ pub async fn run(mut input: AgentInput) {
                 }
 
                 set_state(AgentState::WaitingForAi);
-                if let Err(e) = ensure_sent(&mut input, &result_blocks, false, &push).await {
-                    finish_error(&shared, &app, &input.task_id, &e);
+                if let Err(e) = ensure_sent(&mut input, &result_blocks, false, stop.clone()).await {
+                    if halted.load(Ordering::SeqCst) {
+                        finish(
+                            &shared,
+                            &app,
+                            &mut meta,
+                            &input,
+                            AgentState::Cancelled,
+                            "stopped by user".into(),
+                        );
+                    } else {
+                        finish_error(&shared, &app, &input.task_id, &e);
+                    }
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -604,71 +710,119 @@ pub async fn run(mut input: AgentInput) {
     }
 }
 
-/// Send through the provider. Typed provider errors (A10) decide the fallback:
-/// NeedsLogin/PageChanged/BridgeUnreachable (after brief notice) switch to the
-/// manual relay once; Timeout/SendFailed only after two attempts. Never mistakes
-/// a bridge failure for "logged out".
+/// Submit once and fail clearly. Retrying a provider send after an uncertain
+/// acknowledgement can duplicate a prompt, and silently switching to manual
+/// relay breaks the single-chat workflow.
 async fn ensure_sent(
     input: &mut AgentInput,
     text: &str,
     first_of_task: bool,
-    push: &impl Fn(TranscriptEntry) -> TranscriptEntry,
+    stop: Arc<Notify>,
 ) -> Result<(), String> {
-    match input
-        .provider
-        .send(&input.task_id, text, first_of_task)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            if !e.should_use_manual_relay() {
-                // One retry covers transient send failures; then surface it.
-                return match input
-                    .provider
-                    .send(&input.task_id, text, first_of_task)
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(e2) => Err(e2.to_string()),
-                };
-            }
-            input.provider =
-                Provider::Manual(ManualProvider::new(input.app.clone(), input.relay.clone()));
-            *input.webview_state.manual_fallback.lock().unwrap() = true;
-            push(entry("system", format!("provider chat unavailable ({e}) — switched to manual relay. Copy the message in the relay card into your chat, then paste the reply back.")));
-            let _ = input.app.emit(
-                EVT,
-                json!({"kind": "manual-fallback", "task_id": input.task_id}),
-            );
-            input
-                .provider
-                .send(&input.task_id, text, first_of_task)
-                .await
-                .map_err(|error| error.to_string())
+    let provider_name = input.provider.describe();
+    let web_provider = matches!(&input.provider, Provider::Web(_));
+    let result = tokio::select! {
+        _ = stop.notified() => return Err("stopped by user while waiting for provider".into()),
+        result = input.provider.send(&input.task_id, text, first_of_task) => result,
+    };
+    result.map_err(|error| provider_send_failure(&provider_name, &error.to_string(), web_provider))
+}
+
+fn provider_send_failure(provider: &str, error: &str, is_web: bool) -> String {
+    if is_web {
+        format!("{provider} unavailable: {error}. Neelima did not confirm prompt submission and did not retry it. Open the provider sign-in window and test the connection, or choose a configured Ollama/LM Studio model.")
+    } else {
+        format!("{provider} request failed: {error}. The task ended and can be retried.")
+    }
+}
+
+struct AgentLifecycleGuard {
+    app: tauri::AppHandle,
+    task_id: String,
+    shared: Arc<AgentShared>,
+    history: Arc<HistoryStore>,
+    state: Arc<crate::webprov::WebviewState>,
+}
+
+impl AgentLifecycleGuard {
+    fn start(
+        app: tauri::AppHandle,
+        task_id: String,
+        shared: Arc<AgentShared>,
+        history: Arc<HistoryStore>,
+        state: Arc<crate::webprov::WebviewState>,
+    ) -> Self {
+        *state.task_active.lock().unwrap() = true;
+        Self {
+            app,
+            task_id,
+            shared,
+            history,
+            state,
         }
     }
 }
 
-struct ProviderTaskGuard {
-    app: tauri::AppHandle,
-    state: Arc<crate::webprov::WebviewState>,
-}
-
-impl ProviderTaskGuard {
-    fn start(app: tauri::AppHandle, state: Arc<crate::webprov::WebviewState>) -> Self {
-        *state.task_active.lock().unwrap() = true;
-        Self { app, state }
-    }
-}
-
-impl Drop for ProviderTaskGuard {
+impl Drop for AgentLifecycleGuard {
     fn drop(&mut self) {
+        if !matches!(
+            self.shared.current_state(),
+            AgentState::Done | AgentState::Error | AgentState::Cancelled
+        ) {
+            finish_error(
+                &self.shared,
+                &self.app,
+                &self.task_id,
+                "Task stopped unexpectedly. You can retry it from Neelima chat.",
+            );
+        }
+        let _ = self.history.fail_if_running(&self.task_id);
+        // Clear the webview task flag before releasing the active-task slot.
+        // A new task can only start after `clear`, so the old guard cannot
+        // overwrite the new task's flag afterward.
         *self.state.task_active.lock().unwrap() = false;
+        if let Some(active) = self.app.try_state::<ActiveAgent>() {
+            active.clear(&self.task_id);
+        }
         crate::webprov::destroy_if_idle(&self.app, &self.state, false);
     }
 }
 
 fn finish_error(shared: &Arc<AgentShared>, app: &tauri::AppHandle, task_id: &str, msg: &str) {
+    if let Some(history) = app.try_state::<Arc<HistoryStore>>() {
+        if history.contains_task(task_id) {
+            let failure = TranscriptEntry {
+                id: history.next_entry_id(),
+                ts: history::now_ms(),
+                kind: "error".into(),
+                text: msg.to_string(),
+                calls: Vec::new(),
+                diff: None,
+                injection_warning: None,
+            };
+            match history.append_once(task_id, &failure) {
+                Ok(true) => emit(
+                    app,
+                    AgentEvent {
+                        kind: "transcript".into(),
+                        state: None,
+                        task_id: Some(task_id.to_string()),
+                        entry: Some(failure),
+                        pending_calls: None,
+                        text: None,
+                    },
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = app.emit(
+                        EVT,
+                        json!({"kind":"notify", "level":"error", "text":format!("Could not save task failure: {error}")}),
+                    );
+                }
+            }
+        }
+    }
+    clear_active_task(app, task_id);
     shared.set_state(AgentState::Error);
     let _ = app.emit(
         EVT,
@@ -695,6 +849,7 @@ fn finish(
     meta.status = format!("{state:?}").to_lowercase();
     meta.ended_ms = Some(history::now_ms());
     let _ = input.history.update_task(meta);
+    clear_active_task(app, &input.task_id);
     shared.set_state(state);
     let _ = app.emit(
         EVT,
@@ -708,6 +863,12 @@ fn finish(
         })
         .unwrap_or(Value::Null),
     );
+}
+
+fn clear_active_task(app: &tauri::AppHandle, task_id: &str) {
+    if let Some(active) = app.try_state::<ActiveAgent>() {
+        active.clear(task_id);
+    }
 }
 
 fn preview_diff(ws: &Workspace, call: &ToolCall) -> Option<serde_json::Value> {
@@ -829,6 +990,114 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_for(task_id: &str) -> Arc<AgentShared> {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        Arc::new(AgentShared {
+            cmd_tx,
+            cmd_rx: Mutex::new(Some(cmd_rx)),
+            state: Mutex::new(AgentState::WaitingForAi),
+            task_id: Mutex::new(Some(task_id.to_string())),
+        })
+    }
+
+    #[test]
+    fn stale_task_cleanup_cannot_clear_a_newer_active_task() {
+        let slot = ActiveAgent::default();
+        *slot.0.lock().unwrap() = Some(shared_for("old-task"));
+        slot.clear("old-task");
+        *slot.0.lock().unwrap() = Some(shared_for("new-task"));
+        slot.clear("old-task");
+        assert_eq!(
+            slot.get().unwrap().task_id.lock().unwrap().as_deref(),
+            Some("new-task")
+        );
+        slot.clear("new-task");
+        assert!(slot.get().is_none());
+    }
+
+    #[test]
+    fn terminal_task_cleanup_allows_a_follow_up_task() {
+        let slot = ActiveAgent::default();
+        *slot.0.lock().unwrap() = Some(shared_for("finished"));
+        slot.clear("finished");
+        assert!(slot.get().is_none());
+
+        *slot.0.lock().unwrap() = Some(shared_for("next-task"));
+        assert_eq!(
+            slot.get().unwrap().task_id.lock().unwrap().as_deref(),
+            Some("next-task")
+        );
+        slot.clear("next-task");
+    }
+
+    #[test]
+    fn permission_modes_gate_tools_and_destructive_commands() {
+        use crate::settings::PermissionMode;
+        let guard = CommandGuard::new(&[], &[]).unwrap();
+        let args = json!({});
+        assert!(tool_needs_approval(
+            "read_file",
+            &args,
+            PermissionMode::AskAll,
+            &guard
+        ));
+        assert!(!tool_needs_approval(
+            "read_file",
+            &args,
+            PermissionMode::AskWrites,
+            &guard
+        ));
+        assert!(tool_needs_approval(
+            "write_file",
+            &args,
+            PermissionMode::AskWrites,
+            &guard
+        ));
+        assert!(!tool_needs_approval(
+            "write_file",
+            &args,
+            PermissionMode::FullAccess,
+            &guard
+        ));
+        assert!(!tool_needs_approval(
+            "run_command",
+            &json!({"command":"git status"}),
+            PermissionMode::FullAccess,
+            &guard
+        ));
+        assert!(tool_needs_approval(
+            "run_command",
+            &json!({"command":"git reset --hard HEAD"}),
+            PermissionMode::FullAccess,
+            &guard
+        ));
+    }
+
+    #[test]
+    fn provider_cannot_report_unavailable_tools_as_successful_completion() {
+        assert!(completion_reports_unavailable_tools(
+            "Unable to create the app because workspace tools are not available in this session"
+        ));
+        assert!(!completion_reports_unavailable_tools(
+            "Created the app and verified the files"
+        ));
+        assert!(!completion_reports_unavailable_tools(
+            "The tool output says no files were found"
+        ));
+    }
+
+    #[test]
+    fn provider_submission_failure_is_truthful_and_actionable() {
+        let failure = provider_send_failure("web:ChatGPT", "composer not found", true);
+        assert!(failure.contains("did not confirm prompt submission"));
+        assert!(failure.contains("Ollama/LM Studio"));
+        assert!(!failure.contains("switched to manual relay"));
+
+        let local = provider_send_failure("local:Ollama", "connection refused", false);
+        assert!(local.contains("task ended"));
+        assert!(!local.contains("sign-in window"));
+    }
 
     #[test]
     fn preview_diff_skips_large_existing_files() {

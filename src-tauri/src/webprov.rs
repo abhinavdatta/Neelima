@@ -34,8 +34,6 @@ pub struct WebviewState {
     pub mounted: Mutex<Option<MountedProfile>>,
     /// Provider pane geometry in PHYSICAL pixels relative to the window client area.
     pub rect: Mutex<Rect>,
-    /// Manual-relay fallback active for the current provider.
-    pub manual_fallback: Mutex<bool>,
     /// Inspector mode target for capture.
     pub inspector: Mutex<Option<InspectorSession>>,
     /// Latest page-reported login state (push events; no polling).
@@ -73,15 +71,17 @@ pub struct MountedProfile {
 /// Three-state login posture (A4): a bridge failure is NEVER "logged out".
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginState {
+    Loading { reason: String, url: String },
     Unknown { reason: String, url: String },
     LoggedIn { url: String },
     LoggedOut { url: String },
+    Challenge { reason: String, url: String },
 }
 
 impl Default for LoginState {
     fn default() -> Self {
-        LoginState::Unknown {
-            reason: "not mounted yet".into(),
+        LoginState::Loading {
+            reason: "provider page has not loaded yet".into(),
             url: String::new(),
         }
     }
@@ -272,7 +272,7 @@ impl WebProvider {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let cur = self.state.login.lock().unwrap().clone();
-            if !matches!(cur, LoginState::Unknown { .. }) {
+            if !matches!(cur, LoginState::Unknown { .. } | LoginState::Loading { .. }) {
                 return Ok(cur);
             }
             tokio::select! {
@@ -295,64 +295,98 @@ impl WebProvider {
                 .await
                 .map_err(ProviderError::PageChanged)?;
         }
-        // Show the provider pane while a task is running (A7: the webview may
-        // simply be hidden, in which case this is a no-op raise).
-        set_visible(&self.app, &self.state, true);
+        // Keep the provider page hidden during ordinary work. The UI only
+        // reveals it after an explicit sign-in action or a login-required event.
 
         // A6: never assume the page is up before the first push event.
         self.wait_ready(20_000).await.map_err(|e| {
             ProviderError::BridgeUnreachable(set_bridge_err(&self.state.last_bridge_error, e))
         })?;
 
-        // A4: three states; unknown => "can't reach the page" (diagnose),
-        // NOT the login prompt. The UI shows Test connection + the
-        // "I'm logged in, continue" override; a retry then succeeds.
+        // Wait for an observed chat/auth/challenge state. Document load alone
+        // is not evidence that the SPA or its composer has finished rendering.
         loop {
             let cur = { self.state.login.lock().unwrap().clone() };
             match cur {
                 LoginState::LoggedIn { .. } => break,
-                LoginState::LoggedOut { .. } => {
+                LoginState::LoggedOut { .. } | LoginState::Challenge { .. } => {
                     let _ = self.app.emit(
                         "evt",
-                        json!({"kind": "provider-login-required", "adapter": self.adapter.name}),
+                        json!({"kind": "provider-login-required", "adapter": self.adapter.name, "reason": match &cur { LoginState::Challenge { reason, .. } => reason.as_str(), _ => "sign-in is required" }}),
                     );
                     match self.await_login(300).await {
                         Ok(_) => break,
                         Err(_) => return Err(ProviderError::NeedsLogin),
                     }
                 }
-                LoginState::Unknown { reason, .. } => {
-                    if self
-                        .await_known_login(Duration::from_secs(30))
-                        .await
-                        .is_err()
-                    {
-                        let e = set_bridge_err(
-                            &self.state.last_bridge_error,
-                            format!("page never reported a login state: {reason}"),
-                        );
-                        let _ = self.app.emit(
-                            "evt",
-                            json!({
-                                "kind": "provider-bridge-unreachable",
-                                "adapter": self.adapter.name,
-                                "reason": reason,
-                            }),
-                        );
-                        return Err(ProviderError::BridgeUnreachable(e));
+                LoginState::Unknown { .. } | LoginState::Loading { .. } => {
+                    match self.await_known_login(Duration::from_secs(30)).await {
+                        Ok(LoginState::Challenge { reason, .. }) => {
+                            let _ = self.app.emit(
+                                "evt",
+                                json!({
+                                    "kind": "provider-login-required",
+                                    "adapter": self.adapter.name,
+                                    "reason": reason,
+                                }),
+                            );
+                            return Err(ProviderError::NeedsLogin);
+                        }
+                        Ok(LoginState::LoggedOut { .. }) => {
+                            let _ = self.app.emit(
+                                "evt",
+                                json!({
+                                    "kind": "provider-login-required",
+                                    "adapter": self.adapter.name,
+                                    "reason": "sign-in is required",
+                                }),
+                            );
+                            return Err(ProviderError::NeedsLogin);
+                        }
+                        Ok(LoginState::LoggedIn { .. }) => break,
+                        Ok(LoginState::Unknown { .. } | LoginState::Loading { .. }) | Err(_) => {
+                            let e = actionable_composer_error(&self.state.login.lock().unwrap());
+                            let e = set_bridge_err(&self.state.last_bridge_error, e);
+                            let _ = self.app.emit(
+                                "evt",
+                                json!({
+                                    "kind": "provider-bridge-unreachable",
+                                    "adapter": self.adapter.name,
+                                    "reason": e,
+                                }),
+                            );
+                            return Err(ProviderError::BridgeUnreachable(e));
+                        }
                     }
                 }
             }
         }
 
-        // A8: new_chat ONLY for the first message of a task (keep a per-task
-        // flag; never reset the conversation mid-task).
+        // A8: new_chat ONLY for the first message of each task, after the
+        // supported chat interface has been positively identified.
         let already = self.state.chat_started_for.lock().unwrap().clone();
         if first_of_task && already.as_deref() != Some(task_id) {
-            let _ = self.fire("new_chat", &json!(null));
+            if let Err(e) = self.fire("new_chat", &json!(null)) {
+                return Err(ProviderError::PageChanged(format!(
+                    "could not start a provider chat: {e}"
+                )));
+            }
             *self.state.chat_started_for.lock().unwrap() = Some(task_id.to_string());
-            // Give the SPA a beat to re-render (bounded; the page re-posts ready).
-            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+
+        // Ensure the composer still exists immediately before each send; an
+        // SPA navigation can invalidate an earlier login-state observation.
+        match self.call("page_info", &json!(null)).await {
+            Ok(info) if info["value"]["input_found"].as_bool() == Some(true) => {}
+            Ok(info) => {
+                return Err(ProviderError::PageChanged(format!(
+                    "chat composer is no longer available (page state: {})",
+                    info["value"]["login"]["reason"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                )))
+            }
+            Err(e) => return Err(e),
         }
 
         let baseline = self.state.last_message.lock().unwrap().0;
@@ -360,8 +394,8 @@ impl WebProvider {
             .response_baseline
             .store(baseline, Ordering::Release);
 
-        // A10: await the send acknowledgement so a stale selector is distinct
-        // from a successful click followed by a slow assistant response.
+        // A10: trust only the explicit acknowledgement returned after the
+        // provider UI confirms that the submitted prompt entered its chat.
         let result = self
             .call(
                 "send_message",
@@ -374,26 +408,52 @@ impl WebProvider {
 
     /// Wait for the assistant message push (A3). Cancel-safe via Notify.
     pub async fn wait_reply(&mut self, cancel: Arc<Notify>) -> Result<String, String> {
-        let timeout = Duration::from_millis(self.adapter.response_timeout_ms);
-        let deadline = tokio::time::Instant::now() + timeout;
         let start_seq = self.state.response_baseline.load(Ordering::Acquire);
-        loop {
-            let notified = self.state.message_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let (seq, text) = self.state.last_message.lock().unwrap().clone();
-            if seq > start_seq && !text.trim().is_empty() {
-                return Ok(text);
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = cancel.notified() => return Err("stopped".into()),
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err("response timeout waiting for the assistant message".into());
-                },
-            }
+        wait_for_reply_state(
+            &self.state,
+            start_seq,
+            Duration::from_millis(self.adapter.response_timeout_ms),
+            cancel,
+        )
+        .await
+    }
+}
+
+async fn wait_for_reply_state(
+    state: &WebviewState,
+    start_seq: u64,
+    timeout: Duration,
+    cancel: Arc<Notify>,
+) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let notified = state.message_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let (seq, text) = state.last_message.lock().unwrap().clone();
+        if seq > start_seq && !text.trim().is_empty() {
+            return Ok(text);
+        }
+        tokio::select! {
+            _ = &mut notified => {},
+            _ = cancel.notified() => return Err("stopped".into()),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err("response timeout waiting for the assistant message".into());
+            },
         }
     }
+}
+
+fn actionable_composer_error(state: &LoginState) -> String {
+    let reason = match state {
+        LoginState::Unknown { reason, .. } | LoginState::Loading { reason, .. } => reason.as_str(),
+        LoginState::Challenge { reason, .. } => reason.as_str(),
+        LoginState::LoggedOut { .. } => "sign-in is required",
+        LoginState::LoggedIn { .. } => {
+            "provider chat was reported ready, but its composer could not be reached"
+        }
+    };
+    format!("{reason}. Open the provider sign-in window to refresh it, or choose a configured Ollama/LM Studio model. Neelima did not submit the prompt.")
 }
 
 impl From<ProviderError> for String {
@@ -402,7 +462,8 @@ impl From<ProviderError> for String {
     }
 }
 
-/// A10: typed provider errors so the agent can pick the right fallback.
+/// Typed provider errors; the agent surfaces these without silently changing
+/// providers or moving the conversation out of Neelima.
 #[derive(Debug, Clone)]
 pub enum ProviderError {
     NeedsLogin,
@@ -415,7 +476,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn message(&self) -> String {
         match self {
-            ProviderError::NeedsLogin => "NEEDS_LOGIN".into(),
+            ProviderError::NeedsLogin => "Provider sign-in or verification is required. Open the provider sign-in window, complete it, then retry; or select a configured API/local model.".into(),
             ProviderError::BridgeUnreachable(d) => format!("can't reach the provider page ({d})"),
             ProviderError::PageChanged(d) => {
                 format!("provider page changed (selectors may be stale): {d}")
@@ -423,15 +484,6 @@ impl ProviderError {
             ProviderError::Timeout(d) => format!("provider timeout: {d}"),
             ProviderError::SendFailed(d) => format!("send failed: {d}"),
         }
-    }
-
-    pub fn should_use_manual_relay(&self) -> bool {
-        matches!(
-            self,
-            ProviderError::NeedsLogin
-                | ProviderError::BridgeUnreachable(_)
-                | ProviderError::PageChanged(_)
-        )
     }
 }
 
@@ -506,6 +558,14 @@ pub fn on_login_state(
         *login = match state_s.as_str() {
             "logged_in" => LoginState::LoggedIn { url: url.clone() },
             "logged_out" => LoginState::LoggedOut { url: url.clone() },
+            "loading" => LoginState::Loading {
+                reason: reason.clone(),
+                url: url.clone(),
+            },
+            "challenge" => LoginState::Challenge {
+                reason: reason.clone(),
+                url: url.clone(),
+            },
             _ => LoginState::Unknown {
                 reason: reason.clone(),
                 url: url.clone(),
@@ -561,7 +621,6 @@ pub async fn mount(
     if mounted_profile_matches(current.as_ref(), profile_id, &adapter.id)
         && app.get_webview(PROVIDER_LABEL).is_some()
     {
-        set_visible(app, state, true);
         return Ok(());
     }
     if current.is_some() && *state.task_active.lock().unwrap() {
@@ -571,8 +630,8 @@ pub async fn mount(
     let mount_nonce = hub.new_nonce();
     // Reset watch state for a fresh page.
     state.page_ready.store(false, Ordering::Release);
-    *state.login.lock().unwrap() = LoginState::Unknown {
-        reason: "loading".into(),
+    *state.login.lock().unwrap() = LoginState::Loading {
+        reason: "provider document is loading".into(),
         url: String::new(),
     };
     *state.last_message.lock().unwrap() = (0, String::new());
@@ -661,6 +720,9 @@ pub async fn mount(
         profile_id: profile_id.to_string(),
         adapter_id: adapter.id.clone(),
     });
+    // add_child creates a visible child by default. Hide it immediately;
+    // explicit login/inspector entry points reveal it after mount returns.
+    hide_if_any(app, state);
     let _ = webview; // kept alive by the manager
     let _ = app.emit(
         "evt",
@@ -747,6 +809,79 @@ pub fn unmount_if_any(app: &tauri::AppHandle, state: &WebviewState) {
     if had.is_some() {
         let _ = app.emit("evt", serde_json::json!({"kind": "provider-unmounted"}));
     }
+}
+
+/// Clear a provider's persistent webview profile on platforms where Neelima
+/// owns the profile directory (Windows WebView2 and Linux WebKit data dir).
+/// macOS uses WKWebsiteDataStore identifiers and cannot be cleared through the
+/// filesystem safely with this API.
+pub fn clear_profile_session(
+    app: &tauri::AppHandle,
+    state: &WebviewState,
+    profile_id: &str,
+) -> Result<(), String> {
+    if !valid_profile_id(profile_id) {
+        return Err("invalid provider profile ID".into());
+    }
+    let task_active = state.task_active.lock().unwrap();
+    if *task_active {
+        return Err("cannot clear provider data while an agent task is active".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (app, state, profile_id);
+        return Err("Clearing provider session data is not supported by this macOS build. Sign out on the provider website instead.".into());
+    }
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let app_data_canon = app_data.canonicalize().map_err(|e| e.to_string())?;
+        let profiles = app_data.join("provider-profiles");
+        let profiles_meta = match std::fs::symlink_metadata(&profiles) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(meta) => meta,
+        };
+        if profiles_meta.file_type().is_symlink() || !profiles_meta.is_dir() {
+            return Err("provider profile storage is not a safe directory".into());
+        }
+        let profiles_canon = profiles.canonicalize().map_err(|e| e.to_string())?;
+        if !profiles_canon.starts_with(&app_data_canon) {
+            return Err("provider profile storage escaped app data".into());
+        }
+        let target = profiles.join(profile_id);
+        match std::fs::symlink_metadata(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err("provider session path is not a regular directory".into())
+            }
+            Ok(_) => {}
+        }
+        let target_canon = target.canonicalize().map_err(|e| e.to_string())?;
+        if !target_canon.starts_with(&profiles_canon) {
+            return Err("provider session path escaped its storage directory".into());
+        }
+        let mounted_for_profile = state
+            .mounted
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|mounted| mounted.profile_id == profile_id);
+        if mounted_for_profile {
+            unmount_if_any(app, state);
+        }
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("could not clear provider session: {e}"))
+    }
+}
+
+fn valid_profile_id(profile_id: &str) -> bool {
+    !profile_id.is_empty()
+        && profile_id.len() <= 64
+        && profile_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// A7: hide the webview (do NOT destroy) so the page never reloads when the
@@ -845,6 +980,28 @@ fn safe_web_origin(url: &tauri::Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_provider_response_returns_a_recoverable_timeout() {
+        let state = WebviewState::default();
+        state.response_baseline.store(4, Ordering::Release);
+        *state.last_message.lock().unwrap() = (4, "stale answer".into());
+        let result =
+            wait_for_reply_state(&state, 4, Duration::from_millis(1), Arc::new(Notify::new()))
+                .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "response timeout waiting for the assistant message"
+        );
+    }
+
+    #[test]
+    fn provider_profile_ids_reject_path_traversal() {
+        assert!(valid_profile_id("p123safe"));
+        assert!(!valid_profile_id("../outside"));
+        assert!(!valid_profile_id("C:\\outside"));
+        assert!(!valid_profile_id(""));
+    }
 
     /// B1: only adapter + auth domains survive the navigation guard.
     #[test]
@@ -979,12 +1136,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_errors_only_relay_when_provider_is_unavailable() {
-        assert!(ProviderError::NeedsLogin.should_use_manual_relay());
-        assert!(ProviderError::BridgeUnreachable("timeout".into()).should_use_manual_relay());
-        assert!(ProviderError::PageChanged("redirected".into()).should_use_manual_relay());
-        assert!(!ProviderError::Timeout("reply".into()).should_use_manual_relay());
-        assert!(!ProviderError::SendFailed("click".into()).should_use_manual_relay());
+    fn provider_failures_never_claim_a_prompt_was_sent() {
+        assert!(ProviderError::NeedsLogin.message().contains("retry"));
+        assert!(
+            ProviderError::BridgeUnreachable("composer unavailable".into())
+                .to_string()
+                .contains("composer unavailable")
+        );
+        assert!(ProviderError::PageChanged("selector missing".into())
+            .to_string()
+            .contains("selector missing"));
     }
 
     #[test]
@@ -995,7 +1156,6 @@ mod tests {
         }))
         .unwrap_err();
         assert!(matches!(err, ProviderError::PageChanged(_)));
-        assert!(err.should_use_manual_relay());
         assert!(classify_send_result(&json!({"sent": true})).is_ok());
     }
 

@@ -2,6 +2,7 @@
 import { useEffect, useRef } from "preact/hooks";
 import { setState, useStore } from "../store";
 import { cmd } from "../tauri";
+import { Icon } from "./Icon";
 
 export function DiffModal() {
   const s = useStore();
@@ -41,7 +42,7 @@ export function DiffModal() {
       <div class="modal diff-modal" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
           <h2>Proposed change</h2>
-          <button class="ghost" onClick={() => setState({ diffEntry: null })}>✕</button>
+          <button class="ghost icon-button" aria-label="Close diff" onClick={() => setState({ diffEntry: null })}><Icon name="close" size={16} /></button>
         </div>
         <div class="diff-host" ref={hostRef} />
       </div>

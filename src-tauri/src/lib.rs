@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod providers;
 pub mod sec;
 pub mod settings;
+pub mod skills;
 pub mod terminal;
 pub mod tools;
 pub mod ui;
@@ -68,6 +69,7 @@ pub fn run() {
             ui::ui_adapter_finish_inspector,
             ui::ui_providers_login,
             ui::ui_providers_close,
+            ui::ui_provider_clear_session,
             ui::ui_providers_list,
             ui::ui_models_local,
             ui::ui_task_start,
@@ -92,8 +94,16 @@ pub fn run() {
             ui::ui_task_rename,
             ui::ui_task_delete,
             ui::ui_app_info,
+            ui::ui_skills_list,
+            ui::ui_skill_preview,
+            ui::ui_skill_install,
+            ui::ui_skill_set_enabled,
+            ui::ui_skill_uninstall,
+            ui::ui_skill_reveal,
+            ui::ui_skill_update_preview,
+            ui::ui_skill_read,
+            ui::ui_open_github,
             ui::ui_provider_diagnose,
-            ui::ui_provider_login_override,
             bridge::lb_bridge,
         ])
         .setup(|app| {

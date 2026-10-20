@@ -6,7 +6,7 @@ import { cmd } from "./tauri";
 import { getState, setState, toast, useStore } from "./store";
 import Sidebar from "./components/Sidebar";
 import FileTree from "./components/FileTree";
-import TitleBar from "./components/TitleBar";
+import TitleBar, { WindowMoveStrip } from "./components/TitleBar";
 import Chat from "./components/Chat";
 import Composer from "./components/Composer";
 import ProviderPane from "./components/ProviderPane";
@@ -16,10 +16,41 @@ import SearchPane from "./components/SearchPane";
 import SettingsModal from "./components/SettingsModal";
 import TerminalPanel from "./components/TerminalPanel";
 import DiffModal from "./components/DiffModal";
+import { Icon } from "./components/Icon";
+import { DEFAULT_CUSTOM_THEME, parseCustomTheme, THEME_TOKENS } from "./theme";
 import "./styles.css";
+
+let earlyTaskEvents: any[] = [];
 
 export function App() {
   const s = useStore();
+
+  useEffect(() => {
+    const requested = s.settings?.theme ?? "dark";
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      const isPureDark = requested === "pure_dark";
+      const isCustom = requested === "custom";
+      const resolved = requested === "system" ? (media.matches ? "dark" : "light")
+        : isPureDark ? "dark" : isCustom ? "custom" : requested;
+      const root = document.documentElement;
+      root.dataset.theme = resolved;
+      root.dataset.themeVariant = isPureDark ? "pure-dark" : "";
+      root.style.colorScheme = resolved === "light" ? "light" : "dark";
+      for (const token of THEME_TOKENS) root.style.removeProperty(token);
+      if (isCustom) {
+        const custom = parseCustomTheme(s.settings?.custom_theme || DEFAULT_CUSTOM_THEME);
+        if (!custom.error) {
+          for (const [token, color] of Object.entries(custom.colors)) root.style.setProperty(token, color);
+        } else {
+          root.dataset.theme = "dark";
+        }
+      }
+    };
+    apply();
+    if (requested === "system") media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [s.settings?.theme, s.settings?.custom_theme]);
 
   useEffect(() => {
     (async () => {
@@ -59,30 +90,32 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (s.view !== "provider") {
-      cmd.webviewMode("chat").catch((e) => toast("error", `Could not hide the provider view: ${String(e)}`));
-    }
-  }, [s.view]);
+    const mode = s.view === "provider" && s.providerAuthOpen && !s.settingsOpen ? "provider" : "chat";
+    cmd.webviewMode(mode).catch((e) => toast("error", `Could not update the provider view: ${String(e)}`));
+  }, [s.view, s.settingsOpen]);
 
   const showWelcome = s.view === "chat" && s.entries.length === 0;
 
   return (
     <div id="app">
       <Sidebar />
-      <main class="main-panel">
-        <TitleBar />
-        {showWelcome ? <Welcome /> : null}
-        <section class="content">
-          {s.view === "chat" || s.view === "task" ? <Chat /> : null}
-          {s.view === "files" ? <FileTree /> : null}
-          {s.view === "provider" ? <ProviderPane /> : null}
-          {s.view === "automations" ? <AutomationsPane /> : null}
-          {s.view === "marketplace" ? <MarketplacePane /> : null}
-          {s.view === "search" ? <SearchPane /> : null}
-        </section>
-        <Composer />
-        {s.terminalOpen ? <TerminalPanel /> : null}
-      </main>
+      <div class="window-shell">
+        <WindowMoveStrip />
+        <main class="main-panel">
+          <TitleBar />
+          {showWelcome ? <Welcome /> : null}
+          <section class="content">
+            {s.view === "chat" || s.view === "task" ? <Chat /> : null}
+            {s.view === "files" ? <FileTree /> : null}
+            {s.view === "provider" ? <ProviderPane /> : null}
+            {s.view === "automations" ? <AutomationsPane /> : null}
+            {s.view === "marketplace" ? <MarketplacePane /> : null}
+            {s.view === "search" ? <SearchPane /> : null}
+          </section>
+          <Composer />
+          {s.terminalOpen ? <TerminalPanel /> : null}
+        </main>
+      </div>
       <SettingsModal />
       <DiffModal />
       <div class="toasts">
@@ -101,34 +134,24 @@ function Welcome() {
       <div class="welcome-hero">
         <div>
           <h1>Hi there, Ready to Achieve Great Things?</h1>
-          <p>{s.activeWorkspacePath ? `Working in ${s.activeWorkspacePath}` : "Choose a project folder to give your assistant a place to work."}</p>
-        </div>
-        <div class="mascot-scene" aria-hidden="true">
-          <div class="mascot-bubble">Hey there! <span>👋</span><br />Need a boost?</div>
-          <div class="mascot">
-            <div class="robot-antenna" />
-            <div class="robot-head"><div class="robot-visor"><i /><i /></div></div>
-            <div class="robot-neck" />
-            <div class="robot-body"><span /></div>
-            <div class="robot-arm arm-left" /><div class="robot-arm arm-right" />
-          </div>
+          <p title={s.activeWorkspacePath ?? undefined}>{s.activeWorkspacePath ? `Working in ${s.activeWorkspacePath}` : "Choose a project folder to give your assistant a place to work."}</p>
         </div>
       </div>
       <div class="feature-grid">
-        <button class="feature-card" onClick={() => setState({ composerText: "Help me contribute ideas and organize the work in this project." })}>
-          <span class="feature-icon layers-icon" aria-hidden="true"><i /><i /><i /></span>
-          <span class="feature-copy">Contribute ideas, offer feedback, and manage tasks — all in sync.</span>
-          <span class="feature-label">Fast Start</span>
+        <button class="feature-card" onClick={() => setState({ composerText: "Review this workspace, summarize the project, and suggest a short prioritized task list." })}>
+          <span class="feature-icon"><Icon name="layers" size={24} /></span>
+          <span class="feature-copy">Ask Neelima to inspect the open workspace and summarize the project.</span>
+          <span class="feature-label">Review this project</span>
         </button>
-        <button class="feature-card" onClick={() => setState({ composerText: "Help me collaborate on this project: summarize the context, suggest next steps, and identify what needs alignment." })}>
-          <span class="feature-icon team-icon" aria-hidden="true"><i /><i /><i /><i /><i /></span>
-          <span class="feature-copy">Stay connected, share ideas, and align goals effortlessly. Boost your productivity with AI.</span>
-          <span class="feature-label">Collaborate with Team</span>
+        <button class="feature-card" onClick={() => setState({ composerText: "Explain the main files and architecture in this workspace in clear, beginner-friendly language." })}>
+          <span class="feature-icon"><Icon name="code" size={23} /></span>
+          <span class="feature-copy">Get a guided explanation based on files in the selected workspace.</span>
+          <span class="feature-label">Explain this codebase</span>
         </button>
-        <button class="feature-card" onClick={() => setState({ composerText: "Help me plan my next steps for this project and prioritize the work." })}>
-          <span class="feature-icon calendar-icon" aria-hidden="true"><b>31</b></span>
-          <span class="feature-copy">Organize your time efficiently, set clear priorities, and stay focused.</span>
-          <span class="feature-label">Planning</span>
+        <button class="feature-card" onClick={() => setState({ composerText: "Inspect this workspace and identify the three most useful next engineering tasks, with reasons." })}>
+          <span class="feature-icon"><Icon name="arrow-up-right" size={22} /></span>
+          <span class="feature-copy">Get practical next steps grounded in the project's current files.</span>
+          <span class="feature-label">Plan next steps</span>
         </button>
       </div>
     </section>
@@ -145,13 +168,48 @@ function inferPreferredProvider(settings: any, providers: any): string {
 function handleEvent(p: any) {
   if (!p || !p.kind) return;
   const st = getState();
+  if (p.kind === "task-started") {
+    if (typeof p.task_id !== "string") return;
+    const matchesPendingRequest = st.taskStartPending && st.taskStartRequestId === p.request_id;
+    const matchesAcceptedTask = st.taskId === p.task_id;
+    if (matchesPendingRequest || matchesAcceptedTask) {
+      setState((current) => ({
+        taskId: p.task_id,
+        agentState: current.agentState === "idle" ? "waiting_for_ai" : current.agentState,
+        taskStartedAt: current.taskStartedAt ?? Date.now(),
+      }));
+      if (matchesPendingRequest) {
+        const queued = earlyTaskEvents;
+        earlyTaskEvents = [];
+        queued.filter((event) => event.task_id === p.task_id).forEach(handleEvent);
+      }
+    }
+    return;
+  }
+  const taskScopedKinds = new Set([
+    "agent-state", "transcript", "approval-request", "command-output", "relay-outbound",
+  ]);
+  if (taskScopedKinds.has(p.kind)) {
+    if (typeof p.task_id !== "string") return;
+    if (st.taskId && st.taskId !== p.task_id) return;
+    if (!st.taskId) {
+      // Buffer events until the task-start request ID confirms which task is
+      // ours. This prevents late events from an older task being adopted.
+      if (st.taskStartPending && st.view !== "task") {
+        earlyTaskEvents.push(p);
+        if (earlyTaskEvents.length > 128) earlyTaskEvents.shift();
+      }
+      return;
+    }
+  }
   switch (p.kind) {
     case "agent-state":
       setState({ agentState: p.state, agentText: p.text ?? null, taskStartedAt: st.taskStartedAt ?? (p.state === "waiting_for_ai" ? Date.now() : st.taskStartedAt) });
       if (p.text) toast(p.state === "error" ? "error" : "info", p.text);
       break;
     case "transcript":
-      if (p.entry) setState((s2) => ({ entries: [...s2.entries, p.entry] }));
+      if (p.entry) setState((s2) => s2.entries.some((entry) => entry.id === p.entry.id && entry.ts === p.entry.ts)
+        ? {} : { entries: [...s2.entries, p.entry] });
       break;
     case "approval-request":
       setState({ pendingCalls: p.pending_calls ?? [] });
@@ -164,12 +222,10 @@ function handleEvent(p: any) {
     case "relay-outbound":
       setState({ relayOutbound: p.text });
       break;
-    case "manual-fallback":
-      toast("warn", "Provider needs login — switched to manual relay.");
-      break;
     case "provider-login-required":
-      toast("warn", `Please log into ${p.adapter} inside the provider view.`);
-      setState({ view: "provider", providerLoginWaiting: true, providerLoginState: "logged_out" });
+      toast("warn", p.reason ?? `Please sign into ${p.adapter} in its provider window, then return to Neelima chat.`);
+      setState({ view: "provider", providerAuthOpen: true, providerLoginWaiting: true, providerLoginState: p.reason?.toLowerCase().includes("challenge") || p.reason?.toLowerCase().includes("verification") ? "challenge" : "logged_out" });
+      cmd.webviewMode("provider").catch((error) => toast("error", `Could not open provider sign-in: ${String(error)}`));
       break;
     case "term-data":
       window.dispatchEvent(new CustomEvent("term-data", { detail: p }));
@@ -187,25 +243,32 @@ function handleEvent(p: any) {
       setState({ providerMounted: false, providerLoginState: "unknown", providerBridgeError: null });
       break;
     case "provider-login-waiting":
-      setState({ providerLoginWaiting: true, view: "provider" });
+      setState({ providerLoginWaiting: true, providerAuthOpen: true, view: "provider" });
       break;
-    case "provider-login-state":
+    case "provider-login-state": {
+      const returnedToChat = p.state === "logged_in" && getState().view === "provider";
       setState({
         providerLoginState: p.state ?? "unknown",
         providerLoginWaiting: p.state === "logged_out",
         providerBridgeError: p.state === "unknown" ? (p.reason ?? "Page state is unknown") : null,
+        ...(returnedToChat ? { view: "chat" as const, providerAuthOpen: false } : {}),
       });
+      if (returnedToChat) toast("info", "Provider session ready. Continue in Neelima chat.");
       break;
+    }
     case "provider-bridge-unreachable":
       // The chip would keep lying "Waiting for login…" — say what's actually wrong.
-      toast("warn", `Can't reach the embedded ${p.adapter} page (bridge). Reopen the provider view; if it persists, restart Neelima.`);
+      toast("error", `${p.reason ?? `Can't reach ${p.adapter}'s chat`}. Neelima did not submit the prompt. Refresh the provider sign-in window or choose a configured API/local model.`);
       setState({
         providerLoginWaiting: false,
         providerBridgeError: p.reason ?? "Can't reach the embedded provider page",
       });
       break;
     case "provider-login-complete":
-      setState({ providerLoginWaiting: false, providerMounted: true, providerLoginState: "logged_in", providerBridgeError: null });
+      // Keep the persistent provider webview mounted in Rust, but return to
+      // Neelima's own conversation as the single workspace interface.
+      setState({ providerLoginWaiting: false, providerMounted: true, providerLoginState: "logged_in", providerBridgeError: null, providerAuthOpen: false, view: "chat" });
+      toast("info", "Provider session ready. Continue in Neelima chat.");
       break;
     case "adapters-reloaded":
       cmd.adaptersList().then((a) => setState({ adapters: a })).catch(() => {});
