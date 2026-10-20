@@ -78,7 +78,10 @@ pub struct TaskMeta {
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub struct HistoryStore {
@@ -88,14 +91,22 @@ pub struct HistoryStore {
 
 impl HistoryStore {
     pub fn new(app_data_dir: PathBuf) -> Self {
-        HistoryStore { root: app_data_dir.join("tasks"), next_id: Mutex::new(1) }
+        HistoryStore {
+            root: app_data_dir.join("tasks"),
+            next_id: Mutex::new(1),
+        }
     }
 
     pub fn task_dir(&self, id: &str) -> PathBuf {
         self.root.join(id)
     }
 
-    pub fn create_task(&self, title: &str, workspace: &str, provider: &str) -> Result<TaskMeta, String> {
+    pub fn create_task(
+        &self,
+        title: &str,
+        workspace: &str,
+        provider: &str,
+    ) -> Result<TaskMeta, String> {
         let id = format!("{}", uuid::Uuid::new_v4().simple());
         let meta = TaskMeta {
             id: id.clone(),
@@ -109,22 +120,31 @@ impl HistoryStore {
         };
         let dir = self.task_dir(&id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(meta)
     }
 
     pub fn update_task(&self, meta: &TaskMeta) -> Result<(), String> {
         let dir = self.task_dir(&meta.id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn append(&self, task_id: &str, entry: &TranscriptEntry) -> Result<(), String> {
         let dir = self.task_dir(task_id);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("transcript.jsonl"))
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("transcript.jsonl"))
             .map_err(|e| e.to_string())?;
         let mut line = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
         line.push(b'\n');
@@ -149,7 +169,11 @@ impl HistoryStore {
         metas
     }
 
-    pub fn read_transcript(&self, task_id: &str, tail: usize) -> Result<Vec<TranscriptEntry>, String> {
+    pub fn read_transcript(
+        &self,
+        task_id: &str,
+        tail: usize,
+    ) -> Result<Vec<TranscriptEntry>, String> {
         let path = self.task_dir(task_id).join("transcript.jsonl");
         let data = match std::fs::read(path) {
             Ok(d) => d,
@@ -158,7 +182,9 @@ impl HistoryStore {
         };
         let mut entries = Vec::new();
         for line in data.split(|b| *b == b'\n') {
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             if let Ok(e) = serde_json::from_slice::<TranscriptEntry>(line) {
                 entries.push(e);
             }

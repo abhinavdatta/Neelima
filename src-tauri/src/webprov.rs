@@ -12,11 +12,12 @@
 //! Navigation guard (B1): `on_navigation` allows only the adapter's allowed
 //! domain + its auth domains; anything else opens in the system browser.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tauri::{Emitter, Manager, Position, Size, State, Webview, WebviewUrl, WebviewBuilder};
+use tauri::{Emitter, Manager, Position, Size, State, Webview, WebviewBuilder, WebviewUrl};
 use tokio::sync::Notify;
 
 use crate::adapters::Adapter;
@@ -41,8 +42,14 @@ pub struct WebviewState {
     pub login: Mutex<LoginState>,
     /// Set when the page posted `ready` (then cleared by waiters).
     pub ready: Arc<Notify>,
+    pub page_ready: AtomicBool,
+    /// Push notification for changes to the page's login posture.
+    pub login_changed: Arc<Notify>,
     /// Last assistant message pushed by the page, keyed by seq.
     pub last_message: Mutex<(u64, String)>,
+    /// Sequence captured immediately before a send, so a fast reply cannot be
+    /// missed if it arrives before the agent begins waiting.
+    pub response_baseline: std::sync::atomic::AtomicU64,
     /// Incremented so waiters know a new message arrived.
     pub message_notify: Arc<Notify>,
     /// TCSO / stream relay: latest streaming text from the page.
@@ -73,7 +80,10 @@ pub enum LoginState {
 
 impl Default for LoginState {
     fn default() -> Self {
-        LoginState::Unknown { reason: "not mounted yet".into(), url: String::new() }
+        LoginState::Unknown {
+            reason: "not mounted yet".into(),
+            url: String::new(),
+        }
     }
 }
 
@@ -121,10 +131,13 @@ fn store_id(profile_id: &str) -> [u8; 16] {
     out
 }
 
-pub fn injection_script(adapter: &Adapter) -> String {
+pub fn injection_script(adapter: &Adapter, mount_nonce: &str) -> String {
     let cfg = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".into());
-    // The per-mount nonce is passed per-RPC at eval time; the page needs nothing up front.
-    format!("window.__LB_ADAPTER__ = {cfg};\n{}", include_str!("adapter_runtime.js"))
+    format!(
+        "window.__LB_NONCE__ = {:?};\nwindow.__LB_ADAPTER__ = {cfg};\n{}",
+        mount_nonce,
+        include_str!("adapter_runtime.js")
+    )
 }
 
 #[derive(Clone)]
@@ -145,7 +158,10 @@ impl WebProvider {
     /// B2: every call carries the per-mount nonce so pushes that originate in
     /// this conversation stay authenticated.
     fn fire(&self, method: &str, arg: &Value) -> Result<(), String> {
-        let wv = self.app.get_webview(PROVIDER_LABEL).ok_or("provider webview is not open")?;
+        let wv = self
+            .app
+            .get_webview(PROVIDER_LABEL)
+            .ok_or("provider webview is not open")?;
         let nonce = self.hub.current_nonce();
         let js = format!(
             "window.__LB__ && window.__LB__.call({:?}, {:?}, null, {:?})",
@@ -156,12 +172,54 @@ impl WebProvider {
         wv.eval(js).map_err(|e| format!("eval failed: {e}"))
     }
 
+    async fn call(&self, method: &str, arg: &Value) -> Result<Value, ProviderError> {
+        let wv = self.app.get_webview(PROVIDER_LABEL).ok_or_else(|| {
+            ProviderError::BridgeUnreachable(set_bridge_err(
+                &self.state.last_bridge_error,
+                "provider webview is not open".into(),
+            ))
+        })?;
+        let arg_json = serde_json::to_string(arg).map_err(|e| {
+            ProviderError::SendFailed(format!("could not serialize provider call: {e}"))
+        })?;
+        let (req_id, nonce, rx) = self.hub.begin();
+        let js = format!(
+            "window.__LB__ && window.__LB__.call({:?}, {:?}, {:?}, {:?})",
+            method, arg_json, req_id, nonce
+        );
+        if let Err(e) = wv.eval(js) {
+            self.hub.cancel(&req_id);
+            return Err(ProviderError::SendFailed(set_bridge_err(
+                &self.state.last_bridge_error,
+                format!("eval failed: {e}"),
+            )));
+        }
+        let reply = crate::bridge::BridgeHub::wait(rx, 10_000)
+            .await
+            .map_err(|e| {
+                self.hub.cancel(&req_id);
+                ProviderError::Timeout(set_bridge_err(&self.state.last_bridge_error, e))
+            })?;
+        if reply["ok"] == false {
+            return Err(ProviderError::SendFailed(
+                reply["error"]
+                    .as_str()
+                    .unwrap_or("provider call failed")
+                    .to_string(),
+            ));
+        }
+        Ok(reply.get("value").cloned().unwrap_or(Value::Null))
+    }
+
     /// A6: wait for the page's `ready` push before any RPC/fire.
     async fn wait_ready(&self, timeout_ms: u64) -> Result<(), String> {
-        if self.is_ready_hint() {
+        if self.state.page_ready.load(Ordering::Acquire) {
             return Ok(());
         }
-        let _ = self.app.emit("evt", json!({"kind": "provider-waiting", "what": "page-load", "adapter": self.adapter.name}));
+        let _ = self.app.emit(
+            "evt",
+            json!({"kind": "provider-waiting", "what": "page-load", "adapter": self.adapter.name}),
+        );
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -171,66 +229,79 @@ impl WebProvider {
                     self.adapter.name
                 ));
             }
+            let notified = self.state.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.page_ready.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let notified = tokio::select! {
-                _ = self.state.ready.notified() => true,
+                _ = &mut notified => true,
                 _ = tokio::time::sleep(left) => false,
             };
-            if notified && self.is_ready_hint() {
+            if notified && self.state.page_ready.load(Ordering::Acquire) {
                 return Ok(());
             }
         }
     }
 
-    /// The `ready` push also carries a login_state; treat "unknown with a URL"
-    /// as evidence the page is alive. (The canonical ready flag is the Notify.)
-    fn is_ready_hint(&self) -> bool {
-        match &*self.state.login.lock().unwrap() {
-            LoginState::Unknown { url, .. } => !url.is_empty(),
-            _ => true,
-        }
-    }
-
     /// Read the current login posture from push events (NOT from polling).
     async fn await_login(&self, timeout_secs: u64) -> Result<LoginState, String> {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         loop {
-            if Instant::now() > deadline {
-                return Err(format!("login wait timed out after {timeout_secs}s"));
-            }
+            let notified = self.state.login_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let cur = self.state.login.lock().unwrap().clone();
-            match cur {
-                LoginState::LoggedIn { .. } => return Ok(cur),
-                LoginState::Unknown { reason, .. } => {
-                    let _ = self.app.emit("evt", json!({
-                        "kind": "provider-login-state",
-                        "state": "unknown",
-                        "adapter": self.adapter.name,
-                        "reason": reason,
-                    }));
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                LoginState::LoggedOut { .. } => {
-                    let _ = self.app.emit("evt", json!({
-                        "kind": "provider-login-state",
-                        "state": "logged_out",
-                        "adapter": self.adapter.name,
-                    }));
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            if matches!(cur, LoginState::LoggedIn { .. }) {
+                return Ok(cur);
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(format!("login wait timed out after {timeout_secs}s"));
                 }
             }
         }
     }
 
-    pub async fn send(&mut self, task_id: &str, text: &str, first_of_task: bool) -> Result<(), String> {
-        if !is_mounted(&self.state, &self.profile_id) {
-            mount(&self.app, &self.profile_id, &self.adapter, &self.state).await?;
+    async fn await_known_login(&self, timeout: Duration) -> Result<LoginState, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.state.login_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let cur = self.state.login.lock().unwrap().clone();
+            if !matches!(cur, LoginState::Unknown { .. }) {
+                return Ok(cur);
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err("page did not report a login state".into());
+                }
+            }
         }
-        let _ = set_visible(&self.app, &self.state, true);
+    }
+
+    pub async fn send(
+        &mut self,
+        task_id: &str,
+        text: &str,
+        first_of_task: bool,
+    ) -> Result<(), ProviderError> {
+        if !is_mounted(&self.state, &self.profile_id, &self.adapter.id) {
+            mount(&self.app, &self.profile_id, &self.adapter, &self.state)
+                .await
+                .map_err(ProviderError::PageChanged)?;
+        }
+        // Show the provider pane while a task is running (A7: the webview may
+        // simply be hidden, in which case this is a no-op raise).
+        set_visible(&self.app, &self.state, true);
 
         // A6: never assume the page is up before the first push event.
         self.wait_ready(20_000).await.map_err(|e| {
-            let e = set_bridge_err(&self.state.last_bridge_error, e);
-            ProviderError::BridgeUnreachable(e).message()
+            ProviderError::BridgeUnreachable(set_bridge_err(&self.state.last_bridge_error, e))
         })?;
 
         // A4: three states; unknown => "can't reach the page" (diagnose),
@@ -241,38 +312,34 @@ impl WebProvider {
             match cur {
                 LoginState::LoggedIn { .. } => break,
                 LoginState::LoggedOut { .. } => {
-                    let _ = self.app.emit("evt", json!({"kind": "provider-login-required", "adapter": self.adapter.name}));
+                    let _ = self.app.emit(
+                        "evt",
+                        json!({"kind": "provider-login-required", "adapter": self.adapter.name}),
+                    );
                     match self.await_login(300).await {
                         Ok(_) => break,
-                        Err(_) => return Err(ProviderError::NeedsLogin.message()),
+                        Err(_) => return Err(ProviderError::NeedsLogin),
                     }
                 }
                 LoginState::Unknown { reason, .. } => {
-                    // Give the page a short settle window (it usually reports
-                    // real state within seconds); then degrade cleanly.
-                    let settle = Instant::now() + Duration::from_secs(30);
-                    let mut known = false;
-                    while Instant::now() < settle {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if !matches!(
-                            &*self.state.login.lock().unwrap(),
-                            LoginState::Unknown { .. }
-                        ) {
-                            known = true;
-                            break;
-                        }
-                    }
-                    if !known {
+                    if self
+                        .await_known_login(Duration::from_secs(30))
+                        .await
+                        .is_err()
+                    {
                         let e = set_bridge_err(
                             &self.state.last_bridge_error,
                             format!("page never reported a login state: {reason}"),
                         );
-                        let _ = self.app.emit("evt", json!({
-                            "kind": "provider-bridge-unreachable",
-                            "adapter": self.adapter.name,
-                            "reason": reason,
-                        }));
-                        return Err(ProviderError::BridgeUnreachable(e).message());
+                        let _ = self.app.emit(
+                            "evt",
+                            json!({
+                                "kind": "provider-bridge-unreachable",
+                                "adapter": self.adapter.name,
+                                "reason": reason,
+                            }),
+                        );
+                        return Err(ProviderError::BridgeUnreachable(e));
                     }
                 }
             }
@@ -288,40 +355,42 @@ impl WebProvider {
             tokio::time::sleep(Duration::from_millis(600)).await;
         }
 
-        // send_message is fire-and-forget; the runtime posts assistant_message
-        // pushes when the reply completes (wait_reply consumes them).
-        let sent = self.fire("send_message", &json!({"text": text, "quiet_ms": self.adapter.quiet_ms}));
-        match sent {
-            Ok(()) => {}
-            Err(e) => {
-                let e = set_bridge_err(&self.state.last_bridge_error, e);
-                return Err(ProviderError::SendFailed(e).message());
-            }
-        }
+        let baseline = self.state.last_message.lock().unwrap().0;
+        self.state
+            .response_baseline
+            .store(baseline, Ordering::Release);
+
+        // A10: await the send acknowledgement so a stale selector is distinct
+        // from a successful click followed by a slow assistant response.
+        let result = self
+            .call(
+                "send_message",
+                &json!({"text": text, "quiet_ms": self.adapter.quiet_ms}),
+            )
+            .await?;
+        classify_send_result(&result)?;
         Ok(())
     }
 
     /// Wait for the assistant message push (A3). Cancel-safe via Notify.
     pub async fn wait_reply(&mut self, cancel: Arc<Notify>) -> Result<String, String> {
-        let timeout = self.adapter.response_timeout_ms as u64;
-        let deadline = Instant::now() + Duration::from_millis(timeout);
-        let (start_seq, start_text) = self.state.last_message.lock().unwrap().clone();
-        let started = !start_text.is_empty();
+        let timeout = Duration::from_millis(self.adapter.response_timeout_ms);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let start_seq = self.state.response_baseline.load(Ordering::Acquire);
         loop {
-            if Instant::now() > deadline {
-                return Err("response timeout waiting for the assistant message".into());
+            let notified = self.state.message_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (seq, text) = self.state.last_message.lock().unwrap().clone();
+            if seq > start_seq && !text.trim().is_empty() {
+                return Ok(text);
             }
-            let left = deadline.saturating_duration_since(Instant::now());
             tokio::select! {
-                _ = self.state.message_notify.notified() => {
-                    let (seq, text) = self.state.last_message.lock().unwrap().clone();
-                    if !text.is_empty() && (seq > start_seq || seq == start_seq && !started) {
-                        if text.trim().is_empty() && seq <= start_seq { continue; }
-                        return Ok(text);
-                    }
-                }
+                _ = &mut notified => {},
                 _ = cancel.notified() => return Err("stopped".into()),
-                _ = tokio::time::sleep(left.min(Duration::from_millis(500))) => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err("response timeout waiting for the assistant message".into());
+                },
             }
         }
     }
@@ -348,10 +417,45 @@ impl ProviderError {
         match self {
             ProviderError::NeedsLogin => "NEEDS_LOGIN".into(),
             ProviderError::BridgeUnreachable(d) => format!("can't reach the provider page ({d})"),
-            ProviderError::PageChanged(d) => format!("provider page changed (selectors may be stale): {d}"),
+            ProviderError::PageChanged(d) => {
+                format!("provider page changed (selectors may be stale): {d}")
+            }
             ProviderError::Timeout(d) => format!("provider timeout: {d}"),
             ProviderError::SendFailed(d) => format!("send failed: {d}"),
         }
+    }
+
+    pub fn should_use_manual_relay(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::NeedsLogin
+                | ProviderError::BridgeUnreachable(_)
+                | ProviderError::PageChanged(_)
+        )
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+fn classify_send_result(result: &Value) -> Result<(), ProviderError> {
+    match result["error_type"].as_str() {
+        Some("page_changed") => Err(ProviderError::PageChanged(
+            result["error"]
+                .as_str()
+                .unwrap_or("provider input selector is missing")
+                .to_string(),
+        )),
+        Some(_) => Err(ProviderError::SendFailed(
+            result["error"]
+                .as_str()
+                .unwrap_or("provider rejected the send")
+                .to_string(),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -360,25 +464,41 @@ fn set_bridge_err(slot: &Mutex<Option<String>>, e: String) -> String {
     e
 }
 
-pub fn is_mounted(state: &WebviewState, profile_id: &str) -> bool {
+pub fn is_mounted(state: &WebviewState, profile_id: &str, adapter_id: &str) -> bool {
     state
         .mounted
         .lock()
         .unwrap()
         .as_ref()
-        .map(|m| m.profile_id == profile_id)
+        .map(|m| m.profile_id == profile_id && m.adapter_id == adapter_id)
+        .unwrap_or(false)
+}
+
+fn mounted_profile_matches(
+    current: Option<&MountedProfile>,
+    profile_id: &str,
+    adapter_id: &str,
+) -> bool {
+    current
+        .map(|m| m.profile_id == profile_id && m.adapter_id == adapter_id)
         .unwrap_or(false)
 }
 
 /// Push-event intake from bridge.rs.
 pub fn on_page_ready(app: &tauri::AppHandle) {
     let st: State<'_, Arc<WebviewState>> = app.state();
-    // Notifying wakes any wait_ready waiter; login state arrives separately.
-    st.ready.notify_one();
+    st.page_ready.store(true, Ordering::Release);
+    st.ready.notify_waiters();
     let _ = app.emit("evt", json!({"kind": "provider-page-ready"}));
 }
 
-pub fn on_login_state(webview: &Webview, app: &tauri::AppHandle, state_s: String, url: String, reason: String) {
+pub fn on_login_state(
+    webview: &Webview,
+    app: &tauri::AppHandle,
+    state_s: String,
+    url: String,
+    reason: String,
+) {
     let _ = webview;
     let st: State<'_, Arc<WebviewState>> = app.state();
     {
@@ -386,14 +506,17 @@ pub fn on_login_state(webview: &Webview, app: &tauri::AppHandle, state_s: String
         *login = match state_s.as_str() {
             "logged_in" => LoginState::LoggedIn { url: url.clone() },
             "logged_out" => LoginState::LoggedOut { url: url.clone() },
-            _ => LoginState::Unknown { reason: reason.clone(), url: url.clone() },
+            _ => LoginState::Unknown {
+                reason: reason.clone(),
+                url: url.clone(),
+            },
         };
     }
     let _ = app.emit(
         "evt",
         json!({"kind": "provider-login-state", "state": state_s, "url": url, "reason": reason}),
     );
-    st.ready.notify_one();
+    st.login_changed.notify_waiters();
 }
 
 pub fn on_assistant_message(webview: &Webview, text: String, seq: u64) {
@@ -407,7 +530,10 @@ pub fn on_assistant_message(webview: &Webview, text: String, seq: u64) {
             }
         }
         st.message_notify.notify_one();
-        let _ = app.emit("evt", json!({"kind": "assistant-stream-complete", "len": text.len()}));
+        let _ = app.emit(
+            "evt",
+            json!({"kind": "assistant-stream-complete", "len": text.len()}),
+        );
     }
 }
 
@@ -431,17 +557,31 @@ pub async fn mount(
     state: &WebviewState,
 ) -> Result<(), String> {
     let hub: State<'_, Arc<BridgeHub>> = app.state();
+    let current = state.mounted.lock().unwrap().clone();
+    if mounted_profile_matches(current.as_ref(), profile_id, &adapter.id)
+        && app.get_webview(PROVIDER_LABEL).is_some()
+    {
+        set_visible(app, state, true);
+        return Ok(());
+    }
+    if current.is_some() && *state.task_active.lock().unwrap() {
+        return Err("cannot change provider profile while an agent task is active".into());
+    }
     unmount_if_any(app, state);
-    hub.new_nonce();
+    let mount_nonce = hub.new_nonce();
     // Reset watch state for a fresh page.
-    *state.login.lock().unwrap() = LoginState::Unknown { reason: "loading".into(), url: String::new() };
+    state.page_ready.store(false, Ordering::Release);
+    *state.login.lock().unwrap() = LoginState::Unknown {
+        reason: "loading".into(),
+        url: String::new(),
+    };
     *state.last_message.lock().unwrap() = (0, String::new());
     *state.chat_started_for.lock().unwrap() = None;
     *state.last_bridge_error.lock().unwrap() = None;
     *state.hidden_since.lock().unwrap() = None;
 
     let window = app.get_window("main").ok_or("main window missing")?;
-    let script = injection_script(adapter);
+    let script = injection_script(adapter, &mount_nonce);
     let url = if let Some(rest) = adapter.url.strip_prefix("app://") {
         WebviewUrl::App(rest.to_string().into())
     } else {
@@ -449,30 +589,32 @@ pub async fn mount(
             tauri::Url::parse(&adapter.url).map_err(|e| format!("bad adapter url: {e}"))?,
         )
     };
-    let start_domain = allowed_host(adapter);
+    let start_domain = if adapter.allowed_domain.is_empty() {
+        allowed_host(adapter)
+    } else {
+        adapter.allowed_domain.clone()
+    };
     let auth_list = adapter.auth_domains.clone();
+    hub.set_origin(&adapter.url, &start_domain, &auth_list);
+    let adapter_url = adapter.url.clone();
     let adapter_name = adapter.name.clone();
     let nav_app = app.clone();
     let mut builder = WebviewBuilder::new(PROVIDER_LABEL, url)
         .initialization_script(script)
         .focused(false)
         .on_navigation(move |url| {
-            // B1: only the adapter's own domain + auth domains may load here.
-            // Everything else (a malicious link inside the chat, an ad, an
-            // OAuth consent page we do not whitelist) opens in the system
-            // browser instead. app:// (bundled demo page) is always allowed.
             let s = url.to_string();
             if let Ok(parsed) = tauri::Url::parse(&s) {
-                if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                if provider_url_allowed(
+                    &parsed,
+                    &adapter_url,
+                    &start_domain,
+                    &auth_list,
+                    false,
+                ) {
                     return true;
                 }
-                let host = parsed.host_str().unwrap_or("").to_string();
-                if host.is_empty() {
-                    return true;
-                }
-                if domain_allowed(&host, &start_domain, &auth_list) {
-                    return true;
-                }
+                let host = parsed.host_str().unwrap_or(parsed.scheme()).to_string();
                 let _ = open_in_system_browser(&nav_app, &s);
                 let _ = nav_app.emit(
                     "evt",
@@ -497,14 +639,22 @@ pub async fn mount(
             let dpr = window.scale_factor().unwrap_or(1.0);
             let w = (sz.width as f64 / dpr).max(400.0) as i32;
             let h = (sz.height as f64 / dpr - 120.0).max(300.0) as i32;
-            rect = Rect { x: 272, y: 46, w, h };
+            rect = Rect {
+                x: 272,
+                y: 46,
+                w,
+                h,
+            };
         }
     }
     let webview = window
         .add_child(
             builder,
             Position::Physical(tauri::PhysicalPosition::new(rect.x, rect.y)),
-            Size::Physical(tauri::PhysicalSize::new(rect.w.max(1) as u32, rect.h.max(1) as u32)),
+            Size::Physical(tauri::PhysicalSize::new(
+                rect.w.max(1) as u32,
+                rect.h.max(1) as u32,
+            )),
         )
         .map_err(|e| format!("add_child failed: {e}"))?;
     *state.mounted.lock().unwrap() = Some(MountedProfile {
@@ -524,10 +674,14 @@ pub fn host_of(url: &str) -> String {
     if url.starts_with("app://") {
         return String::new();
     }
-    tauri::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_string())).unwrap_or_default()
+    tauri::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default()
 }
 
-/// Extract the host of the adapter start URL. app:// pages are always trusted.
+/// Extract the host of the adapter start URL. Bundled app pages use an empty
+/// network-host allowlist and are checked against the internal app origin.
 fn allowed_host(adapter: &Adapter) -> String {
     if adapter.url.starts_with("app://") {
         return String::new();
@@ -538,8 +692,10 @@ fn allowed_host(adapter: &Adapter) -> String {
         .unwrap_or_default()
 }
 
-fn domain_allowed(host: &str, start: &str, auth: &[String]) -> bool {
-    if host.eq_ignore_ascii_case(start) {
+pub fn domain_allowed(host: &str, start: &str, auth: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    let start = start.to_ascii_lowercase();
+    if host == start {
         return true;
     }
     // Subdomains of the start domain are allowed (login flows bounce through sso).
@@ -547,9 +703,33 @@ fn domain_allowed(host: &str, start: &str, auth: &[String]) -> bool {
         return true;
     }
     auth.iter().any(|a| {
-        let a = a.trim().trim_start_matches('.');
-        host.eq_ignore_ascii_case(a) || host.ends_with(&format!(".{a}"))
+        let a = a.trim().trim_start_matches('.').to_ascii_lowercase();
+        host == a || host.ends_with(&format!(".{a}"))
     })
+}
+
+pub fn provider_url_allowed(
+    url: &tauri::Url,
+    adapter_url: &str,
+    primary_host: &str,
+    auth_domains: &[String],
+    primary_only: bool,
+) -> bool {
+    if adapter_url.starts_with("app://") {
+        return matches!(url.scheme(), "app" | "tauri") && url.host_str() == Some("localhost")
+            || matches!(url.scheme(), "http" | "https")
+                && url.host_str() == Some("tauri.localhost");
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if domain_allowed(host, primary_host, &[]) {
+        return true;
+    }
+    !primary_only && domain_allowed(host, "", auth_domains)
 }
 
 pub fn unmount_if_any(app: &tauri::AppHandle, state: &WebviewState) {
@@ -557,6 +737,12 @@ pub fn unmount_if_any(app: &tauri::AppHandle, state: &WebviewState) {
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         let _ = wv.close();
     }
+    if let Some(hub) = app.try_state::<Arc<BridgeHub>>() {
+        hub.clear_origin();
+    }
+    state.page_ready.store(false, Ordering::Release);
+    state.login_changed.notify_waiters();
+    state.ready.notify_waiters();
     *state.hidden_since.lock().unwrap() = None;
     if had.is_some() {
         let _ = app.emit("evt", serde_json::json!({"kind": "provider-unmounted"}));
@@ -569,14 +755,25 @@ pub fn hide_if_any(app: &tauri::AppHandle, state: &WebviewState) {
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         let _ = wv.hide();
         *state.hidden_since.lock().unwrap() = Some(Instant::now());
+        let app = app.clone();
+        let state = app.state::<Arc<WebviewState>>().inner().clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(HIDDEN_IDLE_DESTROY_MS)).await;
+            destroy_if_idle(&app, &state, false);
+        });
     }
 }
 
 pub fn apply_rect(app: &tauri::AppHandle, state: &WebviewState, rect: Rect) {
     *state.rect.lock().unwrap() = rect;
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
-        let _ = wv.set_position(Position::Physical(tauri::PhysicalPosition::new(rect.x, rect.y)));
-        let _ = wv.set_size(Size::Physical(tauri::PhysicalSize::new(rect.w.max(1) as u32, rect.h.max(1) as u32)));
+        let _ = wv.set_position(Position::Physical(tauri::PhysicalPosition::new(
+            rect.x, rect.y,
+        )));
+        let _ = wv.set_size(Size::Physical(tauri::PhysicalSize::new(
+            rect.w.max(1) as u32,
+            rect.h.max(1) as u32,
+        )));
     }
 }
 
@@ -610,25 +807,21 @@ pub fn destroy_if_idle(app: &tauri::AppHandle, state: &WebviewState, force: bool
 }
 
 pub fn open_in_system_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
-    // No plugin needed: shell-open via `start`/`open`/`xdg-open`.
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(0x08000000)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+    let parsed = tauri::Url::parse(url).map_err(|e| format!("invalid external URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "refusing to open unsupported external URL scheme '{}'",
+            parsed.scheme()
+        ));
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(url).spawn().map_err(|e| e.to_string())?;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open").arg(url).spawn().map_err(|e| e.to_string())?;
-    }
-    let _ = app.emit("evt", json!({"kind": "notify", "text": format!("Opened {url} in your system browser.")}));
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(parsed.to_string(), None::<&str>)
+        .map_err(|e| format!("could not open external URL: {e}"))?;
+    let _ = app.emit(
+        "evt",
+        json!({"kind": "notify", "text": format!("Opened {url} in your system browser.")}),
+    );
     Ok(())
 }
 
@@ -643,16 +836,112 @@ mod tests {
         assert!(allowed);
         assert!(domain_allowed("sso.claude.ai", "claude.ai", &[]));
         assert!(!domain_allowed("evil.com", "claude.ai", &[]));
-        assert!(domain_allowed("accounts.google.com", "gemini.google.com", &["accounts.google.com".into(), "accounts.youtube.com".into()]));
-        assert!(domain_allowed("login.microsoftonline.com", "chatgpt.com", &["auth0.com".into(), "login.microsoftonline.com".into()]));
-        assert!(!domain_allowed("tracker.example", "", &["auth0.com".into()]));
+        assert!(domain_allowed(
+            "accounts.google.com",
+            "gemini.google.com",
+            &["accounts.google.com".into(), "accounts.youtube.com".into()]
+        ));
+        assert!(domain_allowed(
+            "login.microsoftonline.com",
+            "chatgpt.com",
+            &["auth0.com".into(), "login.microsoftonline.com".into()]
+        ));
+        assert!(!domain_allowed(
+            "tracker.example",
+            "",
+            &["auth0.com".into()]
+        ));
+        let auth = vec!["accounts.google.com".to_string()];
+        assert!(provider_url_allowed(
+            &tauri::Url::parse("https://CHATGPT.COM/c/1").unwrap(),
+            "https://chatgpt.com",
+            "chatgpt.com",
+            &auth,
+            true
+        ));
+        assert!(provider_url_allowed(
+            &tauri::Url::parse("https://accounts.google.com/").unwrap(),
+            "https://chatgpt.com",
+            "chatgpt.com",
+            &auth,
+            false
+        ));
+        assert!(!provider_url_allowed(
+            &tauri::Url::parse("https://accounts.google.com/").unwrap(),
+            "https://chatgpt.com",
+            "chatgpt.com",
+            &auth,
+            true
+        ));
+        assert!(!provider_url_allowed(
+            &tauri::Url::parse("mailto:user@example.com").unwrap(),
+            "https://chatgpt.com",
+            "chatgpt.com",
+            &auth,
+            false
+        ));
+        assert!(provider_url_allowed(
+            &tauri::Url::parse("http://tauri.localhost/index.html").unwrap(),
+            "app://localhost/demo",
+            "",
+            &[],
+            true
+        ));
+        assert!(!provider_url_allowed(
+            &tauri::Url::parse("https://evil.example/").unwrap(),
+            "app://localhost/demo",
+            "",
+            &[],
+            false
+        ));
     }
 
     /// A4: a bridge failure must never classify as logged out.
     #[test]
     fn unknown_is_not_loggedout() {
-        let a = LoginState::Unknown { reason: "bridge timeout".into(), url: "https://x".into() };
-        assert_ne!(a, LoginState::LoggedOut { url: "https://x".into() });
+        let a = LoginState::Unknown {
+            reason: "bridge timeout".into(),
+            url: "https://x".into(),
+        };
+        assert_ne!(
+            a,
+            LoginState::LoggedOut {
+                url: "https://x".into()
+            }
+        );
+    }
+
+    #[test]
+    fn provider_errors_only_relay_when_provider_is_unavailable() {
+        assert!(ProviderError::NeedsLogin.should_use_manual_relay());
+        assert!(ProviderError::BridgeUnreachable("timeout".into()).should_use_manual_relay());
+        assert!(ProviderError::PageChanged("redirected".into()).should_use_manual_relay());
+        assert!(!ProviderError::Timeout("reply".into()).should_use_manual_relay());
+        assert!(!ProviderError::SendFailed("click".into()).should_use_manual_relay());
+    }
+
+    #[test]
+    fn stale_send_selector_is_classified_as_page_changed() {
+        let err = classify_send_result(&json!({
+            "error_type": "page_changed",
+            "error": "input selector was not found"
+        }))
+        .unwrap_err();
+        assert!(matches!(err, ProviderError::PageChanged(_)));
+        assert!(err.should_use_manual_relay());
+        assert!(classify_send_result(&json!({"sent": true})).is_ok());
+    }
+
+    #[test]
+    fn same_profile_mount_is_reused_but_profile_change_is_not() {
+        let mounted = MountedProfile {
+            profile_id: "p1".into(),
+            adapter_id: "a1".into(),
+        };
+        assert!(mounted_profile_matches(Some(&mounted), "p1", "a1"));
+        assert!(!mounted_profile_matches(Some(&mounted), "p2", "a1"));
+        assert!(!mounted_profile_matches(Some(&mounted), "p1", "a2"));
+        assert!(!mounted_profile_matches(None, "p1", "a1"));
     }
 
     /// A2: the page's ONLY allowed message types never include file ops.

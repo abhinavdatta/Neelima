@@ -7,11 +7,12 @@
 
 use std::sync::Arc;
 
-use tauri::{Manager, WebviewUrl, WebviewBuilder, LogicalPosition, LogicalSize, Emitter};
+use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, WebviewBuilder, WebviewUrl};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 pub mod adapters;
 pub mod agent;
+pub mod app_log;
 pub mod bridge;
 pub mod checkpoints;
 pub mod exec;
@@ -82,6 +83,7 @@ pub fn run() {
             ui::ui_terminal_kill,
             ui::ui_checkpoint_list,
             ui::ui_checkpoint_create,
+            ui::ui_checkpoint_restore_preview,
             ui::ui_checkpoint_restore,
             ui::ui_history_tasks,
             ui::ui_history_open,
@@ -102,6 +104,7 @@ pub fn run() {
             let data_dir = handle.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+            app_log::init(&data_dir)?;
 
             // ---- managed state (Arc-shared with the agent task) ----
             let settings = settings::SettingsStore::load(&config_dir)?;
@@ -143,8 +146,13 @@ pub fn run() {
             // Emergency-stop hotkey (default Ctrl+Alt+Shift+X, user-editable).
             // F2: never fatal — a busy global shortcut must not kill the app.
             if let Err(e) = register_hotkey(&handle, &hotkey) {
-                eprintln!("[hotkey] {e}");
-                let _ = handle.emit(agent::EVT, serde_json::json!({"kind": "notify", "level": "warn", "text": format!("Emergency-stop hotkey could not be registered: {e}") }));
+                let log_error = app_log::write("hotkey", &e).err();
+                let text = if let Some(log_error) = log_error {
+                    format!("Emergency-stop hotkey could not be registered: {e}; file log failed: {log_error}")
+                } else {
+                    format!("Emergency-stop hotkey could not be registered: {e}")
+                };
+                let _ = handle.emit(agent::EVT, serde_json::json!({"kind": "notify", "level": "warn", "text": text }));
             }
 
             // Kill leftover state on window close.
@@ -193,9 +201,13 @@ pub fn run_checks() -> String {
 }
 
 pub fn register_hotkey(app: &tauri::AppHandle, hotkey: &str) -> Result<(), String> {
+    let sc: Shortcut = hotkey
+        .parse()
+        .map_err(|e| format!("bad hotkey '{hotkey}': {e}"))?;
     let gs = app.global_shortcut();
-    let _ = gs.unregister_all();
-    let sc: Shortcut = hotkey.parse().map_err(|e| format!("bad hotkey '{hotkey}': {e}"))?;
-    gs.register(sc).map_err(|e| format!("failed to register hotkey '{hotkey}': {e}"))?;
+    gs.unregister_all()
+        .map_err(|e| format!("could not clear existing hotkey registrations: {e}"))?;
+    gs.register(sc)
+        .map_err(|e| format!("failed to register hotkey '{hotkey}': {e}"))?;
     Ok(())
 }

@@ -15,29 +15,11 @@ export function Chat() {
 
   return (
     <div class="chat">
-      {s.entries.length === 0 && !readOnly ? <EmptyState /> : null}
       {s.entries.map((e) => <Entry key={`${e.ts}-${e.id}`} e={e} taskId={s.taskId ?? s.openTask?.id ?? ""} readOnly={readOnly} />)}
 
       {s.pendingCalls.length > 0 ? <ApprovalCard /> : null}
       {s.relayOutbound && s.agentState === "waiting_for_ai" ? <RelayCard /> : null}
       <div ref={bottom} />
-    </div>
-  );
-}
-
-function EmptyState() {
-  const s = useStore();
-  return (
-    <div class="empty">
-      <div class="empty-logo">N</div>
-      <h2>Neelima</h2>
-      <p>A local-first agentic coding assistant. It embeds the AI provider's own web chat (your account, your login) or local models — no API keys, no cloud calls, no telemetry.</p>
-      {!s.activeWorkspacePath ? (
-        <p class="hint">Pick a project folder first — use <b>+ Add folder</b> in the sidebar.</p>
-      ) : (
-        <p class="hint">Workspace: <code>{s.activeWorkspacePath}</code></p>
-      )}
-      <p class="hint dim">Try it instantly with the built-in <b>Demo chat</b> provider — no login needed.</p>
     </div>
   );
 }

@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::workspace::{Workspace, WorkspaceError};
 
 pub const MAX_WRITE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 500;
 pub const MAX_GLOB_RESULTS: usize = 500;
 pub const MAX_GREP_MATCHES: usize = 200;
@@ -24,10 +25,18 @@ pub struct ToolOutcome {
 }
 
 fn ok_out(output: String) -> ToolOutcome {
-    ToolOutcome { ok: true, output, diff: None }
+    ToolOutcome {
+        ok: true,
+        output,
+        diff: None,
+    }
 }
 fn err_out(output: String) -> ToolOutcome {
-    ToolOutcome { ok: false, output, diff: None }
+    ToolOutcome {
+        ok: false,
+        output,
+        diff: None,
+    }
 }
 
 fn cap_note(cap: usize) -> String {
@@ -77,7 +86,14 @@ pub fn execute(
         "move_file" => move_file(ws, args),
         // run_command is dispatched by the agent (needs streaming + kill handle).
         "run_command" => err_out("run_command must be executed by the agent loop".into()),
-        other => err_out(format!("unknown tool '{other}'. Available: {}", tool_names().iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "))),
+        other => err_out(format!(
+            "unknown tool '{other}'. Available: {}",
+            tool_names()
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -90,7 +106,10 @@ fn get_str(args: &Value, key: &str) -> Result<String, String> {
 fn get_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(n)) => n.as_u64().map(|v| Some(v as usize)).ok_or(format!("arg '{key}' must be a non-negative number")),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(|v| Some(v as usize))
+            .ok_or(format!("arg '{key}' must be a non-negative number")),
         Some(_) => Err(format!("arg '{key}' must be a number")),
     }
 }
@@ -108,14 +127,20 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
         Err(e) => return err_out(format!("read_file: {e}")),
     };
     if meta.is_dir() {
-        return err_out(format!("read_file: '{}' is a directory (use list_dir)", ws.display(&path)));
+        return err_out(format!(
+            "read_file: '{}' is a directory (use list_dir)",
+            ws.display(&path)
+        ));
     }
     // Binary sniff on the first 8 KB.
     if let Ok(mut f) = std::fs::File::open(&path) {
         let mut head = [0u8; 8192];
         let n = f.read(&mut head).unwrap_or(0);
         if head[..n].contains(&0) {
-            return err_out(format!("read_file: '{}' looks binary (NUL bytes); refusing to dump", ws.display(&path)));
+            return err_out(format!(
+                "read_file: '{}' looks binary (NUL bytes); refusing to dump",
+                ws.display(&path)
+            ));
         }
     }
 
@@ -130,16 +155,13 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
             let mut line_no = 0usize;
             let mut lossy = false;
             let mut byte_line: Vec<u8> = Vec::new();
-            let mut saw_any_byte = false;
             loop {
                 byte_line.clear();
-                saw_any_byte = false;
                 let mut one = [0u8; 1];
                 loop {
                     match mut_reader.read(&mut one) {
                         Ok(0) => break,
                         Ok(1) => {
-                            saw_any_byte = true;
                             byte_line.push(one[0]);
                             if one[0] == b'\n' || byte_line.len() >= MAX_LINE_BYTES {
                                 break;
@@ -152,7 +174,6 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
                 if byte_line.is_empty() {
                     break; // EOF (with or without a final newline)
                 }
-                let _ = saw_any_byte;
                 line_no += 1;
                 if line_no > offset {
                     if String::from_utf8(byte_line.clone()).is_err() {
@@ -179,7 +200,11 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
                                 }
                                 Ok(n) => {
                                     if let Some(pos) = sink[..n].iter().position(|&b| b == b'\n') {
-                                        if pos + 1 < n && (limit.is_none() || line_no - offset + 1 < limit.unwrap_or(usize::MAX)) {
+                                        if pos + 1 < n
+                                            && (limit.is_none()
+                                                || line_no - offset + 1
+                                                    < limit.unwrap_or(usize::MAX))
+                                        {
                                             // Remainder bytes start the next line
                                             // for plain lossless accounting.
                                             line_no += 1;
@@ -228,7 +253,11 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
                 out.push_str(&cap_note(cap));
             }
             if offset > 0 || limit.is_some() {
-                out.push_str(&format!("[{} lines read from line {}]", line_no.saturating_sub(offset), offset + 1));
+                out.push_str(&format!(
+                    "[{} lines read from line {}]",
+                    line_no.saturating_sub(offset),
+                    offset + 1
+                ));
             }
             ok_out(out)
         }
@@ -259,20 +288,23 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
             return err_out(format!("write_file: {e}"));
         }
     }
-    let diff: Option<(String, String, String)>;
-    if append {
+    let diff: Option<(String, String, String)> = if append {
         use std::io::Write;
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path)
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
             .and_then(|mut f| f.write_all(content.as_bytes()))
         {
-            Ok(()) => {}
-            Err(e) => return err_out(format!("write_file: {e}")),
+            return err_out(format!("write_file: {e}"));
         }
         // No whole-file diff for appends (the file may be a chunked stream).
-        diff = None;
+        None
     } else {
         // D4: skip the old/new full read for diff on files over 2 MB.
-        let over_cap = std::fs::metadata(&path).map(|m| m.len() as usize > MAX_WRITE_BYTES).unwrap_or(false);
+        let over_cap = std::fs::metadata(&path)
+            .map(|m| m.len() > MAX_DIFF_BYTES as u64)
+            .unwrap_or(false);
         let old = if over_cap {
             String::new()
         } else {
@@ -281,7 +313,7 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         if let Err(e) = std::fs::write(&path, content) {
             return err_out(format!("write_file: {e}"));
         }
-        diff = if over_cap {
+        if over_cap {
             Some((
                 ws.display(&path),
                 "[diff skipped: file exceeds 2 MB]".to_string(),
@@ -289,11 +321,19 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
             ))
         } else {
             let new = content.to_string();
-            if old != new { Some((ws.display(&path), old, new)) } else { None }
-        };
-    }
-    ok_out(format!("wrote {} bytes to {}", content.len(), ws.display(&path)))
-        .with_diff(diff)
+            if old != new {
+                Some((ws.display(&path), old, new))
+            } else {
+                None
+            }
+        }
+    };
+    ok_out(format!(
+        "wrote {} bytes to {}",
+        content.len(),
+        ws.display(&path)
+    ))
+    .with_diff(diff)
 }
 
 pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
@@ -310,9 +350,14 @@ pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         None => return err_out("missing string arg 'new_string'".into()),
     };
     if old_string.is_empty() {
-        return err_out("edit_file: old_string must not be empty (use write_file to create files)".into());
+        return err_out(
+            "edit_file: old_string must not be empty (use write_file to create files)".into(),
+        );
     }
-    let replace_all = args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+    let replace_all = args
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let path = match ws.resolve(&rel).map_err(|e| e.to_string()) {
         Ok(p) => p,
         Err(e) => return err_out(format!("edit_file: {e}")),
@@ -361,7 +406,15 @@ pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
     if let Err(e) = std::fs::write(&path, &updated) {
         return err_out(format!("edit_file: {e}"));
     }
-    let diff = Some((ws.display(&path), content.clone(), updated.clone()));
+    let diff = if content.len() > MAX_DIFF_BYTES || updated.len() > MAX_DIFF_BYTES {
+        Some((
+            ws.display(&path),
+            "[diff omitted: file exceeds 2 MB]".to_string(),
+            "[diff omitted: file exceeds 2 MB]".to_string(),
+        ))
+    } else {
+        Some((ws.display(&path), content.clone(), updated.clone()))
+    };
     ok_out(format!("edited {}", ws.display(&path))).with_diff(diff)
 }
 
@@ -465,7 +518,10 @@ pub fn grep(ws: &Workspace, args: &Value) -> ToolOutcome {
         Err(e) => return err_out(format!("grep: bad pattern: {e}")),
     };
     let inc_matcher = match include {
-        Some(g) => match globset::GlobBuilder::new(g).build().map(|g| g.compile_matcher()) {
+        Some(g) => match globset::GlobBuilder::new(g)
+            .build()
+            .map(|g| g.compile_matcher())
+        {
             Ok(m) => Some(m),
             Err(e) => return err_out(format!("grep: bad include: {e}")),
         },
@@ -473,14 +529,21 @@ pub fn grep(ws: &Workspace, args: &Value) -> ToolOutcome {
     };
     let mut lines = Vec::new();
     let mut matches = 0usize;
-    let walker = ignore::WalkBuilder::new(&base).hidden(true).git_ignore(true).require_git(false).build();
+    let walker = ignore::WalkBuilder::new(&base)
+        .hidden(true)
+        .git_ignore(true)
+        .require_git(false)
+        .build();
     'outer: for entry in walker.flatten() {
         let p = entry.path();
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
         if let Some(m) = &inc_matcher {
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if !m.is_match(&name) {
                 continue;
             }
@@ -526,7 +589,9 @@ pub fn delete_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         Err(e) => return err_out(format!("delete_file: {e}")),
     };
     if path.is_dir() {
-        return err_out("delete_file: refusing to delete a directory (delete files individually)".into());
+        return err_out(
+            "delete_file: refusing to delete a directory (delete files individually)".into(),
+        );
     }
     match std::fs::remove_file(&path) {
         Ok(()) => ok_out(format!("deleted {}", ws.display(&path))),
@@ -544,15 +609,26 @@ pub fn move_file(ws: &Workspace, args: &Value) -> ToolOutcome {
         Err(e) => return err_out(format!("move_file: {e}")),
     };
     if to.exists() {
-        return err_out(format!("move_file: destination {} already exists", ws.display(&to)));
+        return err_out(format!(
+            "move_file: destination {} already exists",
+            ws.display(&to)
+        ));
     }
     if let Some(parent) = to.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::rename(&from, &to) {
-        Ok(()) => ok_out(format!("moved {} -> {}", ws.display(&from), ws.display(&to))),
+        Ok(()) => ok_out(format!(
+            "moved {} -> {}",
+            ws.display(&from),
+            ws.display(&to)
+        )),
         Err(_) => match std::fs::copy(&from, &to).and_then(|_| std::fs::remove_file(&from)) {
-            Ok(_) => ok_out(format!("moved {} -> {}", ws.display(&from), ws.display(&to))),
+            Ok(_) => ok_out(format!(
+                "moved {} -> {}",
+                ws.display(&from),
+                ws.display(&to)
+            )),
             Err(e) => err_out(format!("move_file: {e}")),
         },
     }
@@ -602,15 +678,28 @@ mod tests {
         Workspace::open(&dir).unwrap()
     }
     fn call(id: &str, tool: &str, args: Value) -> ToolCall {
-        ToolCall { id: id.into(), tool: tool.into(), args }
+        ToolCall {
+            id: id.into(),
+            tool: tool.into(),
+            args,
+            security_nonce: None,
+        }
     }
 
     #[test]
     fn write_then_read_roundtrip() {
         let w = ws("rw");
-        let out = execute(&w, &call("1", "write_file", json!({"path":"a.txt","content":"hello"})), &crate::settings::Settings::default());
+        let out = execute(
+            &w,
+            &call("1", "write_file", json!({"path":"a.txt","content":"hello"})),
+            &crate::settings::Settings::default(),
+        );
         assert!(out.ok, "{}", out.output);
-        let out = execute(&w, &call("2", "read_file", json!({"path":"a.txt"})), &crate::settings::Settings::default());
+        let out = execute(
+            &w,
+            &call("2", "read_file", json!({"path":"a.txt"})),
+            &crate::settings::Settings::default(),
+        );
         assert_eq!(out.output.trim(), "hello");
         std::fs::remove_dir_all(w.root()).ok();
     }
@@ -619,10 +708,29 @@ mod tests {
     fn chunked_append_write() {
         let w = ws("append");
         let s = crate::settings::Settings::default();
-        execute(&w, &call("1", "write_file", json!({"path":"big.txt","content":"part1"})), &s);
-        let out = execute(&w, &call("2", "write_file", json!({"path":"big.txt","content":"part2","append":true})), &s);
+        execute(
+            &w,
+            &call(
+                "1",
+                "write_file",
+                json!({"path":"big.txt","content":"part1"}),
+            ),
+            &s,
+        );
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "write_file",
+                json!({"path":"big.txt","content":"part2","append":true}),
+            ),
+            &s,
+        );
         assert!(out.ok);
-        assert_eq!(std::fs::read_to_string(w.root().join("big.txt")).unwrap(), "part1part2");
+        assert_eq!(
+            std::fs::read_to_string(w.root().join("big.txt")).unwrap(),
+            "part1part2"
+        );
         std::fs::remove_dir_all(w.root()).ok();
     }
 
@@ -631,10 +739,26 @@ mod tests {
         let w = ws("edit");
         let s = crate::settings::Settings::default();
         std::fs::write(w.root().join("c.rs"), "fn a() {}\nfn a() {}\n").unwrap();
-        let out = execute(&w, &call("1", "edit_file", json!({"path":"c.rs","old_string":"fn a() {}","new_string":"fn b() {}"})), &s);
+        let out = execute(
+            &w,
+            &call(
+                "1",
+                "edit_file",
+                json!({"path":"c.rs","old_string":"fn a() {}","new_string":"fn b() {}"}),
+            ),
+            &s,
+        );
         assert!(!out.ok);
         assert!(out.output.contains("2 locations"));
-        let out = execute(&w, &call("2", "edit_file", json!({"path":"c.rs","old_string":"fn a() {}\nfn a() {}","new_string":"fn b() {}"})), &s);
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "edit_file",
+                json!({"path":"c.rs","old_string":"fn a() {}\nfn a() {}","new_string":"fn b() {}"}),
+            ),
+            &s,
+        );
         assert!(out.ok, "{}", out.output);
         assert!(out.diff.is_some());
         std::fs::remove_dir_all(w.root()).ok();
@@ -644,13 +768,25 @@ mod tests {
     fn read_file_caps_output() {
         let w = ws("cap");
         let mut big = String::new();
-        for i in 0..5000 { big.push_str(&format!("line {i}\n")); }
+        for i in 0..5000 {
+            big.push_str(&format!("line {i}\n"));
+        }
         std::fs::write(w.root().join("big.txt"), &big).unwrap();
-        let mut s = crate::settings::Settings::default();
-        s.result_cap_bytes = 1024;
+        let s = crate::settings::Settings {
+            result_cap_bytes: 1024,
+            ..Default::default()
+        };
         let out = execute(&w, &call("1", "read_file", json!({"path":"big.txt"})), &s);
         assert!(out.output.contains("truncated"));
-        let out = execute(&w, &call("2", "read_file", json!({"path":"big.txt","offset":4998,"limit":2})), &s);
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "read_file",
+                json!({"path":"big.txt","offset":4998,"limit":2}),
+            ),
+            &s,
+        );
         assert!(out.output.contains("line 4999"));
         std::fs::remove_dir_all(w.root()).ok();
     }
@@ -672,9 +808,17 @@ mod tests {
     fn tools_confined_to_workspace() {
         let w = ws("conf");
         let s = crate::settings::Settings::default();
-        let out = execute(&w, &call("1", "read_file", json!({"path":"../secrets.txt"})), &s);
+        let out = execute(
+            &w,
+            &call("1", "read_file", json!({"path":"../secrets.txt"})),
+            &s,
+        );
         assert!(!out.ok);
-        let out = execute(&w, &call("2", "delete_file", json!({"path":"/etc/passwd"})), &s);
+        let out = execute(
+            &w,
+            &call("2", "delete_file", json!({"path":"/etc/passwd"})),
+            &s,
+        );
         assert!(!out.ok);
         std::fs::remove_dir_all(w.root()).ok();
     }
@@ -693,12 +837,34 @@ mod tests {
     fn append_creates_parent_dirs() {
         let w = ws("append-new-dir");
         let s = crate::settings::Settings::default();
-        let out = execute(&w, &call("1", "write_file", json!({"path":"newdir/inner/log.txt","content":"first chunk","append":true})), &s);
+        let out = execute(
+            &w,
+            &call(
+                "1",
+                "write_file",
+                json!({"path":"newdir/inner/log.txt","content":"first chunk","append":true}),
+            ),
+            &s,
+        );
         assert!(out.ok, "{}", out.output);
-        assert_eq!(std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(), "first chunk");
-        let out2 = execute(&w, &call("2", "write_file", json!({"path":"newdir/inner/log.txt","content":"/second","append":true})), &s);
+        assert_eq!(
+            std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(),
+            "first chunk"
+        );
+        let out2 = execute(
+            &w,
+            &call(
+                "2",
+                "write_file",
+                json!({"path":"newdir/inner/log.txt","content":"/second","append":true}),
+            ),
+            &s,
+        );
         assert!(out2.ok, "{}", out2.output);
-        assert_eq!(std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(), "first chunk/second");
+        assert_eq!(
+            std::fs::read_to_string(w.root().join("newdir/inner/log.txt")).unwrap(),
+            "first chunk/second"
+        );
         std::fs::remove_dir_all(w.root()).ok();
     }
 
@@ -708,13 +874,50 @@ mod tests {
         let w = ws("crlf");
         let s = crate::settings::Settings::default();
         std::fs::write(w.root().join("c.txt"), b"first line\r\nsecond line\r\n").unwrap();
-        let out = execute(&w, &call("1", "edit_file", json!({"path":"c.txt","old_string":"second line","new_string":"SECOND line\nthird"})), &s);
+        let out = execute(
+            &w,
+            &call(
+                "1",
+                "edit_file",
+                json!({"path":"c.txt","old_string":"second line","new_string":"SECOND line\nthird"}),
+            ),
+            &s,
+        );
         assert!(out.ok, "{}", out.output);
         let bytes = std::fs::read(w.root().join("c.txt")).unwrap();
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("\r\n"), "CRLF endings must be preserved: {text:?}");
-        assert!(!text.contains("\n\r"), "only \r\n pairs expected, got: {text:?}");
+        assert!(
+            text.contains("\r\n"),
+            "CRLF endings must be preserved: {text:?}"
+        );
+        assert!(
+            !text.contains("\n\r"),
+            "only \r\n pairs expected, got: {text:?}"
+        );
         assert_eq!(text, "first line\r\nSECOND line\r\nthird\r\n");
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    #[test]
+    fn edit_file_omits_oversized_diff() {
+        let w = ws("large-edit-diff");
+        let s = crate::settings::Settings::default();
+        let mut content = vec![b'x'; MAX_DIFF_BYTES + 1];
+        content[..6].copy_from_slice(b"target");
+        std::fs::write(w.root().join("large.txt"), content).unwrap();
+        let out = execute(
+            &w,
+            &call(
+                "1",
+                "edit_file",
+                json!({"path":"large.txt","old_string":"target","new_string":"updated"}),
+            ),
+            &s,
+        );
+        assert!(out.ok, "{}", out.output);
+        let (_, old, new) = out.diff.unwrap();
+        assert_eq!(old, "[diff omitted: file exceeds 2 MB]");
+        assert_eq!(new, "[diff omitted: file exceeds 2 MB]");
         std::fs::remove_dir_all(w.root()).ok();
     }
 
@@ -759,9 +962,21 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&outside, w.root().join("out-link")).unwrap();
-            let out = execute(&w, &call("1", "read_file", json!({"path":"out-link/secret.txt"})), &s);
+            let out = execute(
+                &w,
+                &call("1", "read_file", json!({"path":"out-link/secret.txt"})),
+                &s,
+            );
             assert!(!out.ok, "symlink escape must fail: {}", out.output);
-            let out = execute(&w, &call("2", "write_file", json!({"path":"out-link/evil.txt","content":"x"})), &s);
+            let out = execute(
+                &w,
+                &call(
+                    "2",
+                    "write_file",
+                    json!({"path":"out-link/evil.txt","content":"x"}),
+                ),
+                &s,
+            );
             assert!(!out.ok, "write through symlink must fail: {}", out.output);
         }
         let _ = &s;

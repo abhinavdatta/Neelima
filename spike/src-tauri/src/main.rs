@@ -20,13 +20,19 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{atomic::{AtomicU64, Ordering}, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl, WindowBuilder};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl,
+    WindowBuilder,
+};
 
 const BRIDGE_JS: &str = include_str!("bridge.js");
 const HELLO_TIMEOUT: Duration = Duration::from_secs(25);
@@ -57,17 +63,27 @@ struct Opts {
 
 fn opts_from_args() -> Opts {
     let args: Vec<String> = std::env::args().collect();
-    let val = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
+    let val = |k: &str| {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
     Opts {
         selftest: args.iter().any(|a| a == "--selftest"),
         run: val("--run").and_then(|s| s.parse().ok()).unwrap_or(1),
-        report: val("--report").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("spike-report.md")),
+        report: val("--report")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("spike-report.md")),
         remote_url: val("--remote-url").unwrap_or_else(|| "https://example.com/".into()),
     }
 }
 
 #[tauri::command]
-fn lb_bridge(webview: Webview, state: tauri::State<'_, std::sync::Arc<SpikeState>>, msg: String) -> Result<(), String> {
+fn lb_bridge(
+    webview: Webview,
+    state: tauri::State<'_, std::sync::Arc<SpikeState>>,
+    msg: String,
+) -> Result<(), String> {
     let label = webview.label().to_string();
     if label != "provider" && label != "ui" && label != "provider-remote" {
         return Err(format!("unexpected caller '{label}'"));
@@ -82,7 +98,11 @@ fn lb_bridge(webview: Webview, state: tauri::State<'_, std::sync::Arc<SpikeState
             Ok(())
         }
         Some("rpc_result") => {
-            let id = v.get("id").and_then(Value::as_str).ok_or("missing id")?.to_string();
+            let id = v
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("missing id")?
+                .to_string();
             let raw = v.get("v").and_then(Value::as_str).unwrap_or("null");
             let val: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
             if let Some(tx) = state.pending.lock().unwrap().remove(&id) {
@@ -95,7 +115,12 @@ fn lb_bridge(webview: Webview, state: tauri::State<'_, std::sync::Arc<SpikeState
 }
 
 #[tauri::command]
-fn spike_action(webview: Webview, app: AppHandle, action: String, arg: String) -> Result<Value, String> {
+fn spike_action(
+    webview: Webview,
+    app: AppHandle,
+    action: String,
+    arg: String,
+) -> Result<Value, String> {
     let label = webview.label().to_string();
     match action.as_str() {
         // Intentionally not label-checked: T4 measures whether the ACL alone
@@ -104,8 +129,20 @@ fn spike_action(webview: Webview, app: AppHandle, action: String, arg: String) -
         "echo" => Ok(json!({"echo": arg, "caller": label})),
         "run_selftest" => {
             let o = opts_from_args();
-            let report = if arg.is_empty() { o.report } else { PathBuf::from(arg) };
-            tauri::async_runtime::spawn(run_selftest(app, Opts { selftest: true, run: o.run, report, remote_url: o.remote_url }));
+            let report = if arg.is_empty() {
+                o.report
+            } else {
+                PathBuf::from(arg)
+            };
+            tauri::async_runtime::spawn(run_selftest(
+                app,
+                Opts {
+                    selftest: true,
+                    run: o.run,
+                    report,
+                    remote_url: o.remote_url,
+                },
+            ));
             Ok(json!({"started": true}))
         }
         _ if label != "ui" => Err(format!("not allowed from webview '{label}'")),
@@ -113,11 +150,19 @@ fn spike_action(webview: Webview, app: AppHandle, action: String, arg: String) -
     }
 }
 
-async fn rpc(app: &AppHandle, label: &str, method: &str, arg_json: &str, state: &SpikeState) -> Result<Value, String> {
+async fn rpc(
+    app: &AppHandle,
+    label: &str,
+    method: &str,
+    arg_json: &str,
+    state: &SpikeState,
+) -> Result<Value, String> {
     let id = format!("r{}", SEQ.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.pending.lock().unwrap().insert(id.clone(), tx);
-    let wv = app.get_webview(label).ok_or_else(|| format!("webview '{label}' missing"))?;
+    let wv = app
+        .get_webview(label)
+        .ok_or_else(|| format!("webview '{label}' missing"))?;
     let js = format!(
         "window.__LB_SPIKE__ && window.__LB_SPIKE__.call({:?}, {:?}, {:?})",
         method, arg_json, id
@@ -153,13 +198,23 @@ impl Run {
         let t0 = Instant::now();
         let (ok, detail) = fut.await;
         let status = if ok { "PASS" } else { "FAIL" };
-        self.out.push(TestResult { name: name.into(), status: status.into(), detail, ms: t0.elapsed().as_millis() as u64 });
-        let _ = self.app.emit("spike-log", json!({"name": name, "status": status, "detail": ""}));
+        self.out.push(TestResult {
+            name: name.into(),
+            status: status.into(),
+            detail,
+            ms: t0.elapsed().as_millis() as u64,
+        });
+        let _ = self.app.emit(
+            "spike-log",
+            json!({"name": name, "status": status, "detail": ""}),
+        );
     }
 }
 
 fn app_data(app: &AppHandle) -> PathBuf {
-    app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 async fn run_selftest(app: AppHandle, opts: Opts) {
@@ -171,115 +226,166 @@ async fn run_selftest(app: AppHandle, opts: Opts) {
         watchdog_app.exit(2);
     });
 
-    let state: std::sync::Arc<SpikeState> = app.state::<std::sync::Arc<SpikeState>>().inner().clone();
-    let mut r = Run { app: app.clone(), out: Vec::new() };
+    let state: std::sync::Arc<SpikeState> =
+        app.state::<std::sync::Arc<SpikeState>>().inner().clone();
+    let mut r = Run {
+        app: app.clone(),
+        out: Vec::new(),
+    };
     let run_no = opts.run;
 
-    r.test("T1 one window hosts ui + provider webviews (multiwebview, unstable)", {
+    r.test(
+        "T1 one window hosts ui + provider webviews (multiwebview, unstable)",
+        {
             let app = app.clone();
             let state = state.clone();
             async move {
-        let ui = app.get_webview("ui").is_some();
-        let prov = app.get_webview("provider").is_some();
-        let n = app_webviews(&app);
-        (ui && prov && n >= 2, format!("ui present: {ui}, provider present: {prov}, webviews on 'main': {n}"))
+                let ui = app.get_webview("ui").is_some();
+                let prov = app.get_webview("provider").is_some();
+                let n = app_webviews(&app);
+                (
+                    ui && prov && n >= 2,
+                    format!("ui present: {ui}, provider present: {prov}, webviews on 'main': {n}"),
+                )
             }
-        }).await;
+        },
+    )
+    .await;
 
-    r.test("T2 init script + hello via narrow lb_bridge (ui webview)", {
+    r.test(
+        "T2 init script + hello via narrow lb_bridge (ui webview)",
+        {
             let app = app.clone();
             let state = state.clone();
             async move {
-        let h = wait_hello(&app, "ui", &state).await;
-        (h.get("has_ipc") == Some(&json!(true)), format!("{h}"))
+                let h = wait_hello(&app, "ui", &state).await;
+                (h.get("has_ipc") == Some(&json!(true)), format!("{h}"))
             }
-        }).await;
-    r.test("T2b init script + hello via narrow lb_bridge (provider webview)", {
+        },
+    )
+    .await;
+    r.test(
+        "T2b init script + hello via narrow lb_bridge (provider webview)",
+        {
             let app = app.clone();
             let state = state.clone();
             async move {
-        let h = wait_hello(&app, "provider", &state).await;
-        (h.get("has_ipc") == Some(&json!(true)), format!("{h}"))
+                let h = wait_hello(&app, "provider", &state).await;
+                (h.get("has_ipc") == Some(&json!(true)), format!("{h}"))
             }
-        }).await;
+        },
+    )
+    .await;
 
     r.test("T3 eval round-trip: ping provider page", {
-            let app = app.clone();
-            let state = state.clone();
-            async move {
-        match rpc(&app, "provider", "ping", "null", &state).await {
-            Ok(v) => {
-                let s = v["value"].as_str().unwrap_or("").to_string();
-                (s.starts_with("pong:"), s)
+        let app = app.clone();
+        let state = state.clone();
+        async move {
+            match rpc(&app, "provider", "ping", "null", &state).await {
+                Ok(v) => {
+                    let s = v["value"].as_str().unwrap_or("").to_string();
+                    (s.starts_with("pong:"), s)
+                }
+                Err(e) => (false, e),
             }
-            Err(e) => (false, e),
         }
-            }
-        }).await;
+    })
+    .await;
 
     r.test("T4a ACL blocks spike_action from the provider webview", {
+        let app = app.clone();
+        let state = state.clone();
+        async move {
+            match rpc(&app, "provider", "probe_forbidden", "null", &state).await {
+                Ok(v) => {
+                    let s = v["value"].as_str().unwrap_or("").to_string();
+                    let blocked = s.starts_with("blocked-as-expected");
+                    (blocked, s)
+                }
+                Err(e) => (false, format!("rpc failed: {e}")),
+            }
+        }
+    })
+    .await;
+    r.test(
+        "T4b ui webview IS allowed to call spike_action (positive control)",
+        {
             let app = app.clone();
             let state = state.clone();
             async move {
-        match rpc(&app, "provider", "probe_forbidden", "null", &state).await {
-            Ok(v) => {
-                let s = v["value"].as_str().unwrap_or("").to_string();
-                let blocked = s.starts_with("blocked-as-expected");
-                (blocked, s)
+                match rpc(&app, "ui", "probe_allowed", "null", &state).await {
+                    Ok(v) => {
+                        let s = v["value"].as_str().unwrap_or("").to_string();
+                        (s.starts_with("allowed:"), s)
+                    }
+                    Err(e) => (false, format!("rpc failed: {e}")),
+                }
             }
-            Err(e) => (false, format!("rpc failed: {e}")),
-        }
-            }
-        }).await;
-    r.test("T4b ui webview IS allowed to call spike_action (positive control)", {
-            let app = app.clone();
-            let state = state.clone();
-            async move {
-        match rpc(&app, "ui", "probe_allowed", "null", &state).await {
-            Ok(v) => {
-                let s = v["value"].as_str().unwrap_or("").to_string();
-                (s.starts_with("allowed:"), s)
-            }
-            Err(e) => (false, format!("rpc failed: {e}")),
-        }
-            }
-        }).await;
+        },
+    )
+    .await;
 
-    r.test("T5a DOM automation: controlled textarea + send + observer completion + extraction", {
+    r.test(
+        "T5a DOM automation: controlled textarea + send + observer completion + extraction",
+        {
             let app = app.clone();
             let state = state.clone();
             async move {
-        let text = format!("spike-ta-{run_no}");
-        let send_arg = json!({"strategy": "textarea", "text": text}).to_string();
-        let _ = rpc(&app, "provider", "demo_send", &send_arg, &state).await;
-        let _ = rpc(&app, "provider", "demo_wait_response", &json!({"quiet_ms": 700}).to_string(), &state).await;
-        match rpc(&app, "provider", "demo_get_last_assistant", "null", &state).await {
-            Ok(v) => {
-                let s = v["value"].as_str().unwrap_or("").to_string();
-                let ok = s.contains(&text) && s.contains("read_file") && s.contains("Copy");
-                (ok, if ok { format!("extracted: {}", s.chars().take(120).collect::<String>()) } else { s.chars().take(300).collect() })
+                let text = format!("spike-ta-{run_no}");
+                let send_arg = json!({"strategy": "textarea", "text": text}).to_string();
+                let _ = rpc(&app, "provider", "demo_send", &send_arg, &state).await;
+                let _ = rpc(
+                    &app,
+                    "provider",
+                    "demo_wait_response",
+                    &json!({"quiet_ms": 700}).to_string(),
+                    &state,
+                )
+                .await;
+                match rpc(&app, "provider", "demo_get_last_assistant", "null", &state).await {
+                    Ok(v) => {
+                        let s = v["value"].as_str().unwrap_or("").to_string();
+                        let ok = s.contains(&text) && s.contains("read_file") && s.contains("Copy");
+                        (
+                            ok,
+                            if ok {
+                                format!("extracted: {}", s.chars().take(120).collect::<String>())
+                            } else {
+                                s.chars().take(300).collect()
+                            },
+                        )
+                    }
+                    Err(e) => (false, e),
+                }
             }
-            Err(e) => (false, e),
-        }
-            }
-        }).await;
+        },
+    )
+    .await;
     r.test("T5b DOM automation: contenteditable path", {
-            let app = app.clone();
-            let state = state.clone();
-            async move {
-        let text = format!("spike-ce-{run_no}");
-        let send_arg = json!({"strategy": "contenteditable", "text": text}).to_string();
-        let _ = rpc(&app, "provider", "demo_send", &send_arg, &state).await;
-        let _ = rpc(&app, "provider", "demo_wait_response", &json!({"quiet_ms": 700}).to_string(), &state).await;
-        match rpc(&app, "provider", "demo_get_last_assistant", "null", &state).await {
-            Ok(v) => {
-                let s = v["value"].as_str().unwrap_or("").to_string();
-                (s.contains(&text), s.chars().take(200).collect())
+        let app = app.clone();
+        let state = state.clone();
+        async move {
+            let text = format!("spike-ce-{run_no}");
+            let send_arg = json!({"strategy": "contenteditable", "text": text}).to_string();
+            let _ = rpc(&app, "provider", "demo_send", &send_arg, &state).await;
+            let _ = rpc(
+                &app,
+                "provider",
+                "demo_wait_response",
+                &json!({"quiet_ms": 700}).to_string(),
+                &state,
+            )
+            .await;
+            match rpc(&app, "provider", "demo_get_last_assistant", "null", &state).await {
+                Ok(v) => {
+                    let s = v["value"].as_str().unwrap_or("").to_string();
+                    (s.contains(&text), s.chars().take(200).collect())
+                }
+                Err(e) => (false, e),
             }
-            Err(e) => (false, e),
         }
-            }
-        }).await;
+    })
+    .await;
 
     r.test("T6 per-profile data directory: storage marker persists across destroy/remount", {
             let app = app.clone();
@@ -306,72 +412,147 @@ async fn run_selftest(app: AppHandle, opts: Opts) {
         }).await;
 
     r.test("T7 webview lifecycle: hide/show/resize/move then ping", {
-            let app = app.clone();
-            let state = state.clone();
-            async move {
-        let wv = match app.get_webview("provider") { Some(w) => w, None => return (false, "provider webview missing".into()) };
-        let mut detail = String::new();
-        let mut ok = true;
-        if wv.hide().is_err() { ok = false; detail.push_str("hide failed; "); }
-        if wv.show().is_err() { ok = false; detail.push_str("show failed; "); }
-        if wv.set_size(LogicalSize::new(900.0, 320.0)).is_err() { ok = false; detail.push_str("set_size failed; "); }
-        if wv.set_position(LogicalPosition::new(20.0, 430.0)).is_err() { ok = false; detail.push_str("set_position failed; "); }
-        let ping = rpc(&app, "provider", "ping", "null", &state).await
-            .ok().and_then(|v| v["value"].as_str().map(String::from)).unwrap_or_default();
-        ok = ok && ping.starts_with("pong:");
-        detail.push_str(&format!("post-lifecycle ping: {ping}"));
-        (ok, detail)
+        let app = app.clone();
+        let state = state.clone();
+        async move {
+            let wv = match app.get_webview("provider") {
+                Some(w) => w,
+                None => return (false, "provider webview missing".into()),
+            };
+            let mut detail = String::new();
+            let mut ok = true;
+            if wv.hide().is_err() {
+                ok = false;
+                detail.push_str("hide failed; ");
             }
-        }).await;
-
-    r.test("T8 remote https page loads with init script + capability-gated IPC", {
-            let app = app.clone();
-            let state = state.clone();
-            async move {
-        let url = opts.remote_url.clone();
-        let parsed = match tauri::Url::parse(&url) { Ok(u) => u, Err(e) => return (false, format!("bad url: {e}")) };
-        let wv = WebviewBuilder::new("provider-remote", WebviewUrl::External(parsed))
-            .initialization_script(BRIDGE_JS)
-            .data_directory(app_data(&app).join("provider-profiles").join("remote-default"));
-        let win = match app.get_window("main") { Some(w) => w, None => return (false, "no main window".into()) };
-        if let Err(e) = win.add_child(wv, LogicalPosition::new(20.0, 430.0), LogicalSize::new(900.0, 320.0)) {
-            return (false, format!("add_child failed: {e}"));
+            if wv.show().is_err() {
+                ok = false;
+                detail.push_str("show failed; ");
+            }
+            if wv.set_size(LogicalSize::new(900.0, 320.0)).is_err() {
+                ok = false;
+                detail.push_str("set_size failed; ");
+            }
+            if wv.set_position(LogicalPosition::new(20.0, 430.0)).is_err() {
+                ok = false;
+                detail.push_str("set_position failed; ");
+            }
+            let ping = rpc(&app, "provider", "ping", "null", &state)
+                .await
+                .ok()
+                .and_then(|v| v["value"].as_str().map(String::from))
+                .unwrap_or_default();
+            ok = ok && ping.starts_with("pong:");
+            detail.push_str(&format!("post-lifecycle ping: {ping}"));
+            (ok, detail)
         }
-        let h = wait_hello(&app, "provider-remote", &state).await;
-        let hello_ok = h.get("has_ipc") == Some(&json!(true));
-        let ping = rpc(&app, "provider-remote", "ping", "null", &state).await
-            .ok().and_then(|v| v["value"].as_str().map(String::from)).unwrap_or_default();
-        if let Some(w) = app.get_webview("provider-remote") { let _ = w.close(); }
-        (hello_ok && ping.starts_with("pong:"), format!("hello: {h}; ping: {ping}"))
+    })
+    .await;
+
+    r.test(
+        "T8 remote https page loads with init script + capability-gated IPC",
+        {
+            let app = app.clone();
+            let state = state.clone();
+            async move {
+                let url = opts.remote_url.clone();
+                let parsed = match tauri::Url::parse(&url) {
+                    Ok(u) => u,
+                    Err(e) => return (false, format!("bad url: {e}")),
+                };
+                let wv = WebviewBuilder::new("provider-remote", WebviewUrl::External(parsed))
+                    .initialization_script(BRIDGE_JS)
+                    .data_directory(
+                        app_data(&app)
+                            .join("provider-profiles")
+                            .join("remote-default"),
+                    );
+                let win = match app.get_window("main") {
+                    Some(w) => w,
+                    None => return (false, "no main window".into()),
+                };
+                if let Err(e) = win.add_child(
+                    wv,
+                    LogicalPosition::new(20.0, 430.0),
+                    LogicalSize::new(900.0, 320.0),
+                ) {
+                    return (false, format!("add_child failed: {e}"));
+                }
+                let h = wait_hello(&app, "provider-remote", &state).await;
+                let hello_ok = h.get("has_ipc") == Some(&json!(true));
+                let ping = rpc(&app, "provider-remote", "ping", "null", &state)
+                    .await
+                    .ok()
+                    .and_then(|v| v["value"].as_str().map(String::from))
+                    .unwrap_or_default();
+                if let Some(w) = app.get_webview("provider-remote") {
+                    let _ = w.close();
+                }
+                (
+                    hello_ok && ping.starts_with("pong:"),
+                    format!("hello: {h}; ping: {ping}"),
+                )
             }
-        }).await;
+        },
+    )
+    .await;
 
     // ---- write report ----
     let mut md = String::new();
     md.push_str("# LocalBridge/Neelima Phase-0 spike self-test report\n\n");
     md.push_str(&format!("- date: {}\n", chrono_stamp()));
-    md.push_str(&format!("- OS: {} {}\n", std::env::consts::OS, std::env::consts::ARCH));
-    md.push_str(&format!("- tauri: {} (unstable multiwebview)\n", tauri::VERSION));
-    md.push_str(&format!("- run: {} (run 1 seeds the storage marker; run 2 verifies restart persistence)\n\n", run_no));
+    md.push_str(&format!(
+        "- OS: {} {}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    md.push_str(&format!(
+        "- tauri: {} (unstable multiwebview)\n",
+        tauri::VERSION
+    ));
+    md.push_str(&format!(
+        "- run: {} (run 1 seeds the storage marker; run 2 verifies restart persistence)\n\n",
+        run_no
+    ));
     md.push_str("| # | test | status | ms | detail |\n|---|------|--------|----|--------|\n");
     let mut all_pass = true;
     for (i, t) in r.out.iter().enumerate() {
-        if t.status != "PASS" { all_pass = false; }
-        md.push_str(&format!("| {} | {} | {} | {} | {} |\n", i + 1, t.name, t.status, t.ms, t.detail.replace('|', "\\|")));
+        if t.status != "PASS" {
+            all_pass = false;
+        }
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            i + 1,
+            t.name,
+            t.status,
+            t.ms,
+            t.detail.replace('|', "\\|")
+        ));
     }
-    md.push_str(&format!("\nOverall: **{}**\n", if all_pass { "ALL PASS" } else { "FAILURES PRESENT" }));
+    md.push_str(&format!(
+        "\nOverall: **{}**\n",
+        if all_pass {
+            "ALL PASS"
+        } else {
+            "FAILURES PRESENT"
+        }
+    ));
     let _ = fs::write(&opts.report, &md);
     println!("{}", md);
     app.exit(if all_pass { 0 } else { 1 });
 }
 
 fn app_webviews(app: &AppHandle) -> usize {
-    app.get_window("main").map(|w| w.webviews().len()).unwrap_or(0)
+    app.get_window("main")
+        .map(|w| w.webviews().len())
+        .unwrap_or(0)
 }
 
 async fn wait_gone(app: &AppHandle, label: &str) {
     for _ in 0..50 {
-        if app.get_webview(label).is_none() { return; }
+        if app.get_webview(label).is_none() {
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -382,13 +563,20 @@ async fn remount_provider(app: &AppHandle) -> Result<(), String> {
     let wv = WebviewBuilder::new("provider", WebviewUrl::App("demo-chat.html".into()))
         .initialization_script(BRIDGE_JS)
         .data_directory(dir);
-    win.add_child(wv, LogicalPosition::new(20.0, 430.0), LogicalSize::new(900.0, 320.0))
-        .map_err(|e| e.to_string())?;
+    win.add_child(
+        wv,
+        LogicalPosition::new(20.0, 430.0),
+        LogicalSize::new(900.0, 320.0),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 fn chrono_stamp() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     format!("unix timestamp {}", d)
 }
 
@@ -407,7 +595,8 @@ fn main() {
             fs::create_dir_all(&data_dir).ok();
 
             window.add_child(
-                WebviewBuilder::new("ui", WebviewUrl::App("index.html".into())).initialization_script(BRIDGE_JS),
+                WebviewBuilder::new("ui", WebviewUrl::App("index.html".into()))
+                    .initialization_script(BRIDGE_JS),
                 LogicalPosition::new(0.0, 0.0),
                 LogicalSize::new(1000.0, 400.0),
             )?;
@@ -421,7 +610,12 @@ fn main() {
 
             if opts.selftest {
                 let app2 = handle.clone();
-                let o2 = Opts { selftest: true, run: opts.run, report: opts.report.clone(), remote_url: opts.remote_url.clone() };
+                let o2 = Opts {
+                    selftest: true,
+                    run: opts.run,
+                    report: opts.report.clone(),
+                    remote_url: opts.remote_url.clone(),
+                };
                 tauri::async_runtime::spawn(async move { run_selftest(app2, o2).await });
             }
             Ok(())

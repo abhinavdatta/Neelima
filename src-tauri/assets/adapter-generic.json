@@ -8,8 +8,8 @@
     "stop_button": null,
     "messages": "main",
     "new_chat": null,
-    "logged_in": null,
-    "logged_out": null
+    "logged_in": "textarea",
+    "logged_out": "a[href*=\"login\"], button[aria-label*=\"Sign in\"], [data-testid*=\"login\"]"
   },
   "input": { "kind": "textarea", "max_chars": 8000 },
   "quiet_ms": 2000,

@@ -2,7 +2,7 @@
 //! to drive a provider's web chat UI. DOM selectors break often, so adapters are
 //! user-editable data, not code — and the Adapter Inspector can record them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -104,7 +104,7 @@ pub struct AdaptersState {
     pub dir: Mutex<PathBuf>,
 }
 
-pub fn adapters_dir(config_dir: &PathBuf) -> PathBuf {
+pub fn adapters_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("adapters")
 }
 
@@ -150,13 +150,22 @@ pub fn load_all(dir: &PathBuf) -> Result<Vec<Adapter>, String> {
         if path.extension().map(|e| e != "json").unwrap_or(true) {
             continue;
         }
-        match std::fs::read(&path).map_err(|e| e.to_string())
-            .and_then(|b| serde_json::from_slice::<Adapter>(&b).map_err(|e| format!("{}: {e}", path.display())))
-        {
+        match std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| {
+                serde_json::from_slice::<Adapter>(&b)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            }) {
             Ok(a) => list.push(a),
             Err(e) => {
                 // Don't kill the whole app over one bad adapter file.
-                eprintln!("[adapters] skipping invalid file: {e}");
+                if let Err(log_error) =
+                    crate::app_log::write("adapters", &format!("skipping invalid file: {e}"))
+                {
+                    eprintln!(
+                        "[adapters] skipping invalid file: {e}; file log failed: {log_error}"
+                    );
+                }
             }
         }
     }
@@ -173,7 +182,7 @@ fn ensure_file(path: &PathBuf, contents: &str, previous_defaults: &[&str]) -> Re
     // anything the user has customized.
     if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim();
-        if previous_defaults.iter().any(|d| *d == trimmed) {
+        if previous_defaults.contains(&trimmed) {
             std::fs::write(path, contents).map_err(|e| e.to_string())?;
         }
     }
@@ -182,11 +191,8 @@ fn ensure_file(path: &PathBuf, contents: &str, previous_defaults: &[&str]) -> Re
 
 /// Spawn a hot-reload watcher for the adapters dir (a single tiny directory —
 /// workspace watching, by contrast, only ever runs while a task is executing).
-pub fn spawn_watcher(
-    dir: PathBuf,
-    state: tauri::AppHandle,
-) {
-    use notify::{Watcher, RecursiveMode};
+pub fn spawn_watcher(dir: PathBuf, state: tauri::AppHandle) {
+    use notify::{RecursiveMode, Watcher};
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
@@ -194,20 +200,14 @@ pub fn spawn_watcher(
     };
     if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
         return;
-    }
-    // Hold the watcher alive for the process lifetime.
+    } // Hold the watcher alive for the process lifetime.
     std::thread::spawn(move || {
         let _watcher = watcher;
-        loop {
-            match rx.recv() {
-                Ok(_) => {
-                    if let Ok(list) = load_all(&dir) {
-                        let st: tauri::State<AdaptersState> = state.state();
-                        *st.list.lock().unwrap() = list;
-                        let _ = state.emit("evt", serde_json::json!({"kind": "adapters-reloaded"}));
-                    }
-                }
-                Err(_) => break,
+        while rx.recv().is_ok() {
+            if let Ok(list) = load_all(&dir) {
+                let st: tauri::State<AdaptersState> = state.state();
+                *st.list.lock().unwrap() = list;
+                let _ = state.emit("evt", serde_json::json!({"kind": "adapters-reloaded"}));
             }
         }
     });
@@ -219,17 +219,22 @@ mod tests {
 
     #[test]
     fn migrates_uncustomized_chatgpt_copy() {
-        let dir = std::env::temp_dir().join(format!("neelima-adapters-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("neelima-adapters-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A user file that is exactly the OLD bundled default.
         std::fs::write(dir.join("chatgpt.json"), CHATGPT_LEGACY).unwrap();
         // A user-customized file must never be touched.
-        let custom = r#"{"id":"chatgpt-custom","name":"My ChatGPT","url":"https://chatgpt.com/custom"}"#;
+        let custom =
+            r#"{"id":"chatgpt-custom","name":"My ChatGPT","url":"https://chatgpt.com/custom"}"#;
         std::fs::write(dir.join("custom.json"), custom).unwrap();
         let list = load_all(&dir).unwrap();
         let migrated = std::fs::read_to_string(dir.join("chatgpt.json")).unwrap();
-        assert!(migrated.contains("logged_out"), "legacy copy must be migrated");
+        assert!(
+            migrated.contains("logged_out"),
+            "legacy copy must be migrated"
+        );
         let custom_read = std::fs::read_to_string(dir.join("custom.json")).unwrap();
         assert_eq!(custom_read, custom, "customized copy must be preserved");
         let cg = list.iter().find(|a| a.id == "chatgpt").unwrap();
@@ -254,7 +259,10 @@ mod tests {
     fn parses_demo_adapter() {
         let a: Adapter = serde_json::from_str(include_str!("../assets/adapter-demo.json")).unwrap();
         assert_eq!(a.id, "demo");
-        assert!(a.selectors.input.contains("#ta"), "input selector must target the demo textarea");
+        assert!(
+            a.selectors.input.contains("#ta"),
+            "input selector must target the demo textarea"
+        );
         assert_eq!(a.selectors.send_button, "#send");
         // B1: every bundled adapter carries a domain guard.
         for f in [
@@ -265,17 +273,57 @@ mod tests {
             include_str!("../assets/adapter-generic.json"),
         ] {
             let a: Adapter = serde_json::from_str(f).unwrap();
-            assert!(a.allowed_domain.is_empty() || !a.allowed_domain.contains("/"), "domain field must be a bare host");
+            assert!(
+                a.allowed_domain.is_empty() || !a.allowed_domain.contains("/"),
+                "domain field must be a bare host"
+            );
         }
-        let chatgpt: Adapter = serde_json::from_str(include_str!("../assets/adapter-chatgpt.json")).unwrap();
+        let chatgpt: Adapter =
+            serde_json::from_str(include_str!("../assets/adapter-chatgpt.json")).unwrap();
         assert_eq!(chatgpt.allowed_domain, "chatgpt.com");
-        assert!(chatgpt.auth_domains.contains(&"auth.openai.com".to_string()));
-        assert!(chatgpt.login_url_patterns.iter().any(|p| p.contains("/auth/login")));
+        assert!(chatgpt
+            .auth_domains
+            .contains(&"auth.openai.com".to_string()));
+        assert!(chatgpt
+            .login_url_patterns
+            .iter()
+            .any(|p| p.contains("/auth/login")));
+    }
+
+    #[test]
+    fn builtin_adapter_login_and_domain_rules_are_configured() {
+        for json in [
+            include_str!("../assets/adapter-chatgpt.json"),
+            include_str!("../assets/adapter-claude.json"),
+            include_str!("../assets/adapter-gemini.json"),
+            include_str!("../assets/adapter-generic.json"),
+        ] {
+            let adapter: Adapter = serde_json::from_str(json).unwrap();
+            assert!(!adapter.allowed_domain.is_empty(), "{}", adapter.id);
+            assert!(!adapter.login_url_patterns.is_empty(), "{}", adapter.id);
+            assert!(
+                adapter.selectors.logged_out.is_some(),
+                "{} needs a logged-out marker selector",
+                adapter.id
+            );
+        }
+        let chatgpt: Adapter =
+            serde_json::from_str(include_str!("../assets/adapter-chatgpt.json")).unwrap();
+        assert!(
+            chatgpt
+                .selectors
+                .logged_in
+                .as_deref()
+                .unwrap()
+                .contains("prompt"),
+            "ChatGPT requires the composer selector to detect the logged-in state"
+        );
     }
 
     #[test]
     fn tolerant_of_missing_optional_fields() {
-        let a: Adapter = serde_json::from_str(r#"{"id":"x","name":"X","url":"https://a.example"}"#).unwrap();
+        let a: Adapter =
+            serde_json::from_str(r#"{"id":"x","name":"X","url":"https://a.example"}"#).unwrap();
         assert_eq!(a.quiet_ms, 2000);
         assert_eq!(a.input.kind, InputKind::Textarea);
     }

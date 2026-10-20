@@ -5,11 +5,12 @@
 //! rpc_result. It can NEVER read or write files — all file/tool work flows from
 //! the agent loop (Rust) to the page via eval, never the other way around.
 //!
-//! Security: every long-running RPC id is bound to a per-mount random nonce.
-//! A foreign page (a redirect inside the provider webview) cannot forge
-//! rpc_result or assistant_message because it does not know the nonce.
+//! Security: every bridge message is bound to a per-mount random nonce and a
+//! host allowlist. RPC results and assistant messages are restricted to the
+//! provider's primary origin; auth hosts may only report load/login state.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -22,7 +23,13 @@ pub const MAX_BRIDGE_MSG: usize = 512 * 1024;
 /// Only these message types may arrive from the provider page. Anything else
 /// is rejected — file operations from the page were removed (CC-B2/A2): the
 /// page is untrusted https content and must never touch the workspace.
-pub const ALLOWED_TYPES: &[&str] = &["hello", "ready", "login_state", "assistant_message", "rpc_result"];
+pub const ALLOWED_TYPES: &[&str] = &[
+    "hello",
+    "ready",
+    "login_state",
+    "assistant_message",
+    "rpc_result",
+];
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -33,8 +40,19 @@ pub struct BridgeHub {
     /// Per-mount nonce, set by webprov on every mount. Re-randomized so a page
     /// captured before a remount cannot answer afterwards.
     pub nonce: Mutex<String>,
+    /// Current mount's origin policy; cleared on unmount.
+    origin: Mutex<Option<BridgeOrigin>>,
     /// Bounded ring of recent bridge events for diagnostics (bug reports).
     pub log: Mutex<Vec<String>>,
+    pub log_path: Mutex<Option<PathBuf>>,
+    pub log_write_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone)]
+struct BridgeOrigin {
+    adapter_url: String,
+    primary_host: String,
+    auth_domains: Vec<String>,
 }
 
 impl BridgeHub {
@@ -50,13 +68,70 @@ impl BridgeHub {
         self.nonce.lock().unwrap().clone()
     }
 
+    pub fn set_origin(&self, adapter_url: &str, primary_host: &str, auth_domains: &[String]) {
+        *self.origin.lock().unwrap() = Some(BridgeOrigin {
+            adapter_url: adapter_url.to_string(),
+            primary_host: primary_host.to_string(),
+            auth_domains: auth_domains.to_vec(),
+        });
+    }
+
+    pub fn clear_origin(&self) {
+        *self.origin.lock().unwrap() = None;
+    }
+
+    fn origin_allowed(&self, url: &tauri::Url, primary_only: bool) -> bool {
+        self.origin
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|origin| {
+                crate::webprov::provider_url_allowed(
+                    url,
+                    &origin.adapter_url,
+                    &origin.primary_host,
+                    &origin.auth_domains,
+                    primary_only,
+                )
+            })
+            .unwrap_or(false)
+    }
+
     fn note(&self, line: String) {
-        let mut log = self.log.lock().unwrap();
-        log.push(format!("[{}] {}", crate::history::now_ms(), line));
-        if log.len() > 200 {
-            let over = log.len() - 200;
-            log.drain(..over);
+        {
+            let mut log = self.log.lock().unwrap();
+            log.push(format!("[{}] {}", crate::history::now_ms(), line));
+            if log.len() > 200 {
+                let over = log.len() - 200;
+                log.drain(..over);
+            }
         }
+        self.persist_log();
+    }
+
+    pub fn set_log_path(&self, path: PathBuf) {
+        *self.log_path.lock().unwrap() = Some(path);
+        self.persist_log();
+    }
+
+    fn persist_log(&self) {
+        let path = self.log_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let contents = self.log.lock().unwrap().join("\n");
+        let result = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or_else(|| Ok(()))
+            .and_then(|()| std::fs::write(path, contents));
+        *self.log_write_error.lock().unwrap() = result.err().map(|e| e.to_string());
+    }
+
+    pub fn log_path(&self) -> Option<PathBuf> {
+        self.log_path.lock().unwrap().clone()
+    }
+
+    pub fn log_write_error(&self) -> Option<String> {
+        self.log_write_error.lock().unwrap().clone()
     }
 
     pub fn events(&self) -> Vec<String> {
@@ -69,7 +144,10 @@ impl BridgeHub {
         let id = format!("r{}", SEQ.fetch_add(1, Ordering::Relaxed));
         let nonce = self.current_nonce();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id.clone(), (nonce.clone(), tx));
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (nonce.clone(), tx));
         self.note(format!("rpc begin {id}"));
         (id, nonce, rx)
     }
@@ -79,7 +157,11 @@ impl BridgeHub {
         let matched = {
             let mut p = self.pending.lock().unwrap();
             let keep = p.get(id).map(|(n, _)| n == nonce).unwrap_or(false);
-            if keep { p.remove(id).map(|(_, tx)| tx) } else { None }
+            if keep {
+                p.remove(id).map(|(_, tx)| tx)
+            } else {
+                None
+            }
         };
         if let Some(tx) = matched {
             self.note(format!("rpc resolve {id}"));
@@ -88,6 +170,12 @@ impl BridgeHub {
         } else {
             self.note(format!("rejected rpc_result id={id} (bad/missing nonce)"));
             false
+        }
+    }
+
+    pub fn cancel(&self, id: &str) {
+        if self.pending.lock().unwrap().remove(id).is_some() {
+            self.note(format!("rpc cancel {id}"));
         }
     }
 
@@ -137,19 +225,65 @@ pub async fn lb_bridge(
     if label != "provider" {
         return Err(format!("lb_bridge: unexpected caller webview '{label}'"));
     }
+    if hub.log_path().is_none() {
+        if let Ok(path) = webview
+            .app_handle()
+            .path()
+            .app_data_dir()
+            .map(|dir| dir.join("provider-bridge.log"))
+        {
+            hub.set_log_path(path);
+        }
+    }
     if msg.len() > MAX_BRIDGE_MSG {
         // Note but don't fail hard on size — reject politely.
         hub.note(format!("oversized message: {} bytes", msg.len()));
-        return Err(format!("lb_bridge: message exceeds {} bytes", MAX_BRIDGE_MSG));
+        return Err(format!(
+            "lb_bridge: message exceeds {} bytes",
+            MAX_BRIDGE_MSG
+        ));
     }
-    let parsed: BridgeMsg = serde_json::from_str(&msg).map_err(|e| format!("lb_bridge: bad message: {e}"))?;
+    let parsed: BridgeMsg =
+        serde_json::from_str(&msg).map_err(|e| format!("lb_bridge: bad message: {e}"))?;
     if !ALLOWED_TYPES.contains(&parsed.t.as_str()) {
         hub.note(format!("rejected message type '{}'", parsed.t));
-        return Err(format!("lb_bridge: message type '{}' is not allowed", parsed.t));
+        return Err(format!(
+            "lb_bridge: message type '{}' is not allowed",
+            parsed.t
+        ));
+    }
+    let current_url = webview
+        .url()
+        .map_err(|e| format!("lb_bridge: could not read caller URL: {e}"))?;
+    let primary_only = matches!(parsed.t.as_str(), "assistant_message" | "rpc_result");
+    if !hub.origin_allowed(&current_url, primary_only) {
+        hub.note(format!(
+            "rejected {} from disallowed origin {}",
+            parsed.t,
+            safe_url_for_log(current_url.as_str())
+        ));
+        return Err(format!(
+            "lb_bridge: message '{}' rejected from disallowed origin",
+            parsed.t
+        ));
+    }
+    let expected_nonce = hub.current_nonce();
+    if !nonce_matches(&expected_nonce, parsed.nonce.as_deref()) {
+        hub.note(format!(
+            "rejected {} with missing/stale mount nonce",
+            parsed.t
+        ));
+        return Err(format!(
+            "lb_bridge: message '{}' rejected (bad or missing nonce)",
+            parsed.t
+        ));
     }
     match parsed.t.as_str() {
         "hello" => {
-            hub.note(format!("hello from {}", parsed.url.clone().unwrap_or_default()));
+            hub.note(format!(
+                "hello from {}",
+                safe_url_for_log(parsed.url.as_deref().unwrap_or_default())
+            ));
             Ok(Value::Null)
         }
         // A2: the page may never read or write files — no file_op here.
@@ -162,8 +296,17 @@ pub async fn lb_bridge(
             let st = parsed.state.clone().unwrap_or_else(|| "unknown".into());
             let url = parsed.url.clone().unwrap_or_default();
             let reason = parsed.reason.clone().unwrap_or_default();
-            hub.note(format!("login_state {st} url={url} reason={reason}"));
-            crate::webprov::on_login_state(&webview, &webview.app_handle().clone(), st, url, reason);
+            hub.note(format!(
+                "login_state {st} url={} reason={reason}",
+                safe_url_for_log(&url)
+            ));
+            crate::webprov::on_login_state(
+                &webview,
+                &webview.app_handle().clone(),
+                st,
+                url,
+                reason,
+            );
             Ok(Value::Null)
         }
         "assistant_message" => {
@@ -174,7 +317,9 @@ pub async fn lb_bridge(
             // inject fake assistant replies into a running task.
             let nonce = parsed.nonce.clone().unwrap_or_default();
             if nonce.is_empty() || nonce != hub.current_nonce() {
-                hub.note(format!("rejected assistant_message seq={seq} (bad/missing nonce)"));
+                hub.note(format!(
+                    "rejected assistant_message seq={seq} (bad/missing nonce)"
+                ));
                 return Err("lb_bridge: assistant_message rejected (bad or missing nonce)".into());
             }
             hub.note(format!("assistant_message seq={seq} len={}", text.len()));
@@ -182,7 +327,10 @@ pub async fn lb_bridge(
             Ok(Value::Null)
         }
         "rpc_result" => {
-            let id = parsed.id.clone().ok_or("lb_bridge: rpc_result missing id")?;
+            let id = parsed
+                .id
+                .clone()
+                .ok_or("lb_bridge: rpc_result missing id")?;
             let nonce = parsed.nonce.clone().unwrap_or_default();
             let raw = parsed.v.as_deref().unwrap_or("null");
             let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
@@ -194,6 +342,22 @@ pub async fn lb_bridge(
         // ALLOWED_TYPES check above makes this arm unreachable; keep for safety.
         other => Err(format!("lb_bridge: unknown message type '{other}'")),
     }
+}
+
+fn safe_url_for_log(value: &str) -> String {
+    tauri::Url::parse(value)
+        .map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid-url>".into())
+}
+
+fn nonce_matches(expected: &str, provided: Option<&str>) -> bool {
+    !expected.is_empty() && provided == Some(expected)
 }
 
 /// Startup self-check: a static assertion that every `State<T>` requested by an
@@ -219,6 +383,36 @@ mod tests {
     use super::*;
     use crate::run_checks;
 
+    #[test]
+    fn bridge_origin_is_limited_to_mount_hosts() {
+        let hub = BridgeHub::default();
+        hub.set_origin(
+            "https://chatgpt.com",
+            "chatgpt.com",
+            &["accounts.google.com".into()],
+        );
+        assert!(hub.origin_allowed(&tauri::Url::parse("https://chatgpt.com/c/1").unwrap(), true));
+        assert!(hub.origin_allowed(
+            &tauri::Url::parse("https://accounts.google.com/login").unwrap(),
+            false
+        ));
+        assert!(!hub.origin_allowed(
+            &tauri::Url::parse("https://accounts.google.com/login").unwrap(),
+            true
+        ));
+        assert!(!hub.origin_allowed(&tauri::Url::parse("https://evil.example/").unwrap(), false));
+        hub.clear_origin();
+        assert!(!hub.origin_allowed(&tauri::Url::parse("https://chatgpt.com/").unwrap(), false));
+    }
+
+    #[test]
+    fn every_bridge_message_requires_the_current_mount_nonce() {
+        assert!(nonce_matches("mount-1", Some("mount-1")));
+        assert!(!nonce_matches("mount-1", Some("mount-2")));
+        assert!(!nonce_matches("mount-1", None));
+        assert!(!nonce_matches("", Some("")));
+    }
+
     /// A1: the bridge command's State type must match what lib.rs manages.
     /// Tauri rejects every call when a command's `State<T>` is not managed, so
     /// every RPC from the page would time out. This is the regression test that
@@ -237,14 +431,33 @@ mod tests {
         assert_eq!(n2.len(), 33, "n + 32 hex chars");
         // resolve with wrong nonce must NOT resolve
         let (_, nonce, _rx) = hub.begin();
-        assert!(!hub.resolve("r1", "forged", Value::Null), "foreign page without nonce cannot resolve");
-        assert!(hub.resolve("r1", &nonce, Value::Null), "correct nonce resolves");
+        assert!(
+            !hub.resolve("r1", "forged", Value::Null),
+            "foreign page without nonce cannot resolve"
+        );
+        assert!(
+            hub.resolve("r1", &nonce, Value::Null),
+            "correct nonce resolves"
+        );
         // Allowed types list contains exactly the page-safe set.
-        assert_eq!(ALLOWED_TYPES, &["hello", "ready", "login_state", "assistant_message", "rpc_result"]);
+        assert_eq!(
+            ALLOWED_TYPES,
+            &[
+                "hello",
+                "ready",
+                "login_state",
+                "assistant_message",
+                "rpc_result"
+            ]
+        );
         // Events ring is bounded.
         for i in 0..300 {
             hub.note(format!("line {i}"));
         }
         assert!(hub.events().len() <= 200);
+        assert_eq!(
+            safe_url_for_log("https://user:pass@example.com/path?token=secret#fragment"),
+            "https://example.com/path"
+        );
     }
 }

@@ -42,7 +42,14 @@ pub async fn run_command_streaming(
     let cwd = match cwd_rel {
         Some(rel) => match ws.resolve(rel) {
             Ok(p) => p,
-            Err(e) => return RunOutcome { ok: false, output: format!("run_command: {e}"), timed_out: false, killed: false },
+            Err(e) => {
+                return RunOutcome {
+                    ok: false,
+                    output: format!("run_command: {e}"),
+                    timed_out: false,
+                    killed: false,
+                }
+            }
         },
         None => ws.root().to_path_buf(),
     };
@@ -66,8 +73,11 @@ pub async fn run_command_streaming(
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.as_std_mut().pre_exec(|| {
-                libc::setsid();
-                Ok(())
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
             });
         }
     }
@@ -80,12 +90,19 @@ pub async fn run_command_streaming(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return RunOutcome { ok: false, output: format!("run_command: failed to spawn: {e}"), timed_out: false, killed: false },
+        Err(e) => {
+            return RunOutcome {
+                ok: false,
+                output: format!("run_command: failed to spawn: {e}"),
+                timed_out: false,
+                killed: false,
+            }
+        }
     };
 
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let tx_out = chunk_tx.clone();
     let tx_err = chunk_tx;
     tokio::spawn(async move {
@@ -93,7 +110,11 @@ pub async fn run_command_streaming(
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { if tx_out.send(buf[..n].to_vec()).is_err() { break; } }
+                Ok(n) => {
+                    if tx_out.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -102,7 +123,11 @@ pub async fn run_command_streaming(
         loop {
             match stderr.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { if tx_err.send(buf[..n].to_vec()).is_err() { break; } }
+                Ok(n) => {
+                    if tx_err.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -174,22 +199,39 @@ pub async fn run_command_streaming(
     }
     if retained.len() > cap {
         let cut = retained.len() - cap;
-        let boundary = (cut..retained.len()).find(|i| retained.is_char_boundary(*i)).unwrap_or(cut);
+        let boundary = (cut..retained.len())
+            .find(|i| retained.is_char_boundary(*i))
+            .unwrap_or(cut);
         retained.drain(..boundary);
         truncated = true;
     }
     let mut out = String::new();
-    if truncated { out.push_str("[earlier output truncated; showing the tail]\n"); }
+    if truncated {
+        out.push_str("[earlier output truncated; showing the tail]\n");
+    }
     out.push_str(retained.trim_end());
-    if timed_out { out.push_str(&format!("\n[timed out after {timeout_secs}s — process killed]")); }
-    if killed { out.push_str("\n[cancelled by user — process tree killed]"); }
-    RunOutcome { ok: !killed && !timed_out, output: out, timed_out, killed }
+    if timed_out {
+        out.push_str(&format!(
+            "\n[timed out after {timeout_secs}s — process killed]"
+        ));
+    }
+    if killed {
+        out.push_str("\n[cancelled by user — process tree killed]");
+    }
+    RunOutcome {
+        ok: !killed && !timed_out,
+        output: out,
+        timed_out,
+        killed,
+    }
 }
 
 /// Kill the child process tree. On Windows `taskkill /T /F`; on Unix kill the
 /// process group (+ pid) first, then the bare pid as a fallback.
 async fn kill_tree(pid: &u32) {
-    if *pid == 0 { return; }
+    if *pid == 0 {
+        return;
+    }
     #[cfg(windows)]
     {
         let _ = hidden_tokio("taskkill")
@@ -200,14 +242,10 @@ async fn kill_tree(pid: &u32) {
     #[cfg(unix)]
     {
         // Negative pid targets the whole process group (setsid made pgid==pid).
-        let _ = hidden_tokio("kill")
-            .args(["-9", &format!("-{pid}")])
-            .output()
-            .await;
-        let _ = hidden_tokio("kill")
-            .args(["-9", &pid.to_string()])
-            .output()
-            .await;
+        let result = unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
+        if result != 0 {
+            let _ = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
     }
 }
 
@@ -215,4 +253,37 @@ async fn kill_tree(pid: &u32) {
 #[cfg(unix)]
 pub fn is_process_group_leader_note() -> &'static str {
     "children run in setsid'd groups; kill -9 -PID takes the whole tree"
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_kills_background_processes_too() {
+        let root = std::env::temp_dir().join(format!(
+            "neelima-exec-kill-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let marker = root.join("child-finished.txt");
+        let escaped_marker = marker.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("(sleep 1; printf done > '{escaped_marker}') & wait");
+        let cancel = Arc::new(Notify::new());
+        let cancel_task = cancel.clone();
+        let run = tokio::spawn(async move {
+            run_command_streaming(&ws, None, &command, 10, 1024, cancel_task, |_| {}).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.notify_one();
+        let outcome = run.await.unwrap();
+        assert!(outcome.killed);
+        assert!(outcome.output.contains("process tree killed"));
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "background child survived cancellation");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

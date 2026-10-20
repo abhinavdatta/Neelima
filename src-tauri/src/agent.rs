@@ -94,7 +94,11 @@ impl ActiveAgent {
     }
     pub fn clear(&self, task_id: &str) {
         let mut slot = self.0.lock().unwrap();
-        if slot.as_ref().map(|s| s.task_id.lock().unwrap().as_deref() == Some(task_id)).unwrap_or(false) {
+        if slot
+            .as_ref()
+            .map(|s| s.task_id.lock().unwrap().as_deref() == Some(task_id))
+            .unwrap_or(false)
+        {
             *slot = None;
         }
     }
@@ -140,6 +144,7 @@ const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "delete_file", "move_f
 pub async fn run(mut input: AgentInput) {
     let app = input.app.clone();
     let shared = input.shared.clone();
+    let _provider_task = ProviderTaskGuard::start(app.clone(), input.webview_state.clone());
 
     let stop = Arc::new(Notify::new());
     let halted = Arc::new(AtomicBool::new(false));
@@ -175,7 +180,12 @@ pub async fn run(mut input: AgentInput) {
     ) {
         Ok(m) => m,
         Err(e) => {
-            finish_error(&shared, &app, &input.task_id, &format!("history error: {e}"));
+            finish_error(
+                &shared,
+                &app,
+                &input.task_id,
+                &format!("history error: {e}"),
+            );
             return;
         }
     };
@@ -186,23 +196,44 @@ pub async fn run(mut input: AgentInput) {
         let mut e = e;
         e.id = history.next_entry_id();
         let _ = history.append(&task_id, &e);
-        emit(&app, AgentEvent { kind: "transcript".into(), state: None, task_id: Some(task_id.clone()), entry: Some(e.clone()), pending_calls: None, text: None });
+        emit(
+            &app,
+            AgentEvent {
+                kind: "transcript".into(),
+                state: None,
+                task_id: Some(task_id.clone()),
+                entry: Some(e.clone()),
+                pending_calls: None,
+                text: None,
+            },
+        );
         e
     };
 
     if let Ok(cp) = checkpoints::snapshot(&input.ws, "task baseline") {
-        push(entry("checkpoint", format!("checkpoint {} ({})", cp.id, cp.label)));
+        push(entry(
+            "checkpoint",
+            format!("checkpoint {} ({})", cp.id, cp.label),
+        ));
     }
 
     if !input.prior_entries.is_empty() {
         let mut summary = String::from("You are continuing a previous task in this workspace. Prior transcript (compressed):\n");
         for e in input.prior_entries.iter().rev().take(30).rev() {
-            summary.push_str(&format!("[{}] {}\n", e.kind, protocol::truncate(&e.text, 400)));
+            summary.push_str(&format!(
+                "[{}] {}\n",
+                e.kind,
+                protocol::truncate(&e.text, 400)
+            ));
         }
         push(entry("system", summary));
     }
 
-    let tree = tree_summary(&input.ws, 2, 400);
+    let tree = format!(
+        "Workspace root: {}\n{}",
+        input.ws.root().display(),
+        tree_summary(&input.ws, 2, 400)
+    );
     // B4: per-task tool-call nonce. Manual relay stays nonce-free (a human
     // copies/pastes; blocks would not carry the nonce).
     let task_nonce: Option<String> = match input.provider {
@@ -212,14 +243,28 @@ pub async fn run(mut input: AgentInput) {
             Some(full[..8].to_string())
         }
     };
-    let preamble = protocol::preamble(&tree, &tools::tool_names(), input.settings.result_cap_bytes, task_nonce.as_deref());
-    push(entry("system", format!("protocol preamble sent to {}", input.provider.describe())));
+    let preamble = protocol::preamble(
+        &tree,
+        &tools::tool_names(),
+        input.settings.result_cap_bytes,
+        task_nonce.as_deref(),
+    );
+    push(entry(
+        "system",
+        format!("protocol preamble sent to {}", input.provider.describe()),
+    ));
 
-    let guard = match CommandGuard::new(&input.settings.command_allow, &input.settings.command_deny) {
+    let guard = match CommandGuard::new(&input.settings.command_allow, &input.settings.command_deny)
+    {
         Ok(g) => g,
         Err(e) => {
             push(entry("error", format!("command guard: {e}")));
-            finish_error(&shared, &app, &input.task_id, &format!("command guard: {e}"));
+            finish_error(
+                &shared,
+                &app,
+                &input.task_id,
+                &format!("command guard: {e}"),
+            );
             return;
         }
     };
@@ -232,7 +277,17 @@ pub async fn run(mut input: AgentInput) {
 
     let set_state = |s: AgentState| {
         shared.set_state(s);
-        emit(&app, AgentEvent { kind: "agent-state".into(), state: Some(s), task_id: Some(task_id.clone()), pending_calls: None, text: None, entry: None });
+        emit(
+            &app,
+            AgentEvent {
+                kind: "agent-state".into(),
+                state: Some(s),
+                task_id: Some(task_id.clone()),
+                pending_calls: None,
+                text: None,
+                entry: None,
+            },
+        );
     };
 
     // ---- first send: preamble + task --------------------------------------
@@ -247,12 +302,27 @@ pub async fn run(mut input: AgentInput) {
     loop {
         if halted.load(Ordering::SeqCst) {
             push(entry("system", "stopped by user".into()));
-            finish(&shared, &app, &mut meta, &input, AgentState::Error, "stopped by user".into());
+            finish(
+                &shared,
+                &app,
+                &mut meta,
+                &input,
+                AgentState::Error,
+                "stopped by user".into(),
+            );
             input.app.state::<ActiveAgent>().clear(&input.task_id);
             return;
         }
         if iterations >= input.settings.max_iterations {
-            finish_error(&shared, &app, &input.task_id, &format!("iteration limit ({}) reached", input.settings.max_iterations));
+            finish_error(
+                &shared,
+                &app,
+                &input.task_id,
+                &format!(
+                    "iteration limit ({}) reached",
+                    input.settings.max_iterations
+                ),
+            );
             input.app.state::<ActiveAgent>().clear(&input.task_id);
             return;
         }
@@ -295,7 +365,12 @@ pub async fn run(mut input: AgentInput) {
             Parsed::Error(e) => {
                 parse_retries += 1;
                 if parse_retries > 2 {
-                    finish_error(&shared, &app, &input.task_id, &format!("malformed tool call 3 times; pausing. Last error: {e}"));
+                    finish_error(
+                        &shared,
+                        &app,
+                        &input.task_id,
+                        &format!("malformed tool call 3 times; pausing. Last error: {e}"),
+                    );
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -313,8 +388,18 @@ pub async fn run(mut input: AgentInput) {
             Parsed::Neither => {
                 nudge_count += 1;
                 if nudge_count > 3 {
-                    push(entry("done", "no tool calls and no DONE — treating the reply as the final answer".into()));
-                    finish(&shared, &app, &mut meta, &input, AgentState::Done, "final answer".into());
+                    push(entry(
+                        "done",
+                        "no tool calls and no DONE — treating the reply as the final answer".into(),
+                    ));
+                    finish(
+                        &shared,
+                        &app,
+                        &mut meta,
+                        &input,
+                        AgentState::Done,
+                        "final answer".into(),
+                    );
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -360,31 +445,51 @@ pub async fn run(mut input: AgentInput) {
                         }
                         pending.push(obj);
                     }
-                    emit(&app, AgentEvent { kind: "approval-request".into(), state: Some(AgentState::AwaitingApproval), task_id: Some(task_id.clone()), entry: None, pending_calls: Some(pending), text: None });
-                    let decisions = loop {
-                        tokio::select! {
-                            Some(d) = approve_rx.recv() => break d,
-                            _ = stop.notified() => {
-                                push(entry("system", "stopped by user during approval".into()));
-                                finish(&shared, &app, &mut meta, &input, AgentState::Error, "stopped during approval".into());
-                                input.app.state::<ActiveAgent>().clear(&input.task_id);
-                                return;
-                            }
+                    emit(
+                        &app,
+                        AgentEvent {
+                            kind: "approval-request".into(),
+                            state: Some(AgentState::AwaitingApproval),
+                            task_id: Some(task_id.clone()),
+                            entry: None,
+                            pending_calls: Some(pending),
+                            text: None,
+                        },
+                    );
+                    let decisions = tokio::select! {
+                        Some(d) = approve_rx.recv() => d,
+                        _ = stop.notified() => {
+                            push(entry("system", "stopped by user during approval".into()));
+                            finish(&shared, &app, &mut meta, &input, AgentState::Error, "stopped during approval".into());
+                            input.app.state::<ActiveAgent>().clear(&input.task_id);
+                            return;
                         }
                     };
-                    calls.iter().map(|c| {
-                        let approved = decisions.iter().find(|d| d.id == c.id).map(|d| d.approved).unwrap_or(false);
-                        (c.clone(), approved)
-                    }).collect()
+                    calls
+                        .iter()
+                        .map(|c| {
+                            let approved = decisions
+                                .iter()
+                                .find(|d| d.id == c.id)
+                                .map(|d| d.approved)
+                                .unwrap_or(false);
+                            (c.clone(), approved)
+                        })
+                        .collect()
                 } else {
                     calls.iter().map(|c| (c.clone(), true)).collect()
                 };
 
                 // ---- execute -------------------------------------------
                 set_state(AgentState::Executing);
-                if decisions.iter().any(|(c, a)| *a && (WRITE_TOOLS.contains(&c.tool.as_str()) || c.tool == "run_command")) {
+                if decisions.iter().any(|(c, a)| {
+                    *a && (WRITE_TOOLS.contains(&c.tool.as_str()) || c.tool == "run_command")
+                }) {
                     if let Ok(cp) = checkpoints::snapshot(&input.ws, "before tool batch") {
-                        push(entry("checkpoint", format!("checkpoint {} ({})", cp.id, cp.label)));
+                        push(entry(
+                            "checkpoint",
+                            format!("checkpoint {} ({})", cp.id, cp.label),
+                        ));
                     }
                 }
 
@@ -401,12 +506,25 @@ pub async fn run(mut input: AgentInput) {
                         record.status = "rejected".into();
                         (false, "rejected by the user".into(), None)
                     } else if call.tool == "run_command" {
-                        let command = call.args.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                        let command = call
+                            .args
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         if let Err(e) = guard.check(&command) {
                             (false, format!("blocked: {e}"), None)
                         } else {
-                            let cwd = call.args.get("cwd").and_then(Value::as_str).map(String::from);
-                            let timeout = call.args.get("timeout").and_then(Value::as_u64).unwrap_or(input.settings.command_timeout_secs);
+                            let cwd = call
+                                .args
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                            let timeout = call
+                                .args
+                                .get("timeout")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(input.settings.command_timeout_secs);
                             let app2 = app.clone();
                             let chunk_task = task_id.clone();
                             let call_id = call.id.clone();
@@ -429,16 +547,29 @@ pub async fn run(mut input: AgentInput) {
                         }
                     } else {
                         let out = tools::execute(&input.ws, call, &input.settings);
-                        let diff = out.diff.map(|(p, o, n)| DiffInfo { path: p, old: o, new: n });
+                        let diff = out.diff.map(|(p, o, n)| DiffInfo {
+                            path: p,
+                            old: o,
+                            new: n,
+                        });
                         (out.ok, out.output, diff)
                     };
                     if record.status != "rejected" {
                         record.status = if ok { "ok".into() } else { "error".into() };
                     }
-                    record.output = protocol::truncate(&output, input.settings.result_cap_bytes).to_string();
+                    record.output =
+                        protocol::truncate(&output, input.settings.result_cap_bytes).to_string();
                     result_blocks.push_str(&protocol::format_result(call, ok, &record.output));
                     let warning = injection_heuristic(&record.output);
-                    push(TranscriptEntry { id: 0, ts: history::now_ms(), kind: "tool_calls".into(), text: String::new(), calls: vec![record], diff, injection_warning: warning });
+                    push(TranscriptEntry {
+                        id: 0,
+                        ts: history::now_ms(),
+                        kind: "tool_calls".into(),
+                        text: String::new(),
+                        calls: vec![record],
+                        diff,
+                        injection_warning: warning,
+                    });
 
                     if !ok && *approved {
                         consecutive_failures += 1;
@@ -450,7 +581,14 @@ pub async fn run(mut input: AgentInput) {
                 }
 
                 if consecutive_failures >= 3 {
-                    finish_error(&shared, &app, &input.task_id, &format!("circuit breaker: tool '{last_failed_tool}' failed 3 times in a row"));
+                    finish_error(
+                        &shared,
+                        &app,
+                        &input.task_id,
+                        &format!(
+                            "circuit breaker: tool '{last_failed_tool}' failed 3 times in a row"
+                        ),
+                    );
                     input.app.state::<ActiveAgent>().clear(&input.task_id);
                     return;
                 }
@@ -476,53 +614,100 @@ async fn ensure_sent(
     first_of_task: bool,
     push: &impl Fn(TranscriptEntry) -> TranscriptEntry,
 ) -> Result<(), String> {
-    match input.provider.send(&input.task_id, text, first_of_task).await {
-        Ok(()) => return Ok(()),
+    match input
+        .provider
+        .send(&input.task_id, text, first_of_task)
+        .await
+    {
+        Ok(()) => Ok(()),
         Err(e) => {
-            let relayable = e.contains("NEEDS_LOGIN")
-                || e.contains("can't reach the provider page")
-                || e.contains("provider page changed");
-            if !relayable {
+            if !e.should_use_manual_relay() {
                 // One retry covers transient send failures; then surface it.
-                match input.provider.send(&input.task_id, text, first_of_task).await {
-                    Ok(()) => return Ok(()),
-                    Err(e2) => return Err(e2),
-                }
+                return match input
+                    .provider
+                    .send(&input.task_id, text, first_of_task)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e2) => Err(e2.to_string()),
+                };
             }
-            input.provider = Provider::Manual(ManualProvider::new(input.app.clone(), input.relay.clone()));
+            input.provider =
+                Provider::Manual(ManualProvider::new(input.app.clone(), input.relay.clone()));
             *input.webview_state.manual_fallback.lock().unwrap() = true;
             push(entry("system", format!("provider chat unavailable ({e}) — switched to manual relay. Copy the message in the relay card into your chat, then paste the reply back.")));
-            let _ = input.app.emit(EVT, json!({"kind": "manual-fallback", "task_id": input.task_id}));
-            return input.provider.send(&input.task_id, text, first_of_task).await;
+            let _ = input.app.emit(
+                EVT,
+                json!({"kind": "manual-fallback", "task_id": input.task_id}),
+            );
+            input
+                .provider
+                .send(&input.task_id, text, first_of_task)
+                .await
+                .map_err(|error| error.to_string())
         }
+    }
+}
+
+struct ProviderTaskGuard {
+    app: tauri::AppHandle,
+    state: Arc<crate::webprov::WebviewState>,
+}
+
+impl ProviderTaskGuard {
+    fn start(app: tauri::AppHandle, state: Arc<crate::webprov::WebviewState>) -> Self {
+        *state.task_active.lock().unwrap() = true;
+        Self { app, state }
+    }
+}
+
+impl Drop for ProviderTaskGuard {
+    fn drop(&mut self) {
+        *self.state.task_active.lock().unwrap() = false;
+        crate::webprov::destroy_if_idle(&self.app, &self.state, false);
     }
 }
 
 fn finish_error(shared: &Arc<AgentShared>, app: &tauri::AppHandle, task_id: &str, msg: &str) {
     shared.set_state(AgentState::Error);
-    let _ = app.emit(EVT, serde_json::to_value(AgentEvent {
-        kind: "agent-state".into(),
-        state: Some(AgentState::Error),
-        task_id: Some(task_id.into()),
-        pending_calls: None,
-        text: Some(msg.to_string()),
-        entry: None,
-    }).unwrap_or(Value::Null));
+    let _ = app.emit(
+        EVT,
+        serde_json::to_value(AgentEvent {
+            kind: "agent-state".into(),
+            state: Some(AgentState::Error),
+            task_id: Some(task_id.into()),
+            pending_calls: None,
+            text: Some(msg.to_string()),
+            entry: None,
+        })
+        .unwrap_or(Value::Null),
+    );
 }
 
-fn finish(shared: &Arc<AgentShared>, app: &tauri::AppHandle, meta: &mut history::TaskMeta, input: &AgentInput, state: AgentState, summary: String) {
+fn finish(
+    shared: &Arc<AgentShared>,
+    app: &tauri::AppHandle,
+    meta: &mut history::TaskMeta,
+    input: &AgentInput,
+    state: AgentState,
+    summary: String,
+) {
     meta.status = format!("{state:?}").to_lowercase();
     meta.ended_ms = Some(history::now_ms());
     let _ = input.history.update_task(meta);
     shared.set_state(state);
-    let _ = app.emit(EVT, serde_json::to_value(AgentEvent {
-        kind: "agent-state".into(),
-        state: Some(state),
-        task_id: Some(input.task_id.clone()),
-        pending_calls: None,
-        text: Some(summary),
-        entry: None,
-    }).unwrap_or(Value::Null));
+    let _ = app.emit(
+        EVT,
+        serde_json::to_value(AgentEvent {
+            kind: "agent-state".into(),
+            state: Some(state),
+            task_id: Some(input.task_id.clone()),
+            pending_calls: None,
+            text: Some(summary),
+            entry: None,
+        })
+        .unwrap_or(Value::Null),
+    );
 }
 
 fn preview_diff(ws: &Workspace, call: &ToolCall) -> Option<serde_json::Value> {
@@ -530,17 +715,64 @@ fn preview_diff(ws: &Workspace, call: &ToolCall) -> Option<serde_json::Value> {
     match call.tool.as_str() {
         "write_file" | "edit_file" => {
             let abs = ws.resolve(path).ok()?;
+            let skipped = || {
+                json!({
+                    "path": path,
+                    "old": "[diff omitted: file exceeds 2 MB]",
+                    "new": "[diff omitted: file exceeds 2 MB]"
+                })
+            };
+            let old_len = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            if old_len > tools::MAX_DIFF_BYTES as u64 {
+                return Some(skipped());
+            }
             let old = std::fs::read_to_string(&abs).unwrap_or_default();
             let new = match call.tool.as_str() {
-                "write_file" => call.args.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+                "write_file" => {
+                    let content = call
+                        .args
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if content.len() > tools::MAX_DIFF_BYTES {
+                        return Some(skipped());
+                    }
+                    content.to_string()
+                }
                 "edit_file" => {
                     let old_s = call.args.get("old_string").and_then(Value::as_str)?;
                     let new_s = call.args.get("new_string").and_then(Value::as_str)?;
-                    let all = call.args.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-                    if all { old.replace(old_s, new_s) } else { old.replacen(old_s, new_s, 1) }
+                    let all = call
+                        .args
+                        .get("replace_all")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let replacements = if all {
+                        old.matches(old_s).count()
+                    } else {
+                        usize::from(old.contains(old_s))
+                    };
+                    let projected_len = old
+                        .len()
+                        .saturating_sub(replacements.saturating_mul(old_s.len()))
+                        .saturating_add(replacements.saturating_mul(new_s.len()));
+                    if old.len() > tools::MAX_DIFF_BYTES
+                        || new_s.len() > tools::MAX_DIFF_BYTES
+                        || projected_len > tools::MAX_DIFF_BYTES
+                    {
+                        return Some(skipped());
+                    }
+                    if all {
+                        old.replace(old_s, new_s)
+                    } else {
+                        old.replacen(old_s, new_s, 1)
+                    }
                 }
                 _ => return None,
             };
+            if old.len() > tools::MAX_DIFF_BYTES || new.len() > tools::MAX_DIFF_BYTES {
+                return Some(skipped());
+            }
             Some(json!({"path": path, "old": old, "new": new}))
         }
         _ => None,
@@ -550,10 +782,20 @@ fn preview_diff(ws: &Workspace, call: &ToolCall) -> Option<serde_json::Value> {
 fn tree_summary(ws: &Workspace, depth: usize, max_entries: usize) -> String {
     let mut lines = Vec::new();
     walk(ws.root(), 0, depth, &mut lines, max_entries);
-    if lines.is_empty() { "(empty workspace)".into() } else { lines.join("\n") }
+    if lines.is_empty() {
+        "(empty workspace)".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
-fn walk(dir: &std::path::Path, level: usize, depth: usize, lines: &mut Vec<String>, max: usize) -> bool {
+fn walk(
+    dir: &std::path::Path,
+    level: usize,
+    depth: usize,
+    lines: &mut Vec<String>,
+    max: usize,
+) -> bool {
     if lines.len() >= max {
         return false;
     }
@@ -582,4 +824,30 @@ fn walk(dir: &std::path::Path, level: usize, depth: usize, lines: &mut Vec<Strin
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_diff_skips_large_existing_files() {
+        let root = std::env::temp_dir().join(format!("neelima-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.txt");
+        std::fs::write(&path, vec![b'x'; tools::MAX_DIFF_BYTES + 1]).unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            tool: "write_file".into(),
+            args: json!({"path":"large.txt","content":"replacement"}),
+            security_nonce: None,
+        };
+
+        let preview = preview_diff(&ws, &call).unwrap();
+        assert_eq!(preview["old"], "[diff omitted: file exceeds 2 MB]");
+        assert_eq!(preview["new"], "[diff omitted: file exceeds 2 MB]");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

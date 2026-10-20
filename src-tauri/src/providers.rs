@@ -9,11 +9,12 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::settings::LocalProvider as LocalCfg;
+use crate::webprov::ProviderError;
 
 #[derive(Clone)]
 pub enum Provider {
     /// Embedded provider web chat, driven through the adapter runtime.
-    Web(crate::webprov::WebProvider),
+    Web(Box<crate::webprov::WebProvider>),
     /// Ollama / LM Studio via localhost HTTP with streaming.
     Local(LocalProvider),
     /// First-class manual relay: the user copies the prompt out and pastes the
@@ -33,11 +34,16 @@ impl Provider {
     /// Send a message. `task_id` identifies the task (the web provider uses it
     /// to decide new_chat), `first_of_task` allows the web provider to reset
     /// the chat exactly once per task (A8).
-    pub async fn send(&mut self, task_id: &str, text: &str, first_of_task: bool) -> Result<(), String> {
+    pub async fn send(
+        &mut self,
+        task_id: &str,
+        text: &str,
+        first_of_task: bool,
+    ) -> Result<(), ProviderError> {
         match self {
             Provider::Web(w) => w.send(task_id, text, first_of_task).await,
-            Provider::Local(l) => l.send(text).await,
-            Provider::Manual(m) => m.send(text).await,
+            Provider::Local(l) => l.send(text).await.map_err(ProviderError::SendFailed),
+            Provider::Manual(m) => m.send(text).await.map_err(ProviderError::SendFailed),
         }
     }
 
@@ -84,7 +90,9 @@ impl ManualProvider {
 
     pub async fn send(&mut self, text: &str) -> Result<(), String> {
         use tauri::Emitter;
-        let _ = self.app.emit("evt", json!({"kind": "relay-outbound", "text": text}));
+        let _ = self
+            .app
+            .emit("evt", json!({"kind": "relay-outbound", "text": text}));
         Ok(())
     }
 
@@ -116,13 +124,105 @@ pub enum LocalKind {
     LmStudio,
 }
 
+#[derive(Default)]
+struct ByteLineDecoder {
+    pending: Vec<u8>,
+}
+
+impl ByteLineDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        self.pending.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for (index, byte) in self.pending.iter().enumerate() {
+            if *byte == b'\n' {
+                lines.push(self.pending[start..index].to_vec());
+                start = index + 1;
+            }
+        }
+        if start > 0 {
+            self.pending.drain(..start);
+        }
+        lines
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+}
+
+fn local_stream_content(kind: LocalKind, line: &[u8]) -> Result<Option<String>, String> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let value = match kind {
+        LocalKind::Ollama => serde_json::from_slice::<Value>(line)
+            .map_err(|e| format!("invalid Ollama stream line: {e}"))?,
+        LocalKind::LmStudio => {
+            let text = std::str::from_utf8(line)
+                .map_err(|e| format!("invalid UTF-8 in LM Studio stream: {e}"))?;
+            let Some(data) = text.trim().strip_prefix("data:").map(str::trim) else {
+                return Ok(None);
+            };
+            if data.is_empty() || data == "[DONE]" {
+                return Ok(None);
+            }
+            serde_json::from_str::<Value>(data)
+                .map_err(|e| format!("invalid LM Studio stream event: {e}"))?
+        }
+    };
+    if let Some(error) = value["error"].as_str() {
+        return Err(format!("local model server stream error: {error}"));
+    }
+    let content = match kind {
+        LocalKind::Ollama => value["message"]["content"].as_str(),
+        LocalKind::LmStudio => value["choices"][0]["delta"]["content"].as_str(),
+    };
+    Ok(content.map(str::to_owned))
+}
+
+fn local_request_body(kind: LocalKind, model: &str, messages: &[Value], cfg: &LocalCfg) -> Value {
+    match kind {
+        LocalKind::Ollama => json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "options": {
+                "num_ctx": cfg.num_ctx.unwrap_or(8192),
+                "temperature": cfg.temperature.unwrap_or(0.7)
+            }
+        }),
+        LocalKind::LmStudio => json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "temperature": cfg.temperature.unwrap_or(0.7)
+        }),
+    }
+}
+
 impl LocalProvider {
     pub fn new(app: tauri::AppHandle, kind: LocalKind, cfg: LocalCfg) -> Self {
-        LocalProvider { app, kind, cfg, messages: Arc::new(Mutex::new(Vec::new())) }
+        LocalProvider {
+            app,
+            kind,
+            cfg,
+            messages: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub fn describe(&self) -> String {
-        format!("{:?} {} [{}]", self.kind, self.cfg.url, self.cfg.model.clone().unwrap_or_default())
+        format!(
+            "{:?} {} [{}]",
+            self.kind,
+            self.cfg.url,
+            self.cfg.model.clone().unwrap_or_default()
+        )
     }
 
     fn client() -> Result<reqwest::Client, String> {
@@ -136,8 +236,13 @@ impl LocalProvider {
     fn prune_messages(&self) {
         let max_chars = self.cfg.context_chars.unwrap_or(24_000);
         let mut msgs = self.messages.lock().unwrap();
-        if msgs.is_empty() { return; }
-        let mut total: usize = msgs.iter().map(|m| m["content"].as_str().map(|c| c.len()).unwrap_or(0)).sum();
+        if msgs.is_empty() {
+            return;
+        }
+        let mut total: usize = msgs
+            .iter()
+            .map(|m| m["content"].as_str().map(|c| c.len()).unwrap_or(0))
+            .sum();
         let mut idx = 1; // keep index 0 (preamble/system)
         while idx < msgs.len() && total > max_chars {
             total -= msgs[idx]["content"].as_str().map(|c| c.len()).unwrap_or(0);
@@ -150,67 +255,62 @@ impl LocalProvider {
     }
 
     pub async fn send(&mut self, text: &str) -> Result<(), String> {
-        self.messages.lock().unwrap().push(json!({"role": "user", "content": text}));
+        self.messages
+            .lock()
+            .unwrap()
+            .push(json!({"role": "user", "content": text}));
         self.prune_messages();
         Ok(())
     }
 
     pub async fn wait_reply(&mut self, cancel: Arc<Notify>) -> Result<String, String> {
-        let model = self.cfg.model.clone().ok_or("no model selected — pick one in Settings")?;
+        let model = self
+            .cfg
+            .model
+            .clone()
+            .ok_or("no model selected — pick one in Settings")?;
         let client = Self::client()?;
         let msgs = self.messages.lock().unwrap().clone();
         let url = match self.kind {
             LocalKind::Ollama => format!("{}/api/chat", self.cfg.url.trim_end_matches('/')),
-            LocalKind::LmStudio => format!("{}/v1/chat/completions", self.cfg.url.trim_end_matches('/')),
+            LocalKind::LmStudio => {
+                format!("{}/v1/chat/completions", self.cfg.url.trim_end_matches('/'))
+            }
         };
         let (tx, mut rx) = mpsc::channel::<String>(64);
         let emit_app = self.app.clone();
 
         let kind = self.kind;
-        let body = match kind {
-            LocalKind::Ollama => json!({"model": model, "messages": msgs, "stream": true}),
-            LocalKind::LmStudio => json!({"model": model, "messages": msgs, "stream": true, "temperature": self.cfg.temperature.unwrap_or(0.7)}),
-        };
+        let body = local_request_body(kind, &model, &msgs, &self.cfg);
 
         let handle = tokio::spawn(async move {
             let resp = client.post(&url).json(&body).send().await.map_err(|e| {
                 format!("cannot reach local server at {url} — is it running? ({e})")
             })?;
             if !resp.status().is_success() {
-                return Err(format!("local server error {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+                return Err(format!(
+                    "local server error {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
             }
             let mut stream = resp.bytes_stream();
-            let mut sse_buf = String::new();
+            let mut lines = ByteLineDecoder::default();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| e.to_string())?;
-                let text = String::from_utf8_lossy(&chunk);
-                match kind {
-                    LocalKind::Ollama => {
-                        // NDJSON: one JSON object per line with {message:{content}}
-                        for line in text.lines() {
-                            if line.trim().is_empty() { continue; }
-                            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                                if let Some(c) = v["message"]["content"].as_str() {
-                                    let _ = tx.send(c.to_string()).await;
-                                }
-                            }
-                        }
+                for line in lines.push(&chunk) {
+                    if let Some(content) = local_stream_content(kind, &line)? {
+                        tx.send(content)
+                            .await
+                            .map_err(|_| "local response receiver closed".to_string())?;
                     }
-                    LocalKind::LmStudio => {
-                        // SSE: data: {choices:[{delta:{content}}]}
-                        sse_buf.push_str(&text);
-                        while let Some(pos) = sse_buf.find('\n') {
-                            let line: String = sse_buf.drain(..=pos).collect();
-                            let line = line.trim();
-                            let data = line.strip_prefix("data:").map(|d| d.trim()).unwrap_or("");
-                            if data.is_empty() || data == "[DONE]" { continue; }
-                            if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
-                                    let _ = tx.send(c.to_string()).await;
-                                }
-                            }
-                        }
-                    }
+                }
+            }
+            if let Some(line) = lines.finish() {
+                if let Some(content) = local_stream_content(kind, &line)? {
+                    tx.send(content)
+                        .await
+                        .map_err(|_| "local response receiver closed".to_string())?;
                 }
             }
             Ok::<(), String>(())
@@ -218,15 +318,17 @@ impl LocalProvider {
 
         let mut reply = String::new();
         let mut last_emit = std::time::Instant::now();
+        let mut pending_emit = String::new();
         loop {
             tokio::select! {
                 item = rx.recv() => {
                     match item {
                         Some(chunk) => {
                             reply.push_str(&chunk);
+                            pending_emit.push_str(&chunk);
                             if last_emit.elapsed() > std::time::Duration::from_millis(120) {
                                 use tauri::Emitter;
-                                let _ = emit_app.emit("evt", json!({"kind": "assistant-stream", "text": chunk}));
+                                let _ = emit_app.emit("evt", json!({"kind": "assistant-stream", "text": std::mem::take(&mut pending_emit)}));
                                 last_emit = std::time::Instant::now();
                             }
                         }
@@ -243,6 +345,13 @@ impl LocalProvider {
                 }
             }
         }
+        if !pending_emit.is_empty() {
+            use tauri::Emitter;
+            let _ = emit_app.emit(
+                "evt",
+                json!({"kind": "assistant-stream", "text": pending_emit}),
+            );
+        }
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
@@ -251,12 +360,13 @@ impl LocalProvider {
         if reply.trim().is_empty() {
             return Err("empty reply from local model".into());
         }
-        self.messages.lock().unwrap().push(json!({"role": "assistant", "content": reply}));
+        self.messages
+            .lock()
+            .unwrap()
+            .push(json!({"role": "assistant", "content": reply}));
         Ok(reply)
     }
 }
-
-use futures_util::StreamExt;
 
 /// List models from a local server (GET only).
 pub async fn list_models(kind: LocalKind, base_url: &str) -> Result<Vec<String>, String> {
@@ -265,11 +375,86 @@ pub async fn list_models(kind: LocalKind, base_url: &str) -> Result<Vec<String>,
         LocalKind::Ollama => format!("{}/api/tags", base_url.trim_end_matches('/')),
         LocalKind::LmStudio => format!("{}/v1/models", base_url.trim_end_matches('/')),
     };
-    let resp = client.get(&url).send().await
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|_| format!("cannot reach {url} — is the server running?"))?;
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(match kind {
-        LocalKind::Ollama => v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default(),
-        LocalKind::LmStudio => v["data"].as_array().map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect()).unwrap_or_default(),
+        LocalKind::Ollama => v["models"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        LocalKind::LmStudio => v["data"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+use futures_util::StreamExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_line_decoder_preserves_split_utf8_sequences() {
+        let wire = b"data: {\"choices\":[{\"delta\":{\"content\":\"caf\xc3\xa9\"}}]}\r\n";
+        let split = wire.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
+        let mut decoder = ByteLineDecoder::default();
+        assert!(decoder.push(&wire[..split]).is_empty());
+        let lines = decoder.push(&wire[split..]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            local_stream_content(LocalKind::LmStudio, &lines[0]).unwrap(),
+            Some("café".into())
+        );
+        assert!(decoder.finish().is_none());
+    }
+
+    #[test]
+    fn stream_decoder_handles_multiple_and_unterminated_lines() {
+        let mut decoder = ByteLineDecoder::default();
+        let lines =
+            decoder.push(b"{\"message\":{\"content\":\"one\"}}\n{\"message\":{\"content\":\"two");
+        assert_eq!(
+            local_stream_content(LocalKind::Ollama, &lines[0]).unwrap(),
+            Some("one".into())
+        );
+        let lines = decoder.push(b"\"}}\n{\"message\":{\"content\":\"tail\"}}");
+        assert_eq!(
+            local_stream_content(LocalKind::Ollama, &lines[0]).unwrap(),
+            Some("two".into())
+        );
+        let final_line = decoder.finish().unwrap();
+        assert_eq!(
+            local_stream_content(LocalKind::Ollama, &final_line).unwrap(),
+            Some("tail".into())
+        );
+    }
+
+    #[test]
+    fn ollama_request_includes_configured_context_and_temperature() {
+        let cfg = LocalCfg {
+            url: "http://localhost:11434".into(),
+            model: Some("test".into()),
+            context_chars: None,
+            temperature: Some(0.25),
+            num_ctx: Some(16_384),
+        };
+        let body = local_request_body(LocalKind::Ollama, "test", &[], &cfg);
+        assert_eq!(body["options"]["num_ctx"], 16_384);
+        assert_eq!(body["options"]["temperature"], 0.25);
+        assert_eq!(body["stream"], true);
+    }
 }

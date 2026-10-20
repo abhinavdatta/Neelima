@@ -1,8 +1,7 @@
 // The provider pane: hosts the embedded web chat webview. The webview is a
 // real child webview positioned EXACTLY over this div (rect reported to Rust in
 // physical px on every layout change). Entering the view mounts the selected
-// profile automatically; leaving destroys it — the profile's data dir persists,
-// so logins survive the destroy.
+// profile automatically; leaving hides it so the page and login session stay alive.
 import { useEffect, useRef } from "preact/hooks";
 import { setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
@@ -54,7 +53,7 @@ export function ProviderPane() {
       ro.disconnect();
       window.removeEventListener("resize", reportRect);
       clearTimeout(t);
-      // Leaving the provider view destroys the webview (RAM budget).
+      // Leaving the provider view hides the webview without reloading the page.
       mountedRef.current = false;
       cmd.webviewMode("chat").catch(() => {});
     };
@@ -76,6 +75,38 @@ export function ProviderPane() {
     } catch (e) { toast("error", String(e)); }
   };
 
+  const testConnection = async () => {
+    try {
+      const result = await cmd.providerDiagnose();
+      if (!result.mounted) {
+        toast("warn", "Provider webview is not mounted.");
+        return;
+      }
+      const status = [
+        `login: ${result.login_state ?? "unknown"}`,
+        `ping: ${result.ping_ms == null ? "failed" : `${result.ping_ms} ms`}`,
+        `input: ${result.input_found == null ? "unknown" : result.input_found ? "found" : "missing"}`,
+        `send: ${result.send_button_found == null ? "unknown" : result.send_button_found ? "found" : "missing"}`,
+        `messages: ${result.messages_found == null ? "unknown" : result.messages_found ? "found" : "missing"}`,
+      ].join(" · ");
+      toast(result.ping_ms == null ? "warn" : "info", status);
+      if (result.ping_ms == null && result.last_bridge_error) {
+        toast("error", result.last_bridge_error);
+      }
+    } catch (e) {
+      toast("error", `Provider diagnostics failed: ${String(e)}`);
+    }
+  };
+
+  const continueAsLoggedIn = async () => {
+    try {
+      await cmd.providerLoginOverride();
+      toast("warn", "Continuing with the manual login-state override.");
+    } catch (e) {
+      toast("error", String(e));
+    }
+  };
+
   return (
     <div class="provider-pane">
       <div class="provider-toolbar">
@@ -91,9 +122,18 @@ export function ProviderPane() {
               {s.providerLoginWaiting
                 ? "Log in inside the embedded chat. Your session persists — you only need to do this once per provider."
                 : s.providerMounted
-                  ? "Runs in an isolated webview — with its own login. Close it any time."
+                  ? s.providerLoginState === "unknown"
+                    ? `Can't reach the page state${s.providerBridgeError ? `: ${s.providerBridgeError}` : ""}. Test the bridge connection before trying again.`
+                    : "Runs in an isolated webview — with its own login. Close it any time."
                   : "Credentials stay inside the webview's own profile — Neelima never reads them."}
             </span>
+            <span class="provider-note hint">
+              Email or magic-link sign-in may open in your system browser, whose cookies are separate. If possible, paste the link into the embedded provider view; otherwise use manual relay.
+            </span>
+            {s.providerMounted ? <button class="tb-btn" onClick={testConnection}>Test connection</button> : null}
+            {s.providerMounted && s.providerLoginState !== "logged_in"
+              ? <button class="tb-btn" onClick={continueAsLoggedIn}>I'm logged in, continue</button>
+              : null}
           </>
         ) : (
           <>
@@ -101,7 +141,10 @@ export function ProviderPane() {
             <button class="tb-btn" onClick={() => addWorkspace()}>+ Add folder</button>
           </>
         )}
-        {selectedProfile ? <button class="tb-danger" onClick={() => cmd.providersClose()}>Close</button> : null}
+        {selectedProfile ? <button class="tb-danger" onClick={async () => {
+          try { await cmd.providersClose(); mountedRef.current = false; }
+          catch (e) { toast("error", String(e)); }
+        }}>Close</button> : null}
       </div>
       <div class="provider-host" ref={host}>
         {!s.providerMounted ? (

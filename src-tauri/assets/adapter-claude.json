@@ -9,7 +9,7 @@
     "messages": "div[data-testid=\"assistant-message\"], .font-claude-message",
     "new_chat": null,
     "logged_in": "div[contenteditable=\"true\"]",
-    "logged_out": "a[href*=\"/login\"], button:has-text(\"Log in\"), [data-testid=\"login-button\"]"
+    "logged_out": "a[href*=\"/login\"], [aria-label*=\"Log in\"], [data-testid=\"login-button\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 20000 },
   "quiet_ms": 3000,

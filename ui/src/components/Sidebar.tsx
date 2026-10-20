@@ -76,59 +76,60 @@ function TaskItem({ t }: { t: TaskMeta }) {
 
 export function Sidebar() {
   const s = useStore();
+  const [panel, setPanel] = useState<null | "projects" | "history" | "tools">(null);
+  const start = () => {
+    if (!s.activeWorkspacePath) {
+      void addWorkspace();
+      return;
+    }
+    resetTask();
+  };
   return (
     <aside class="sidebar">
-      <div class="side-head">
-        <div class="logo">N</div>
-      </div>
-
-      <nav class="side-nav">
-        <button
-          class={`side-item ${s.view === "chat" ? "active" : ""}`}
-          onClick={() => { resetTask(); }}
-        >
-          <svg viewBox="0 0 16 16" class="ic"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" /><path d="M8 5v6M5 8h6" stroke="currentColor" /></svg>
-          <span>New task</span>
-          <kbd>Ctrl+N</kbd>
+      <nav class="rail-nav" aria-label="Main navigation">
+        <button class="rail-button rail-new" title={s.activeWorkspacePath ? "New task" : "Choose a project folder"} aria-label={s.activeWorkspacePath ? "New task" : "Choose a project folder"} onClick={start}>
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
         </button>
-        <button class={`side-item ${s.view === "search" ? "active" : ""}`} onClick={() => setState({ view: "search" })}>
-          <svg viewBox="0 0 16 16" class="ic"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" /><path d="M10.5 10.5 14 14" stroke="currentColor" /></svg>
-          <span>Search</span>
-          <kbd>Ctrl+K</kbd>
+        <button class={`rail-button ${s.view === "search" ? "active" : ""}`} title="Search" aria-label="Search" onClick={() => { setPanel(null); setState({ view: "search" }); }}>
+          <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4.5 4.5" /></svg>
         </button>
-        <button class={`side-item ${s.view === "automations" ? "active" : ""}`} onClick={() => setState({ view: "automations" })}>
-          <svg viewBox="0 0 16 16" class="ic"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" /><path d="M5 7h2M9 7h2M5 10h6" stroke="currentColor" /></svg>
-          <span>Automations</span>
+        <button class={`rail-button ${s.view === "provider" ? "active" : ""}`} title="Providers" aria-label="Providers" onClick={() => { setPanel(null); setState({ view: "provider" }); }}>
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="m14.8 8.3-2.1 5.1-5.1 2.3 2.2-5.2 5-2.2Z" /></svg>
         </button>
-        <button class={`side-item ${s.view === "marketplace" ? "active" : ""}`} onClick={() => setState({ view: "marketplace" })}>
-          <svg viewBox="0 0 16 16" class="ic"><path d="M3 4h10l-1 9H4L3 4Z" fill="none" stroke="currentColor" /><path d="M6 4V3a2 2 0 0 1 4 0v1" fill="none" stroke="currentColor" /></svg>
-          <span>Plugin Marketplace</span>
+        <button class={`rail-button ${panel === "tools" ? "active" : ""}`} title="Tools and files" aria-label="Tools and files" onClick={() => setPanel(panel === "tools" ? null : "tools")}>
+          <svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1.4" /><rect x="14" y="4" width="6" height="6" rx="1.4" /><rect x="4" y="14" width="6" height="6" rx="1.4" /><rect x="14" y="14" width="6" height="6" rx="1.4" /></svg>
         </button>
-
-        <div class="side-chips">
-          <span class="chip"># Group</span>
-          <span class="chip chip-solid">Project</span>
-          <span class="chip-link">⇅</span>
-        </div>
-
-        <div class="side-section">Projects</div>
-        <div class="side-list">
-          {s.workspaces.map((w) => <ProjectItem key={w.id} w={w} active={s.activeWorkspace === w.id} />)}
-          <button class="project-item add" onClick={addWorkspace}>+ Add folder</button>
-        </div>
-
-        <div class="side-section">Tasks</div>
-        <div class="side-list tasks">
-          {s.tasks.length === 0 ? <div class="side-empty">No tasks yet</div> : null}
-          {s.tasks.slice(0, 30).map((t) => <TaskItem key={t.id} t={t} />)}
-        </div>
-        {s.activeWorkspacePath ? <Checkpoints /> : null}
+        <button class={`rail-button ${panel === "history" ? "active" : ""}`} title="Projects and recent tasks" aria-label="Projects and recent tasks" onClick={() => setPanel(panel === "history" ? null : "history")}>
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" /></svg>
+        </button>
       </nav>
-
-      <div class="side-foot">
-        <div class="avatar">N</div>
-        <span class="side-user">Local user</span>
-        <button class="ghost" title="Settings" onClick={() => setState({ settingsOpen: true })}>⚙</button>
+      {panel ? (
+        <div class="rail-popover">
+          <div class="rail-popover-head">
+            <strong>{panel === "history" ? "Projects & recent tasks" : "Workspace tools"}</strong>
+            <button class="rail-close" aria-label="Close panel" onClick={() => setPanel(null)}>×</button>
+          </div>
+          {panel === "history" ? (
+            <>
+              <div class="rail-popover-section">Projects</div>
+              {s.workspaces.map((w) => <ProjectItem key={w.id} w={w} active={s.activeWorkspace === w.id} />)}
+              <button class="rail-add" onClick={() => void addWorkspace()}>＋ Add project folder</button>
+              <div class="rail-popover-section">Recent tasks</div>
+              {s.tasks.length === 0 ? <div class="side-empty">No tasks yet</div> : null}
+              {s.tasks.slice(0, 20).map((t) => <TaskItem key={t.id} t={t} />)}
+              {s.activeWorkspacePath ? <Checkpoints /> : null}
+            </>
+          ) : (
+            <>
+              <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "files" }); }}>Browse project files</button>
+              <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "automations" }); }}>Automations</button>
+              <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "marketplace" }); }}>Plugin marketplace</button>
+            </>
+          )}
+        </div>
+      ) : null}
+      <div class="rail-bottom">
+        <button class="rail-logo" title="Neelima home" aria-label="Neelima home" onClick={start}>N</button>
       </div>
     </aside>
   );
@@ -243,8 +244,16 @@ function Checkpoints() {
               <span class="cp-id">{c.id.slice(0, 7)}</span>
               <button class="ghost" title="Restore this snapshot" onClick={async () => {
                 try {
-                  await cmd.checkpointRestore(c.id);
-                  toast("info", `Restored checkpoint ${c.id.slice(0, 7)}`);
+                  const preview = await cmd.checkpointRestorePreview(c.id);
+                  const confirmed = window.confirm(
+                    `Restore checkpoint ${c.id.slice(0, 7)}?\n\n` +
+                    `Files in snapshot: ${preview.checkpoint_files}\n` +
+                    `Currently tracked files to remove: ${preview.tracked_files_to_remove}\n\n` +
+                    "A backup checkpoint will be created first. New untracked files will be preserved."
+                  );
+                  if (!confirmed) return;
+                  const result = await cmd.checkpointRestore(c.id);
+                  toast("info", `Restored ${result.restored_files} files; removed ${result.removed_files}. Backup: ${result.backup_checkpoint.slice(0, 7)}.`);
                   refresh();
                 } catch (e) { toast("error", String(e)); }
               }}>restore</button>

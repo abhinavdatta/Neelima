@@ -2,7 +2,7 @@
 import { useState, useEffect } from "preact/hooks";
 import type { AgentState, PendingCall, Settings, TaskMeta, TranscriptEntry, Adapter, WorkspaceEntry } from "./types";
 
-export type View = "chat" | "provider" | "automations" | "marketplace" | "search" | "task";
+export type View = "chat" | "provider" | "automations" | "marketplace" | "search" | "task" | "files";
 
 export interface Toast { id: number; level: "info" | "warn" | "error"; text: string }
 
@@ -32,8 +32,11 @@ export interface State {
   searchQuery: string;
   taskStartedAt: number | null;
   settingsOpen: boolean;
+  composerText: string;
   providerMounted: boolean;
   providerLoginWaiting: boolean;
+  providerLoginState: "unknown" | "logged_in" | "logged_out";
+  providerBridgeError: string | null;
 }
 
 const initial: State = {
@@ -62,8 +65,11 @@ const initial: State = {
   searchQuery: "",
   taskStartedAt: null,
   settingsOpen: false,
+  composerText: "",
   providerMounted: false,
   providerLoginWaiting: false,
+  providerLoginState: "unknown",
+  providerBridgeError: null,
 };
 
 let state: State = initial;
@@ -99,6 +105,6 @@ export function toast(level: Toast["level"], text: string) {
 export function resetTask() {
   setState({
     entries: [], taskId: null, agentState: "idle", agentText: null, pendingCalls: [],
-    relayOutbound: null, commandChunks: {}, openTask: null, taskStartedAt: null, view: "chat",
+    relayOutbound: null, commandChunks: {}, openTask: null, taskStartedAt: null, view: "chat", composerText: "",
   });
 }

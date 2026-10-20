@@ -15,9 +15,8 @@
 //   {t:"assistant_message", seq, text, nonce}     — when a reply completes
 //
 // SECURITY: the page may NEVER read or write files — the old file_op /
-// read_file / write_file / list_dir paths were removed. A foreign page also
-// cannot forge assistant_message or rpc_result: both require the per-mount
-// nonce that only Rust-side eval carries (B2).
+// read_file / write_file / list_dir paths were removed. Every message is
+// mount-nonce bound, and Rust also checks the current webview origin (B2).
 
 (function () {
   if (window.__LB__) return;
@@ -25,8 +24,8 @@
   var S = A.selectors || {};
   var LOGIN_PATTERNS = A.login_url_patterns || [];
 
-  // Per-mount nonce. Only Rust-side eval knows it; assistant_message and
-  // rpc_result pushes carry it and Rust rejects anything without it (B2).
+  // The injected script provides a per-mount nonce; Rust checks it together
+  // with the webview's current origin for every bridge message (B2).
   function currentNonce() { return window.__LB_NONCE__ || ""; }
 
   function hasIpc() {
@@ -44,6 +43,9 @@
   }
   function parseArg(a) { return typeof a === "string" ? JSON.parse(a) : (a || {}); }
   function q(sel) { try { return document.querySelector(sel); } catch (e) { return null; } }
+  function visible(el) {
+    return !!(el && (el.getClientRects().length > 0 || el === document.activeElement));
+  }
 
   // ---- input setting -------------------------------------------------------
   function setNativeValue(el, value) {
@@ -95,15 +97,15 @@
       return { state: "logged_out", reason: "on a login/auth page" };
     }
     var composer = S.input ? q(S.input) : null;
-    var composerVisible = !!(composer && (composer.offsetParent !== null || composer === document.activeElement));
+    var composerVisible = visible(composer);
     if (composerVisible) {
-      if (S.logged_out && q(S.logged_out)) {
+      if (S.logged_out && visible(q(S.logged_out))) {
         return { state: "logged_out", reason: "logged-out marker visible" };
       }
       return { state: "logged_in", reason: "composer visible" };
     }
     var out = S.logged_out ? q(S.logged_out) : null;
-    if (out && out.offsetParent !== null) {
+    if (visible(out)) {
       return { state: "logged_out", reason: "logged-out marker visible, composer absent" };
     }
     return { state: "unknown", reason: "composer not found yet" };
@@ -127,7 +129,7 @@
     var key = r.state + "|" + location.href;
     if (key === lastReported) return r;
     lastReported = key;
-    post({ t: "login_state", state: r.state, url: location.href, reason: r.reason }).catch(function () {});
+    post({ t: "login_state", state: r.state, url: location.href, reason: r.reason, nonce: currentNonce() }).catch(function () {});
     return r;
   }
   var loginTimer = null;
@@ -148,7 +150,7 @@
 
   // Boot: post ready + first login state after the page is usable.
   function boot() {
-    post({ t: "ready", url: location.href, has_ipc: hasIpc() }).catch(function () {});
+    post({ t: "ready", url: location.href, has_ipc: hasIpc(), nonce: currentNonce() }).catch(function () {});
     lastReported = "";
     reportLogin();
   }
@@ -194,20 +196,20 @@
     var cfg = parseArg(arg);
     var quiet = cfg.quiet_ms || A.quiet_ms || 2000;
     var deadlineMs = cfg.timeout_ms || A.response_timeout_ms || 300000;
-    var startDeadline = Date.now() + 60000; // A9: generation must START within 60s
     return new Promise(function (resolve) {
       var container = stableContainer();
-      var obs = null, timer = null;
+      var obs = null, quietTimer = null, startTimer = null, deadlineTimer = null;
       var startedAt = Date.now();
       var phase = "waiting_start"; // waiting_start -> generating -> done
       var baseline = extractedLast();
       var baselineCount = baseline.count;
       var baselineText = baseline.text;
-      var rechecks = 0;
 
       function finish(v) {
         if (obs) obs.disconnect();
-        if (timer) clearTimeout(timer);
+        if (quietTimer) clearTimeout(quietTimer);
+        if (startTimer) clearTimeout(startTimer);
+        if (deadlineTimer) clearTimeout(deadlineTimer);
         resolve(v);
       }
 
@@ -218,44 +220,48 @@
 
       function checkStart() {
         var cur = extractedLast();
-        var genStarted = stopVisible() || cur.count > baselineCount || (cur.text !== "" && cur.text !== baselineText);
+        var genStarted = stopVisible() || cur.count > baselineCount || cur.text !== baselineText;
         if (genStarted) {
           phase = "generating";
+          if (startTimer) clearTimeout(startTimer);
           armQuiet();
         }
       }
 
       function armQuiet() {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(function () {
-          if (stopVisible() && rechecks < 3) { rechecks++; armQuiet(); return; }
+        if (quietTimer) clearTimeout(quietTimer);
+        if (stopVisible()) return;
+        quietTimer = setTimeout(function () {
+          if (stopVisible()) return; // completion will be reconsidered on DOM mutation
           var cur = extractedLast();
           if (!cur.text) { finish({ error: "reply detected but text extraction failed" }); return; }
           reportPush(cur.text);
-          finish({ complete: true, rechecks: rechecks, elapsed: Date.now() - startedAt });
+          finish({ complete: true, elapsed: Date.now() - startedAt });
         }, quiet);
       }
 
       obs = new MutationObserver(function () {
-        if (Date.now() - startedAt > deadlineMs) { finish({ error: "response timeout" }); return; }
         if (phase === "waiting_start") checkStart();
         else armQuiet();
       });
       obs.observe(container, { childList: true, subtree: true, characterData: true });
 
-      // Start watchdog: if the AI never even begins replying, and the send
-      // kick repeatedly failed, we surface it instead of "finishing" wrongly.
-      timer = setTimeout(function () {
+      // Start watchdog and overall deadline are one-shot timers; DOM changes,
+      // not polling, detect the transition into and out of generation.
+      startTimer = setTimeout(function () {
         if (phase === "waiting_start") {
           var cur = extractedLast();
-          if (cur.count > baselineCount && cur.text !== baselineText) {
+          if (stopVisible() || cur.count > baselineCount || cur.text !== baselineText) {
             phase = "generating";
             armQuiet();
             return;
           }
           finish({ error: "generation did not start within 60s (message may not have been sent)" });
         }
-      }, Math.max(60000, startDeadline - Date.now()));
+      }, 60000);
+      deadlineTimer = setTimeout(function () {
+        finish({ error: "response timeout" });
+      }, deadlineMs);
     });
   }
 
@@ -283,7 +289,19 @@
     ping: function () { return "pong:" + location.host; },
     page_info: function () {
       var r = evalLogin();
-      return { url: location.href, logged_in: r.state === "logged_in", login: r };
+      function found(selector) {
+        try { return !!(selector && document.querySelector(selector)); } catch (e) { return false; }
+      }
+      var messages = false;
+      try { messages = !!(S.messages && document.querySelector(S.messages)); } catch (e) {}
+      return {
+        url: location.href,
+        logged_in: r.state === "logged_in",
+        login: r,
+        input_found: found(S.input),
+        send_button_found: found(S.send_button),
+        messages_found: messages
+      };
     },
     is_logged_in: function () { return evalLogin().state === "logged_in"; },
 
@@ -296,10 +314,15 @@
     send_message: function (a) {
       var cfg = parseArg(a);
       var input = S.input ? q(S.input) : null;
-      if (!input) return { error: "input not found: " + S.input };
+      if (!input) return { error_type: "page_changed", error: "input not found: " + S.input };
       setEditorText(input, String(cfg.text || ""), A.input && A.input.kind);
       // Give the site a beat to enable its send button, human-paced.
       return new Promise(function (resolve) {
+        // Capture assistant-message count/text and begin observing BEFORE the
+        // send action can cause the first response mutation.
+        waitResponse(cfg).catch(function (e) {
+          if (window.console && console.warn) console.warn("[neelima] wait_response error", e);
+        });
         setTimeout(function () {
           var send = S.send_button ? q(S.send_button) : null;
           if (!send || send.disabled) {
@@ -310,11 +333,6 @@
           } else {
             send.click();
           }
-          // A9: start the reply watcher right here so baseline (count/text) is
-          // recorded BEFORE the message actually lands.
-          waitResponse(cfg).catch(function (e) {
-            if (window.console && console.warn) console.warn("[neelima] wait_response error", e);
-          });
           resolve({ sent: true });
         }, 250);
       });

@@ -1,58 +1,61 @@
-// Integrated title bar (custom, draggable): nav, task title, view toggle,
-// terminal toggle, window controls.
-import { setState, useStore } from "../store";
+import { setState, useStore, toast } from "../store";
 import { cmd } from "../tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export function TitleBar() {
   const s = useStore();
-  const win = getCurrentWindow();
-  const title = s.openTask?.title || (s.activeWorkspacePath ? s.activeWorkspacePath.split(/[\\/]/).pop() : "Neelima");
+  const workspace = s.activeWorkspacePath?.split(/[\\/]/).pop() ?? "Choose a project to begin";
   const running = s.agentState !== "idle" && s.agentState !== "done" && s.agentState !== "error";
 
   return (
-    <header class="titlebar" data-tauri-drag-region>
-      <div class="tb-left">
-        <div class="tb-logo">N</div>
-        <button class="tb-btn" onClick={() => setState({ view: "chat" })} title="Back">
-          <svg viewBox="0 0 16 16"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.4" /></svg>
+    <header class="titlebar">
+      <div class="topbar-left">
+        <button class="assistant-select" title="Open settings" onClick={() => setState({ settingsOpen: true })}>
+          <span class="assistant-gear">⚙</span>
+          <span>Assistant v2.6</span>
+          <svg class="assistant-chevron" viewBox="0 0 12 12"><path d="m3 4.5 3 3 3-3" /></svg>
         </button>
-        <button class="tb-btn" title="Forward" onClick={() => setState({ view: "provider" })}>
-          <svg viewBox="0 0 16 16"><path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.4" /></svg>
-        </button>
-        <div class="tb-title" data-tauri-drag-region>
-          <svg viewBox="0 0 16 16" class="folder-ic"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5H13A1.5 1.5 0 0 1 14.5 6v5A1.5 1.5 0 0 1 13 12.5H3.5A1.5 1.5 0 0 1 2 11V4.5Z" fill="#e8c063" /></svg>
-          <span class="tb-title-text">{title}</span>
-          <span class="tb-dots">…</span>
-        </div>
       </div>
-
-      <div class="tb-right">
-        <div class="seg">
-          <button class={s.view === "chat" || s.view === "task" ? "seg-on" : ""} onClick={async () => { await cmd.webviewMode("chat"); setState({ view: "chat" }); }}>
-            Chat
-          </button>
-          <button class={s.view === "provider" ? "seg-on" : ""} onClick={async () => {
-            setState({ view: "provider" });
-            // The pane's own effect auto-mounts the selected profile; nothing to
-            // do here besides keeping Rust's stored rect in sync.
-            await cmd.webviewMode("provider").catch(() => {});
-          }}>
-            Provider
-          </button>
-        </div>
-        {running ? (
-          <button class="tb-stop" title="Stop the agent (Esc-safe: also Ctrl+Alt+Shift+X)" onClick={() => cmd.taskStop().catch((e) => console.error(e))}>■ Stop</button>
-        ) : null}
-        <button class="tb-btn" title="Terminal" onClick={() => setState((st) => ({ terminalOpen: !st.terminalOpen }))}>
-          <svg viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" stroke="currentColor" /><path d="M4 6l2.5 2L4 10M8 10h4" stroke="currentColor" fill="none" /></svg>
+      <div class="topbar-context" data-tauri-drag-region>{s.view === "chat" ? workspace : viewLabel(s.view)}</div>
+      <div class="topbar-right">
+        {running ? <button class="topbar-stop" onClick={() => cmd.taskStop().catch((e) => toast("error", String(e)))}>Stop</button> : null}
+        <button class="upgrade-button" title="Open provider and app settings" onClick={() => {
+          setState({ settingsOpen: true });
+          toast("info", "Neelima has no paid plan. Configure your providers and app preferences in Settings.");
+        }}>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5 11.8 8l5.7 2-5.7 2L10 17.5 8.2 12l-5.7-2 5.7-2L10 2.5Z" /><path d="m16 2 .7 2.1L19 5l-2.3.8L16 8l-.8-2.2L13 5l2.2-.9L16 2Z" /></svg>
+          Upgrade
         </button>
-        <button class="tb-btn" title="Minimize" onClick={() => win.minimize()}>─</button>
-        <button class="tb-btn" title="Maximize" onClick={() => win.toggleMaximize()}>□</button>
-        <button class="tb-btn tb-close" title="Close" onClick={() => win.close()}>✕</button>
+        <button class="window-button terminal-control" title="Terminal" onClick={() => setState({ terminalOpen: !s.terminalOpen })}>
+          <svg viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="3" /><path d="m6 8 2.2 2-2.2 2M10.5 12h3" /></svg>
+        </button>
+        <button class="window-button" title="Minimize" onClick={() => windowAction("minimize")}>−</button>
+        <button class="window-button" title="Maximize" onClick={() => windowAction("toggleMaximize")}>□</button>
+        <button class="window-button window-close" title="Close" onClick={() => windowAction("close")}>×</button>
       </div>
     </header>
   );
+}
+
+function windowAction(action: "minimize" | "toggleMaximize" | "close") {
+  try {
+    const win = getCurrentWindow();
+    const result = action === "minimize" ? win.minimize() : action === "toggleMaximize" ? win.toggleMaximize() : win.close();
+    result.catch((error) => toast("error", `Window ${action} failed: ${String(error)}`));
+  } catch (error) {
+    toast("error", `Window ${action} is available only inside the Neelima desktop app: ${String(error)}`);
+  }
+}
+
+function viewLabel(view: string) {
+  return ({
+    provider: "Your connected AI workspace",
+    automations: "Automations",
+    marketplace: "Plugin marketplace",
+    search: "Search your task history",
+    task: "Past task · read only",
+    files: "Project files",
+  } as Record<string, string>)[view] ?? "Neelima";
 }
 
 export default TitleBar;

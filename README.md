@@ -181,11 +181,14 @@ Chunked writes via `append: true` because chat replies have length limits.
 ## Safety model
 
 - **Workspace confinement**: every path is rejected unless it canonicalizes inside the workspace root (traversal, absolute paths, Windows device names, and symlink escapes are refused — enforced on every tool).
-- **Permission modes**: *Ask every time* · *Auto-approve reads, ask for writes/commands* · *Full access inside workspace* (**default**). With FullAccess, reads, writes and commands inside the workspace are auto-approved — no per-click approvals during the agent loop. Writes/edits still show a CodeMirror-6 merge diff before approval. Switch to *Ask every time* or *Ask writes* in Settings if you want to review each action.
+- **Permission modes**: *Ask every time* (**default**) · *Auto-approve reads, ask for writes/commands* · *Full access inside workspace*. Selecting Full access requires an explicit confirmation. Destructive commands still require approval; writes/edits show a CodeMirror-6 merge diff before approval.
 - **Command guard**: user-editable allow/deny lists on top of non-removable destructive patterns (`rm -rf /`, `format`, `shutdown`, `reg add`, `curl | sh`, `-enc` PowerShell, …). cwd is forced inside the workspace; timeouts and process-tree kill are built in.
+- **Process handling**: command and helper processes run without Windows console windows; cancelling a command kills its process tree. The integrated terminal remains interactive and visible inside the app.
 - **Untrusted content**: files, command output and web pages are *data, not instructions* (stated in the preamble). Suspected prompt-injection text is flagged with a warning badge.
 - **Emergency stop**: global hotkey (default `Ctrl+Alt+Shift+X`) kills running commands and halts the loop.
-- **Checkpoints**: git snapshots in `<workspace>/.neelima/checkpoints.git` (bare repo; your own git history is untouched). Every write batch is preceded by a snapshot; the chat shows a one-click **files changed +N −N · Undo** card.
+- **Checkpoints**: git snapshots in `<workspace>/.neelima/checkpoints.git` (bare repo; your own git history is untouched). Every write batch is preceded by a snapshot. Known secret-bearing paths (`.env*` except example/sample/template files, private-key/certificate extensions, SSH private-key names, and common credentials JSON names) are excluded from new snapshots and kept in the workspace. This is a filename-based safeguard, not a secret scanner; review what you checkpoint, and rotate any secret already present in an older snapshot. Restoring a snapshot previews file counts, asks for confirmation, and creates a pre-restore backup; it removes only files tracked by the checkpoint index and preserves newly created untracked files.
+- **Settings recovery**: malformed settings are backed up before defaults are loaded. If the backup cannot be created, startup reports an error rather than silently discarding the file.
+- **Diagnostics**: startup and configuration warnings are appended to `neelima.log` in the OS-specific app data directory, with a single rotated backup.
 
 ## Provider isolation (the hard constraint, kept)
 
@@ -197,7 +200,7 @@ Chunked writes via `append: true` because chat replies have length limits.
 
 ## Local models
 
-- **Ollama**: `GET /api/tags` + `POST /api/chat` (streaming, NDJSON).
+- **Ollama**: `GET /api/tags` + `POST /api/chat` (streaming, NDJSON). Context window (`num_ctx`, default 8192) and temperature (default 0.7) are configurable in Settings.
 - **LM Studio**: OpenAI-compatible `http://localhost:1234/v1` (`/models`, `/chat/completions`, SSE streaming).
 - Same ` ```tool ` protocol by default. Settings: base URL, model picker (live from the server), context window, temperature. Cancel aborts the stream immediately. The **only** network destinations in the entire binary are `127.0.0.1` and the pages you load in the webview.
 
@@ -233,10 +236,18 @@ Prereqs: Rust (MSVC on Windows), Node 20+, and on Linux `libwebkit2gtk-4.1-dev l
 
 ```bash
 npm --prefix ui install
-npm --prefix ui run build      # or let tauri build do it
+npm --prefix ui run build      # required before a plain cargo build
 cd src-tauri && cargo test     # unit tests: protocol, confinement, tools, guard
+cargo build --release          # standalone app; serves the bundled UI
 npx --prefix ui tauri build    # release + installer for your OS
 ```
+
+`tauri build` runs the UI build automatically; plain `cargo build --release`
+expects `ui/dist` to have been built already.
+
+Use `npx --prefix ui tauri dev` for development; Tauri starts the Vite server
+automatically using `beforeDevCommand`. Release builds use the bundled UI and do
+not require a localhost server.
 
 ### Signed Windows releases
 

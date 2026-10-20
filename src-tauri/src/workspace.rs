@@ -129,9 +129,28 @@ fn is_windows_device_name(name: &str) -> bool {
     let stem = upper.split('.').next().unwrap_or("");
     matches!(
         stem,
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
-            | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6"
-            | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     )
 }
 
@@ -179,7 +198,9 @@ mod tests {
             // Windows requires privileges for dir symlinks; test an absolute path
             // that lexically points outside instead.
             let ws = Workspace::open(&dir).unwrap();
-            assert!(ws.resolve("C:\\Windows\\System32\\drivers\\etc\\hosts").is_err());
+            assert!(ws
+                .resolve("C:\\Windows\\System32\\drivers\\etc\\hosts")
+                .is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
     }

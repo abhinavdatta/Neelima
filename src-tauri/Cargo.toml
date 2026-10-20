@@ -15,11 +15,9 @@ name = "neelima"
 path = "src/main.rs"
 
 [features]
-# This feature is REQUIRED for release/standalone builds: it makes the app serve
-# the bundled UI assets (frontendDist) instead of expecting the Vite dev server
-# at http://localhost:1420. `tauri build` enables it automatically; plain
-# `cargo build --release` does NOT, which produced the "localhost refused to
-# connect" error page.
+# Use the bundled UI by default so standalone builds do not depend on a Vite
+# server. `tauri dev` starts the Vite server through beforeDevCommand.
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]

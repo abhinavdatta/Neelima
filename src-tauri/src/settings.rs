@@ -130,22 +130,32 @@ impl SettingsStore {
             Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    // F2: a corrupt settings.json must not abort startup with a
-                    // message that lies about "defaults loaded". Back the bad
-                    // file up, load real defaults, keep going.
                     let backup = config_dir.join(format!(
                         "settings.corrupt-{}.json",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
+                        uuid::Uuid::new_v4().simple()
                     ));
-                    let _ = std::fs::rename(&path, &backup);
-                    eprintln!("[settings] settings.json invalid ({e}); backed up to {} and loaded defaults", backup.display());
+                    std::fs::rename(&path, &backup).map_err(|backup_err| {
+                        format!(
+                            "settings.json is invalid ({e}) and could not be backed up to {}: {backup_err}",
+                            backup.display()
+                        )
+                    })?;
+                    if let Err(log_error) = crate::app_log::write(
+                        "settings",
+                        &format!(
+                            "settings.json invalid ({e}); backed up to {} and loaded defaults",
+                            backup.display()
+                        ),
+                    ) {
+                        eprintln!(
+                            "[settings] settings were backed up, but file logging failed: {log_error}"
+                        );
+                    }
                     Settings::default()
                 }
             },
-            Err(_) => Settings::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
         };
         Ok(SettingsStore {
             path,
@@ -158,37 +168,29 @@ impl SettingsStore {
     }
 
     pub fn set(&self, next: Settings) -> Result<Settings, String> {
-        // serde validation happened during deserialization of `next` at the
-        // command boundary; re-validate invariants here.
-        if next.max_iterations == 0 || next.max_iterations > 200 {
-            return Err("max_iterations must be 1..=200".into());
-        }
-        if next.result_cap_bytes < 1024 || next.result_cap_bytes > 1024 * 1024 {
-            return Err("result_cap_bytes must be 1KB..1MB".into());
-        }
-        {
-            let mut cur = self.inner.lock().unwrap();
-            *cur = next;
-        }
-        self.save()?;
-        Ok(self.get())
+        validate_settings(&next)?;
+        let mut current = self.inner.lock().unwrap();
+        self.save(&next)?;
+        *current = next;
+        Ok(current.clone())
     }
 
     pub fn patch<F: FnOnce(&mut Settings)>(&self, f: F) -> Result<Settings, String> {
-        let next = {
-            let mut cur = self.inner.lock().unwrap();
-            f(&mut cur);
-            cur.clone()
-        };
-        self.set(next)
+        let mut current = self.inner.lock().unwrap();
+        let mut next = current.clone();
+        f(&mut next);
+        validate_settings(&next)?;
+        self.save(&next)?;
+        *current = next;
+        Ok(current.clone())
     }
 
-    fn save(&self) -> Result<(), String> {
+    fn save(&self, settings: &Settings) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(&self.get()).map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
         Ok(())
@@ -199,17 +201,49 @@ impl SettingsStore {
     }
 }
 
+fn validate_settings(next: &Settings) -> Result<(), String> {
+    if next.max_iterations == 0 || next.max_iterations > 200 {
+        return Err("max_iterations must be 1..=200".into());
+    }
+    if next.result_cap_bytes < 1024 || next.result_cap_bytes > 1024 * 1024 {
+        return Err("result_cap_bytes must be 1KB..1MB".into());
+    }
+    for (name, provider) in [
+        ("Ollama", next.providers.ollama.as_ref()),
+        ("LM Studio", next.providers.lmstudio.as_ref()),
+    ] {
+        if let Some(provider) = provider {
+            if provider
+                .num_ctx
+                .is_some_and(|n| !(1..=1_048_576).contains(&n))
+            {
+                return Err(format!("{name} context window must be 1..=1048576"));
+            }
+            if provider
+                .temperature
+                .is_some_and(|t| !t.is_finite() || !(0.0..=2.0).contains(&t))
+            {
+                return Err(format!("{name} temperature must be 0..=2"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn always_ask_patterns() -> &'static [&'static str] {
     &[
         // D6: deletes targeting home / parents / outside the workspace /
         // drive roots. Matched case-insensitively.
-        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(~|\$HOME|%USERPROFILE%)([/\\\s]|$)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE)([/\\\s]|$)",
         r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+\.\.(\s|/|$)",
-        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/\*|[a-z]:\\)(\s|$)",
-        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/[a-z]|~?/|\$HOME|\%USERPROFILE%|[a-z]:\\|\.\.)",
-        r"\b(rmdir|rd)\s+(/[sq]\s*)+.*(~|\$HOME|%USERPROFILE%|[a-z]:\\|[a-z]:\s*$|\.\.)",
-        r"\bdel\s+(/[qfs]\s*)+.*(~|\$HOME|%USERPROFILE%|[a-z]:\\|\.\.)",
-        r"\bremove-item\b.*(-recurse|-force).*([a-z]:\\|\.\.|~|\$HOME|%USERPROFILE%)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/\*|[a-z]:[/\\]?)(\s|$)",
+        r"\brm\s+(-[a-z]+\s+)*(-[a-z]+\s+)+(/[a-z]|~?/|\$HOME|\%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]?|\.\.)",
+        r"\b(rmdir|rd)\s+(/[sq]\s*)+.*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|[a-z]:\s*$|\.\.)",
+        r"\b(rmdir|rd)\b[^|;]*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.)[^|;]*(/s|/q|-recurse|-force)",
+        r"\bdel\s+(/[qfs]\s*)+.*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.)",
+        r"\bdel\b[^|;]*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.)[^|;]*(/s|/q|/f)",
+        r"\bremove-item\b.*(-recurse|-force).*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.)",
+        r"\bremove-item\b.*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.).*(-recurse|-force)",
         r"\brm\s+-[^ ]*r[^ ]*\s+/\*",
         r#"\bshutil\.rmtree\b\s*\(\s*(['"])~?[\w.]*/[a-z]"#,
         // Destructive git
@@ -236,7 +270,8 @@ pub fn default_deny_patterns() -> &'static [&'static str] {
         r"\bdel\s+(/[sqf]\s*)+.*[a-z]:\\",
         r"\bformat\s+[a-z]:",
         r"\b(shutdown|reboot|halt|poweroff)\b",
-        r"\breg(es?edit)?\s+(add|delete|edit|import|restore)\b", r"\bregedit\b",
+        r"\breg(es?edit)?\s+(add|delete|edit|import|restore)\b",
+        r"\bregedit\b",
         r"\bdiskpart\b|\bbcdedit\b|\bmkfs\b",
         r"\bdd\s+if=.*of=/dev/",
         r"(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b",
@@ -248,4 +283,118 @@ pub fn default_deny_patterns() -> &'static [&'static str] {
         r"\btaskkill\s+/f\s+/im\s+(explorer|csrss|wininit|svchost)",
         r"\bmv\b\s+.*\s+/dev/null",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permissions_default_to_ask_all() {
+        let settings = Settings::default();
+        assert_eq!(settings.permission_mode, PermissionMode::AskAll);
+        assert!(!settings.permission_mode.auto_approve_read());
+        assert!(!settings.permission_mode.auto_approve_write());
+        assert!(!settings.permission_mode.auto_approve_command());
+    }
+
+    #[test]
+    fn local_model_context_and_temperature_are_validated() {
+        let dir = std::env::temp_dir().join(format!("neelima-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+        let mut settings = Settings::default();
+        settings.providers.ollama = Some(LocalProvider {
+            url: "http://localhost:11434".into(),
+            model: None,
+            context_chars: None,
+            temperature: Some(0.7),
+            num_ctx: Some(0),
+        });
+        assert!(store.set(settings.clone()).is_err());
+        settings.providers.ollama.as_mut().unwrap().num_ctx = Some(8192);
+        settings.providers.ollama.as_mut().unwrap().temperature = Some(2.1);
+        assert!(store.set(settings.clone()).is_err());
+        settings.providers.ollama.as_mut().unwrap().temperature = Some(0.7);
+        assert!(store.set(settings).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_settings_are_backed_up_before_defaults_load() {
+        let dir =
+            std::env::temp_dir().join(format!("neelima-settings-corrupt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+        std::fs::write(&settings_path, b"{invalid json").unwrap();
+
+        let store = SettingsStore::load(&dir).unwrap();
+        assert_eq!(store.get().hotkey, DEFAULT_HOTKEY);
+        assert!(!settings_path.exists());
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.corrupt-")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_patch_does_not_mutate_in_memory_settings() {
+        let dir =
+            std::env::temp_dir().join(format!("neelima-settings-patch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+
+        assert!(store.patch(|settings| settings.max_iterations = 0).is_err());
+        assert_eq!(store.get().max_iterations, DEFAULT_MAX_ITERATIONS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_can_be_replaced_repeatedly() {
+        let dir =
+            std::env::temp_dir().join(format!("neelima-settings-repeat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+
+        let first = Settings {
+            max_iterations: 30,
+            ..Default::default()
+        };
+        store.set(first).unwrap();
+        let second = Settings {
+            max_iterations: 40,
+            ..Default::default()
+        };
+        store.set(second).unwrap();
+
+        let persisted: Settings =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(persisted.max_iterations, 40);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_save_does_not_publish_new_settings_in_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("neelima-settings-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked_path = dir.join("settings.json");
+        std::fs::create_dir(&blocked_path).unwrap();
+        let store = SettingsStore {
+            path: blocked_path,
+            inner: Mutex::new(Settings::default()),
+        };
+        let next = Settings {
+            max_iterations: 99,
+            ..Default::default()
+        };
+
+        assert!(store.set(next).is_err());
+        assert_eq!(store.get().max_iterations, DEFAULT_MAX_ITERATIONS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

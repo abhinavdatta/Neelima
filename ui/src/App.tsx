@@ -1,5 +1,5 @@
-// App shell: wires the event channel, loads settings/providers/tasks, renders
-// the ZCode-style layout (sidebar / titlebar / content / composer).
+// App shell: wires the event channel, restores the active workspace, and renders
+// the rail / floating panel / home / composer layout.
 import { useEffect } from "preact/hooks";
 import { listen } from "./tauri";
 import { cmd } from "./tauri";
@@ -29,6 +29,14 @@ export function App() {
         const wl = await cmd.workspaceList();
         const active = wl.workspaces.find((w: any) => w.id === wl.active);
         setState({ workspaces: wl.workspaces, activeWorkspace: wl.active, activeWorkspacePath: active?.path ?? null });
+        if (active) {
+          try {
+            await cmd.workspaceUse(active.id);
+          } catch (e) {
+            setState({ activeWorkspace: null, activeWorkspacePath: null });
+            toast("warn", `Saved project folder is unavailable: ${String(e)}`);
+          }
+        }
         const [adapters, providers, tasks] = await Promise.all([cmd.adaptersList(), cmd.providersList(), cmd.historyTasks()]);
         setState({ adapters, providers, tasks });
         const preferred = inferPreferredProvider(settings, providers);
@@ -50,16 +58,23 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const showTree = !!s.activeWorkspacePath && (s.view === "chat" || s.view === "task");
+  useEffect(() => {
+    if (s.view !== "provider") {
+      cmd.webviewMode("chat").catch((e) => toast("error", `Could not hide the provider view: ${String(e)}`));
+    }
+  }, [s.view]);
+
+  const showWelcome = s.view === "chat" && s.entries.length === 0;
 
   return (
     <div id="app">
       <Sidebar />
-      {showTree ? <FileTree /> : null}
-      <main class="main">
+      <main class="main-panel">
         <TitleBar />
+        {showWelcome ? <Welcome /> : null}
         <section class="content">
           {s.view === "chat" || s.view === "task" ? <Chat /> : null}
+          {s.view === "files" ? <FileTree /> : null}
           {s.view === "provider" ? <ProviderPane /> : null}
           {s.view === "automations" ? <AutomationsPane /> : null}
           {s.view === "marketplace" ? <MarketplacePane /> : null}
@@ -76,6 +91,47 @@ export function App() {
         ))}
       </div>
     </div>
+  );
+}
+
+function Welcome() {
+  const s = useStore();
+  return (
+    <section class="welcome">
+      <div class="welcome-hero">
+        <div>
+          <h1>Hi there, Ready to Achieve Great Things?</h1>
+          <p>{s.activeWorkspacePath ? `Working in ${s.activeWorkspacePath}` : "Choose a project folder to give your assistant a place to work."}</p>
+        </div>
+        <div class="mascot-scene" aria-hidden="true">
+          <div class="mascot-bubble">Hey there! <span>👋</span><br />Need a boost?</div>
+          <div class="mascot">
+            <div class="robot-antenna" />
+            <div class="robot-head"><div class="robot-visor"><i /><i /></div></div>
+            <div class="robot-neck" />
+            <div class="robot-body"><span /></div>
+            <div class="robot-arm arm-left" /><div class="robot-arm arm-right" />
+          </div>
+        </div>
+      </div>
+      <div class="feature-grid">
+        <button class="feature-card" onClick={() => setState({ composerText: "Help me contribute ideas and organize the work in this project." })}>
+          <span class="feature-icon layers-icon" aria-hidden="true"><i /><i /><i /></span>
+          <span class="feature-copy">Contribute ideas, offer feedback, and manage tasks — all in sync.</span>
+          <span class="feature-label">Fast Start</span>
+        </button>
+        <button class="feature-card" onClick={() => setState({ composerText: "Help me collaborate on this project: summarize the context, suggest next steps, and identify what needs alignment." })}>
+          <span class="feature-icon team-icon" aria-hidden="true"><i /><i /><i /><i /><i /></span>
+          <span class="feature-copy">Stay connected, share ideas, and align goals effortlessly. Boost your productivity with AI.</span>
+          <span class="feature-label">Collaborate with Team</span>
+        </button>
+        <button class="feature-card" onClick={() => setState({ composerText: "Help me plan my next steps for this project and prioritize the work." })}>
+          <span class="feature-icon calendar-icon" aria-hidden="true"><b>31</b></span>
+          <span class="feature-copy">Organize your time efficiently, set clear priorities, and stay focused.</span>
+          <span class="feature-label">Planning</span>
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -113,7 +169,7 @@ function handleEvent(p: any) {
       break;
     case "provider-login-required":
       toast("warn", `Please log into ${p.adapter} inside the provider view.`);
-      setState({ view: "provider" });
+      setState({ view: "provider", providerLoginWaiting: true, providerLoginState: "logged_out" });
       break;
     case "term-data":
       window.dispatchEvent(new CustomEvent("term-data", { detail: p }));
@@ -125,20 +181,31 @@ function handleEvent(p: any) {
       toast(p.level ?? "info", p.text ?? "");
       break;
     case "provider-mounted":
-      setState({ providerMounted: true });
+      setState({ providerMounted: true, providerLoginState: "unknown", providerBridgeError: null });
       break;
     case "provider-unmounted":
-      setState({ providerMounted: false });
+      setState({ providerMounted: false, providerLoginState: "unknown", providerBridgeError: null });
       break;
     case "provider-login-waiting":
       setState({ providerLoginWaiting: true, view: "provider" });
       break;
+    case "provider-login-state":
+      setState({
+        providerLoginState: p.state ?? "unknown",
+        providerLoginWaiting: p.state === "logged_out",
+        providerBridgeError: p.state === "unknown" ? (p.reason ?? "Page state is unknown") : null,
+      });
+      break;
     case "provider-bridge-unreachable":
       // The chip would keep lying "Waiting for login…" — say what's actually wrong.
       toast("warn", `Can't reach the embedded ${p.adapter} page (bridge). Reopen the provider view; if it persists, restart Neelima.`);
+      setState({
+        providerLoginWaiting: false,
+        providerBridgeError: p.reason ?? "Can't reach the embedded provider page",
+      });
       break;
     case "provider-login-complete":
-      setState({ providerLoginWaiting: false, providerMounted: true });
+      setState({ providerLoginWaiting: false, providerMounted: true, providerLoginState: "logged_in", providerBridgeError: null });
       break;
     case "adapters-reloaded":
       cmd.adaptersList().then((a) => setState({ adapters: a })).catch(() => {});

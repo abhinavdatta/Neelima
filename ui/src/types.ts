@@ -2,7 +2,7 @@
 
 export interface WorkspaceEntry { id: string; name: string; path: string }
 export interface WebProfile { id: string; adapter_id: string; name: string }
-export interface LocalCfg { url: string; model?: string | null; context_chars?: number | null; temperature?: number | null }
+export interface LocalCfg { url: string; model?: string | null; context_chars?: number | null; temperature?: number | null; num_ctx?: number | null }
 export interface Adapter {
   id: string; name: string; url: string; built_in: boolean;
   selectors: { input: string; send_button: string; stop_button?: string | null; messages: string; new_chat?: string | null; logged_in?: string | null; logged_out?: string | null };
