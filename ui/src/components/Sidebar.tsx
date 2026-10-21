@@ -15,7 +15,7 @@ function TaskItem({ t }: { t: TaskMeta }) {
   const open = async () => {
     try {
       const entries = await cmd.historyOpen(t.id);
-      setState({ entries, openTask: t, view: "task", pendingCalls: [], agentState: t.status === "done" ? "done" : "idle" });
+      setState({ entries, openTask: t, view: "chat", pendingCalls: [], taskId: null });
     } catch (e) { toast("error", String(e)); }
   };
 
@@ -88,8 +88,15 @@ export function Sidebar() {
   return (
     <aside class="sidebar">
       <nav class="rail-nav" aria-label="Main navigation">
-        <button class="rail-button rail-new" title={s.activeWorkspacePath ? "New task" : "Choose a project folder"} aria-label={s.activeWorkspacePath ? "New task" : "Choose a project folder"} onClick={start}>
-          <Icon name="add" />
+        <button class="rail-button rail-logo" title="Neelima home" aria-label="Neelima home" onClick={start}><span class="rail-logo-mark">N</span></button>
+        <button class={`rail-button ${s.settingsOpen ? "active" : ""}`} title="Settings" aria-label="Open Settings" aria-expanded={s.settingsOpen} onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>
+          <Icon name="settings" size={19} />
+        </button>
+        <button class="rail-button rail-new" title={s.activeWorkspacePath ? "Select a new project folder" : "Select a project folder"} aria-label="Select project folder" onClick={() => void addWorkspace()}>
+          <Icon name="folder" />
+        </button>
+        <button class={`rail-button ${s.view === "provider" ? "active" : ""}`} title="Provider sign-in / Browse" aria-label="Provider sign-in" onClick={() => { setPanel(null); setState({ view: "provider", providerAuthOpen: !s.providerMounted }); }}>
+          <Icon name="compass" />
         </button>
         <button class={`rail-button ${s.view === "search" ? "active" : ""}`} title="Search" aria-label="Search" onClick={() => { setPanel(null); setState({ view: "search" }); }}>
           <Icon name="search" />
@@ -122,17 +129,10 @@ export function Sidebar() {
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "files" }); }}>Browse project files</button>
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "automations" }); }}>Automations</button>
               <button class="rail-action" onClick={() => { setPanel(null); setState({ view: "marketplace" }); }}>Plugin marketplace</button>
-              <button class="rail-action" onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>Settings</button>
             </>
           )}
         </div>
       ) : null}
-      <div class="rail-bottom">
-        <button class={`rail-button rail-settings ${s.settingsOpen ? "active" : ""}`} title="Settings" aria-label="Open Settings" aria-expanded={s.settingsOpen} onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>
-          <Icon name="settings" size={19} />
-        </button>
-        <button class="rail-logo" title="Neelima home" aria-label="Neelima home" onClick={start}>N</button>
-      </div>
     </aside>
   );
 }

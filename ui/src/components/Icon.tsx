@@ -5,7 +5,8 @@ export type IconName =
   | "close" | "folder" | "more" | "chevron" | "terminal"
   | "minimize" | "maximize" | "restore" | "arrow-up-right"
   | "code" | "layers" | "send" | "move" | "refresh" | "chevron-left"
-  | "chevron-right" | "arrow-left" | "clock" | "check" | "alert" | "mail";
+  | "chevron-right" | "arrow-left" | "clock" | "check" | "alert" | "mail"
+  | "compass";
 
 const paths: Record<IconName, JSX.Element> = {
   add: <path d="M12 5v14M5 12h14" />,
@@ -35,6 +36,7 @@ const paths: Record<IconName, JSX.Element> = {
   check: <path d="m5 12 4 4L19 6" />,
   alert: <><path d="m12 3 10 18H2L12 3Z" /><path d="M12 9v4m0 3h.01" /></>,
   mail: <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3 7 9 6 9-6" /></>,
+  compass: <><circle cx="12" cy="12" r="9" /><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z" /></>,
 };
 
 export function Icon({ name, size = 20, class: className, ...props }: { name: IconName; size?: number; class?: string } & JSX.SVGAttributes<SVGSVGElement>) {

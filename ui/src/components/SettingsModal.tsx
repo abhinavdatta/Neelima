@@ -6,6 +6,7 @@ import { cmd } from "../tauri";
 import type { Settings } from "../types";
 import { Icon } from "./Icon";
 import { DEFAULT_CUSTOM_THEME, parseCustomTheme } from "../theme";
+import { SkillsPanel } from "./SkillsPanel";
 
 export function SettingsModal() {
   const s = useStore();
@@ -117,6 +118,7 @@ export function SettingsModal() {
     { id: "appearance", label: "Appearance", icon: "spark" },
     { id: "providers", label: "Providers", icon: "grid" },
     { id: "models", label: "Local models", icon: "terminal" },
+    { id: "skills", label: "Skills", icon: "code" },
     { id: "safety", label: "Safety", icon: "settings" },
     { id: "about", label: "About", icon: "mail" },
   ] as const;
@@ -291,6 +293,12 @@ export function SettingsModal() {
             <button class="ghost" title={dirty ? "Save settings before testing the draft URL" : "Test the saved LM Studio URL"} disabled={!!s.settings && (draft.providers.lmstudio?.url || "http://localhost:1234") !== (s.settings.providers.lmstudio?.url || "http://localhost:1234")} onClick={() => void testLocal("lmstudio")}>Test</button>
             {localStatus.lmstudio ? <small class="local-status">{localStatus.lmstudio}</small> : null}
           </div>
+        </section> : null}
+
+        {activeTab === "skills" ? <section class="skills-settings-section">
+          <h3>Skills</h3>
+          <p class="dim">Skills add reusable guidance you can attach to any task from the composer. Their text is untrusted: they cannot change permissions or run anything.</p>
+          <SkillsPanel />
         </section> : null}
 
         {activeTab === "safety" ? <section>
