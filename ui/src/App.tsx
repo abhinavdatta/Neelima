@@ -3,7 +3,8 @@
 import { useEffect } from "preact/hooks";
 import { listen } from "./tauri";
 import { cmd } from "./tauri";
-import { getState, setState, toast, useStore } from "./store";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getState, setState, toast, useStore, resetTask } from "./store";
 import Sidebar from "./components/Sidebar";
 import FileTree from "./components/FileTree";
 import TitleBar, { WindowMoveStrip } from "./components/TitleBar";
@@ -18,6 +19,8 @@ import TerminalPanel from "./components/TerminalPanel";
 import DiffModal from "./components/DiffModal";
 import { Icon } from "./components/Icon";
 import { DEFAULT_CUSTOM_THEME, parseCustomTheme, THEME_TOKENS } from "./theme";
+import { describePushRejection, reduceProviderRequestEvent, reduceStreamEvent } from "./providerStatus";
+import { noteSecretClick } from "./easterEggs";
 import "./styles.css";
 
 let earlyTaskEvents: any[] = [];
@@ -82,11 +85,22 @@ export function App() {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.ctrlKey && ev.key.toLowerCase() === "n") {
         ev.preventDefault();
-        import("./store").then((m) => m.resetTask());
+        resetTask();
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // Independent viewport-fit path: the Rust resize handler re-fits the UI
+    // webview, but a missed window-resize event leaves the webview stale and
+    // oversized, which pushed centered modals past the visible window edge.
+    // The webview's own window-resize event is a second, independent trigger.
+    const unResize = getCurrentWindow().onResized(() => {
+      cmd.syncViewport().catch(() => {});
+    });
+    cmd.syncViewport().catch(() => {});
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      unResize.then((unlisten) => unlisten()).catch(() => {});
+    };
   }, []);
 
   useEffect(() => {
@@ -95,6 +109,11 @@ export function App() {
   }, [s.view, s.settingsOpen]);
 
   const showWelcome = s.view === "chat" && s.entries.length === 0;
+  // Route-aware shell: the persistent composer belongs to chat surfaces only
+  // (home + active conversation). Settings, provider, marketplace,
+  // automations, files and search are not chat sessions. The draft lives in
+  // the store (composerText), so hiding the composer never discards input.
+  const showComposer = (s.view === "chat" || s.view === "task") && !s.settingsOpen;
 
   return (
     <div id="app">
@@ -112,7 +131,7 @@ export function App() {
             {s.view === "marketplace" ? <MarketplacePane /> : null}
             {s.view === "search" ? <SearchPane /> : null}
           </section>
-          <Composer />
+          {showComposer ? <Composer /> : null}
           {s.terminalOpen ? <TerminalPanel /> : null}
         </main>
       </div>
@@ -133,7 +152,8 @@ function Welcome() {
     <section class="welcome">
       <div class="welcome-hero">
         <div>
-          <h1>Hi there, Ready to Achieve Great Things?</h1>
+          {/* 🥚 seven quick clicks tell you a secret (easterEggs.ts) */}
+          <h1 onClick={noteSecretClick}>Hi there, Ready to Achieve Great Things?</h1>
           <p title={s.activeWorkspacePath ?? undefined}>{s.activeWorkspacePath ? `Working in ${s.activeWorkspacePath}` : "Choose a project folder to give your assistant a place to work."}</p>
         </div>
       </div>
@@ -162,7 +182,8 @@ function inferPreferredProvider(settings: any, providers: any): string {
   if (providers?.web?.length) return `web:${providers.web[0].id}`;
   if (settings?.providers?.ollama?.model) return "ollama";
   if (settings?.providers?.lmstudio?.model) return "lmstudio";
-  return "manual";
+  // Manual copy/paste relay is an explicit fallback, never the default path.
+  return "ollama";
 }
 
 function handleEvent(p: any) {
@@ -176,6 +197,7 @@ function handleEvent(p: any) {
       setState((current) => ({
         taskId: p.task_id,
         agentState: current.agentState === "idle" ? "waiting_for_ai" : current.agentState,
+        streamText: "",
         taskStartedAt: current.taskStartedAt ?? Date.now(),
       }));
       if (matchesPendingRequest) {
@@ -203,13 +225,53 @@ function handleEvent(p: any) {
     }
   }
   switch (p.kind) {
+    case "bridge-approval-request":
+      // Browser-extension write request waiting for the user's decision.
+      // Shown as its own card (separate from agent-flow pendingCalls) so the
+      // two approval lifecycles never mix.
+      setState({
+        bridgeApproval: {
+          request_id: p.request_id,
+          tool: p.tool ?? "unknown",
+          args: p.args ?? null,
+          site: p.site ?? "generic",
+          risk: p.risk ?? "high",
+        },
+      });
+      break;
     case "agent-state":
-      setState({ agentState: p.state, agentText: p.text ?? null, taskStartedAt: st.taskStartedAt ?? (p.state === "waiting_for_ai" ? Date.now() : st.taskStartedAt) });
+      setState({
+        agentState: p.state,
+        agentText: p.text ?? null,
+        // The live preview belongs only to the model-wait phase; drop it as
+        // soon as the loop moves on (the final reply arrives as a transcript).
+        ...(p.state === "waiting_for_ai" ? {} : { streamText: "" }),
+        taskStartedAt: st.taskStartedAt ?? (p.state === "waiting_for_ai" ? Date.now() : st.taskStartedAt),
+      });
       if (p.text) toast(p.state === "error" ? "error" : "info", p.text);
       break;
+    case "assistant-stream": {
+      // Local model chunks (append). Step 2: chunks carry their request ID —
+      // a late chunk from a cancelled/finished request, or one belonging to a
+      // different provider/request, is dropped instead of polluting the
+      // current preview.
+      const chunk = reduceStreamEvent(st.providerRequest, p, "assistant-stream");
+      if (chunk && st.agentState === "waiting_for_ai") {
+        setState((s2) => ({ streamText: (s2.streamText + chunk.text).slice(-12000) }));
+      }
+      break;
+    }
+    case "assistant-partial": {
+      // Web provider preview: the page sends the accumulated tail, not a chunk.
+      const partial = reduceStreamEvent(st.providerRequest, p, "assistant-partial");
+      if (partial && st.agentState === "waiting_for_ai") {
+        setState({ streamText: partial.text });
+      }
+      break;
+    }
     case "transcript":
       if (p.entry) setState((s2) => s2.entries.some((entry) => entry.id === p.entry.id && entry.ts === p.entry.ts)
-        ? {} : { entries: [...s2.entries, p.entry] });
+        ? {} : { entries: [...s2.entries, p.entry], ...(p.entry.kind === "assistant" ? { streamText: "" } : {}) });
       break;
     case "approval-request":
       setState({ pendingCalls: p.pending_calls ?? [] });
@@ -237,10 +299,32 @@ function handleEvent(p: any) {
       toast(p.level ?? "info", p.text ?? "");
       break;
     case "provider-mounted":
-      setState({ providerMounted: true, providerLoginState: "unknown", providerBridgeError: null });
+      setState({ providerMounted: true, providerLoginState: "unknown", providerBridgeError: null, providerLoginReason: null, providerRequest: null, providerEventNote: null, providerEvents: [] });
       break;
     case "provider-unmounted":
-      setState({ providerMounted: false, providerLoginState: "unknown", providerBridgeError: null });
+      setState({ providerMounted: false, providerLoginState: "unknown", providerBridgeError: null, providerLoginReason: null, providerRequest: null, providerEventNote: null, providerEvents: [] });
+      break;
+    case "provider-request-state": {
+      const patch = reduceProviderRequestEvent(st.providerRequest, p);
+      if (!patch) break;
+      setState((s2) => ({
+        providerRequest: patch.providerRequest,
+        providerEventNote: null,
+        // Bounded UI-side diagnostic trail: proves which transitions actually
+        // reached the frontend. Metadata only.
+        providerEvents: [...s2.providerEvents, { state: patch.providerRequest.state, at: patch.providerRequest.at, requestId: patch.providerRequest.requestId }].slice(-20),
+        ...(patch.clearStream ? { streamText: "" } : {}),
+      }));
+      if (patch.toast) toast(patch.toast.level, patch.toast.text);
+      break;
+    }
+    case "assistant-push-rejected":
+      // Metadata only: the page's text was dropped by Rust. Record why so the
+      // wait card can explain a missing reply instead of silently spinning.
+      setState({ providerEventNote: describePushRejection(p) });
+      break;
+    case "provider-login-unverified":
+      setState({ providerLoginReason: p.reason ?? "Provider sign-in could not be verified; a send is still attempted." });
       break;
     case "provider-login-waiting":
       setState({ providerLoginWaiting: true, providerAuthOpen: true, view: "provider" });
@@ -251,6 +335,7 @@ function handleEvent(p: any) {
         providerLoginState: p.state ?? "unknown",
         providerLoginWaiting: p.state === "logged_out",
         providerBridgeError: p.state === "unknown" ? (p.reason ?? "Page state is unknown") : null,
+        providerLoginReason: p.state === "logged_in" ? null : (p.reason ?? null),
         ...(returnedToChat ? { view: "chat" as const, providerAuthOpen: false } : {}),
       });
       if (returnedToChat) toast("info", "Provider session ready. Continue in Neelima chat.");

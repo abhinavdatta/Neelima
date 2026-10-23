@@ -1,0 +1,26 @@
+[package]
+name = "neelima-native-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native messaging host for Neelima Browser Bridge extension"
+
+[[bin]]
+name = "neelima_native_host"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+dunce = "1"
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"

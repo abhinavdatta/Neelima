@@ -429,13 +429,22 @@ button { color: inherit; }
   width: 72px;
   min-width: 72px;
   height: 100%;
+  /* Slim left gutter: enough breathing room that the icons do not hug the
+     window border, without the wide empty strip the rail used to carry. */
   padding: 16px 0;
   align-items: flex-start;
   justify-content: flex-start;
   background: rgba(228, 224, 246, .82);
   border: 0;
 }
-.rail-nav, .rail-bottom { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.rail-nav, .rail-bottom { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 0 16px; }
+/* Primary nav stays at the top; the Settings group anchors to the bottom of
+   the rail. flex:none keeps both groups intact; margin-top:auto pushes the
+   bottom group down without absolute positioning. The rail scrolls only when
+   the window is too short to fit everything, so Settings stays reachable. */
+.rail-nav, .rail-bottom { flex: none; }
+.rail-bottom { margin-top: auto; padding-top: 8px; padding-bottom: 4px; }
+.sidebar { overflow-y: auto; }
 .rail-nav .rail-logo { margin-bottom: 4px; }
 .rail-logo-mark { font-weight: 700; font-size: 18px; line-height: 1; color: #fff; }
 .rail-button, .rail-logo {
@@ -493,6 +502,20 @@ button { color: inherit; }
 .rail-add, .rail-action { width: 100%; display: block; padding: 8px 10px; border-radius: 9px; text-align: left; color: #4a5060; font-size: 12px; }
 .rail-popover .cp-label { color: #4a5060; }
 .rail-popover .ghost { color: #697081; }
+.stream-block {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  border: 1px solid #e8e5f0;
+  border-radius: 12px;
+  background: rgba(255,255,255,.74);
+}
+.stream-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: #72798a; font-size: 12px; }
+.stream-dot { width: 7px; height: 7px; border-radius: 50%; background: #5665df; animation: stream-pulse 1.4s ease-in-out infinite; }
+@keyframes stream-pulse { 0%, 100% { opacity: .45; } 50% { opacity: 1; } }
+.stream-block pre { margin: 0; max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 "Cascadia Code", Consolas, monospace; color: #303749; }
+[data-theme="dark"] .stream-block { border-color: #393d48; background: rgba(37,40,50,.88); }
+[data-theme="dark"] .stream-head { color: #a2a8b6; }
+[data-theme="dark"] .stream-block pre { color: #e1e4ec; }
 .marketplace-tabs { display: flex; gap: 8px; margin: 10px 0 14px; border-bottom: 1px solid #e6e3ed; }
 .marketplace-tabs button { padding: 8px 12px; color: #72798a; border-bottom: 2px solid transparent; }
 .marketplace-tabs button.active { color: #0e1220; border-color: #5665df; font-weight: 650; }
@@ -534,7 +557,9 @@ button { color: inherit; }
   min-width: 0;
   min-height: 0;
   height: auto;
-  margin: 0 16px 16px 0;
+  /* Symmetric insets: equal gaps left (rail side) and right, matching the
+     bottom, so the floating panel reads centered instead of pinned up-left. */
+  margin: 12px 16px 16px 16px;
   padding: 0 32px;
   overflow: hidden;
   color: #0e1220;
@@ -549,7 +574,8 @@ button { color: inherit; }
 .window-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
 .window-move-strip {
   flex: none; height: 28px; display: flex; align-items: center; justify-content: center;
-  margin-right: 16px; color: #7f8798;
+  /* Match the panel's side insets so the drag pill centers over the panel. */
+  margin: 0 16px; color: #7f8798;
 }
 .window-move-button {
   display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
@@ -691,6 +717,9 @@ button { color: inherit; }
 .task-skills-panel label small { margin-left: auto; color: #82899a; }
 .task-skills-panel .task-skill-budget { justify-content: space-between; margin-top: 4px; }
 .task-skill-budget input { width: 100px; padding: 5px; border: 1px solid #ddd9e9; border-radius: 7px; }
+.task-context-picker .context-path { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "Cascadia Mono", Consolas, monospace; font-size: 11.5px; }
+.task-context-picker .task-skills-panel label { align-items: center; }
+.task-context-picker summary { font-variant-numeric: tabular-nums; }
 .menu { z-index: 90; bottom: calc(100% + 8px); left: 0; color: #1c2130; background: #fff; border-color: #edeaf5; border-radius: 12px; box-shadow: 0 12px 34px rgba(45,38,83,.15); }
 .composer-meta > .composer-menu-anchor .menu { left: auto; right: 0; }
 .menu button { color: #353b4b; }
@@ -1033,7 +1062,7 @@ button { color: inherit; }
   .rail-popover { left: 10px; right: 10px; bottom: 84px; top: auto; width: auto; max-height: 56dvh; }
   .window-shell { height: 100dvh; }
   .window-move-strip { height: 24px; margin: 0 10px; }
-  .main-panel { width: auto; height: calc(100dvh - 110px); margin: 0 10px 0; padding: 0 18px; border-radius: 24px; overflow-y: auto; }
+  .main-panel { width: auto; height: calc(100dvh - 110px); margin: 10px 10px 10px; padding: 0 18px; border-radius: 24px; overflow-y: auto; }
   .titlebar { height: 54px; grid-template-columns: 1fr auto; gap: 6px; }
   .topbar-context { display: none; }
   .topbar-right { gap: 3px; }
@@ -1110,6 +1139,9 @@ button { color: inherit; }
   width: min(940px, 94vw);
   height: min(760px, 86vh);
   max-height: 86vh;
+  /* Hard caps: even against a transiently stale viewport the dialog must
+     stay fully inside the visible window. */
+  max-width: calc(100vw - 24px);
   overflow: hidden;
   padding: 0;
 }
@@ -1195,4 +1227,18 @@ button { color: inherit; }
   .settings-panel { padding: 8px 16px 20px; }
   .settings-actions { bottom: 0; margin: 0; padding: 10px 12px; flex-wrap: wrap; }
   .settings-actions .dim { flex: 1 0 100%; }
+}
+
+/* 🥚 Konami party mode (easterEggs.ts): a soft inset glow that cycles colours
+   for 8 s, then the class is removed. Inset shadow only — zero layout impact. */
+@keyframes egg-party {
+  0% { box-shadow: inset 0 0 0 2px #ff5f6d; }
+  25% { box-shadow: inset 0 0 0 2px #ffc371; }
+  50% { box-shadow: inset 0 0 0 2px #35d0ba; }
+  75% { box-shadow: inset 0 0 0 2px #7c6cff; }
+  100% { box-shadow: inset 0 0 0 2px #ff5f6d; }
+}
+html.party-mode #app { animation: egg-party 2s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  html.party-mode #app { animation: none; box-shadow: inset 0 0 0 2px #7c6cff; }
 }

@@ -22,6 +22,11 @@ pub struct Selectors {
     /// several sites hide or replace the send button when the composer is
     /// empty, which makes an input+send check false-negative forever.
     pub logged_out: Option<String>,
+    /// Selector for the USER's own turn inside the conversation. Used to
+    /// confirm that a submitted prompt actually entered the chat. When absent,
+    /// the runtime falls back to a built-in provider list and finally to a
+    /// text match against the messages container.
+    pub user_message: Option<String>,
 }
 
 impl Default for Selectors {
@@ -34,6 +39,7 @@ impl Default for Selectors {
             new_chat: None,
             logged_in: None,
             logged_out: None,
+            user_message: None,
         }
     }
 }
@@ -358,8 +364,8 @@ mod tests {
                 .logged_in
                 .as_deref()
                 .unwrap()
-                .contains("prompt"),
-            "ChatGPT requires the composer selector to detect the logged-in state"
+                .contains("profile"),
+            "ChatGPT requires an account/profile marker to detect the logged-in state"
         );
     }
 

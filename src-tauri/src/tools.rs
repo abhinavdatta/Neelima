@@ -1037,4 +1037,120 @@ mod tests {
         std::fs::remove_dir_all(w.root()).ok();
         std::fs::remove_dir_all(&outside).ok();
     }
+
+    /// Phase 4: every absolute/UNC/verbatim/device form Windows users hit must
+    /// resolve through the same confinement check.
+    #[test]
+    fn windows_path_forms_cannot_escape_the_workspace() {
+        let w = ws("win-paths");
+        let s = crate::settings::Settings::default();
+        let cases = [
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "C:/Windows/win.ini",
+            "C:foo",
+            "\\\\server\\share\\payload.txt",
+            "//server/share/payload.txt",
+            "\\\\?\\C:\\Windows\\win.ini",
+            "\\\\.\\C:\\Windows\\win.ini",
+            "..\\..\\escape.txt",
+        ];
+        for path in cases {
+            for tool in ["read_file", "delete_file"] {
+                let out = execute(&w, &call("1", tool, json!({"path": path})), &s);
+                assert!(!out.ok, "{tool} must refuse {path:?}, got: {}", out.output);
+            }
+            let out = execute(
+                &w,
+                &call("1", "write_file", json!({"path": path, "content": "x"})),
+                &s,
+            );
+            assert!(!out.ok, "write_file must refuse {path:?}");
+        }
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// Phase 4: recursive deletion must never be available through the file
+    /// tool — only individual files, and only inside the workspace.
+    #[test]
+    fn delete_file_never_removes_directories() {
+        let w = ws("delete-dir");
+        let s = crate::settings::Settings::default();
+        std::fs::create_dir_all(w.root().join("keep-dir")).unwrap();
+        std::fs::write(w.root().join("keep-dir").join("f.txt"), "x").unwrap();
+        let out = execute(
+            &w,
+            &call("1", "delete_file", json!({"path":"keep-dir"})),
+            &s,
+        );
+        assert!(!out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("refusing to delete a directory"),
+            "{}",
+            out.output
+        );
+        assert!(w.root().join("keep-dir").is_dir(), "the directory survives");
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    #[test]
+    fn grep_and_list_dir_scope_arguments_are_confined() {
+        let w = ws("grep-scope");
+        let s = crate::settings::Settings::default();
+        std::fs::write(w.root().join("a.txt"), "token\n").unwrap();
+        for escape in ["../..", "C:\\Windows", "/etc"] {
+            let out = execute(
+                &w,
+                &call("1", "grep", json!({"pattern":"token","path": escape})),
+                &s,
+            );
+            assert!(!out.ok, "grep must refuse scope {escape:?}: {}", out.output);
+        }
+        // A tool that does not exist is rejected with the available list rather
+        // than being dispatched anywhere.
+        let out = execute(&w, &call("2", "rm_rf_all", json!({})), &s);
+        assert!(!out.ok);
+        assert!(out.output.contains("unknown tool"), "{}", out.output);
+        std::fs::remove_dir_all(w.root()).ok();
+    }
+
+    /// Best-effort Windows junction/symlink coverage. Creating either needs
+    /// Developer Mode or elevation; when the OS refuses, the test records that
+    /// instead of pretending it covered the case.
+    #[cfg(windows)]
+    #[test]
+    fn windows_symlink_or_junction_escape_is_refused_when_available() {
+        let w = ws("win-symlink");
+        let s = crate::settings::Settings::default();
+        let outside =
+            std::env::temp_dir().join(format!("neelima-outside-win-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+
+        let linked = match std::os::windows::fs::symlink_dir(&outside, w.root().join("out-link")) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "windows symlink unavailable ({e}); junction/symlink escape coverage skipped"
+                );
+                false
+            }
+        };
+        if linked {
+            let out = execute(
+                &w,
+                &call("1", "read_file", json!({"path":"out-link/secret.txt"})),
+                &s,
+            );
+            assert!(!out.ok, "symlink escape must fail: {}", out.output);
+            let out = execute(
+                &w,
+                &call("2", "delete_file", json!({"path":"out-link/secret.txt"})),
+                &s,
+            );
+            assert!(!out.ok, "delete through symlink must fail: {}", out.output);
+        }
+        let _ = &s;
+        std::fs::remove_dir_all(w.root()).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
 }

@@ -1,0 +1,13 @@
+{
+  "name": "neelima",
+  "private": true,
+  "scripts": {
+    "test:rust": "node scripts/test-rust.mjs",
+    "test:adapters": "node --test src-tauri/tests/adapter-runtime.test.js src-tauri/tests/adapter-runtime-jsdom.test.js src-tauri/tests/adapter-content.test.js",
+    "test:ui": "node --test ui/tests/provider-status.test.js ui/tests/provider-wait-card.test.js ui/tests/context-preview.test.js ui/tests/context-picker.test.js",
+    "test:extension": "node --test browser-extension/tests/background.test.js browser-extension/tests/protocol.test.js browser-extension/tests/scan-scheduler.test.js browser-extension/tests/provider-content-script.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

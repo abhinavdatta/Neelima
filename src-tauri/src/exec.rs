@@ -54,6 +54,19 @@ pub async fn run_command_streaming(
         None => ws.root().to_path_buf(),
     };
 
+    // Phase 4: refuse an empty command instead of handing the shell an empty
+    // program line, and clamp the untrusted timeout before it reaches the
+    // deadline arithmetic.
+    if command.trim().is_empty() {
+        return RunOutcome {
+            ok: false,
+            output: "run_command: missing command".into(),
+            timed_out: false,
+            killed: false,
+        };
+    }
+    let timeout_secs = timeout_secs.clamp(1, MAX_COMMAND_TIMEOUT_SECS);
+
     #[cfg(windows)]
     let mut cmd = {
         let mut c = hidden_tokio("cmd");
@@ -135,7 +148,7 @@ pub async fn run_command_streaming(
     let mut retained = String::new();
     let mut truncated = false;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut timed_out = false;
     let mut killed = false;
 
@@ -253,6 +266,96 @@ async fn kill_tree(pid: &u32) {
 #[cfg(unix)]
 pub fn is_process_group_leader_note() -> &'static str {
     "children run in setsid'd groups; kill -9 -PID takes the whole tree"
+}
+
+/// Hard ceiling for a single `run_command`, in seconds. The timeout comes from
+/// model output (`args.timeout`), so it is untrusted input: a value near
+/// `u64::MAX` used to overflow `Instant + Duration` and panic the agent task.
+pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
+
+/// Clamp an untrusted command timeout into a safe window.
+/// Returns the value to use and `None` when the input was adjusted.
+pub fn clamp_timeout(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
+        .clamp(1, MAX_COMMAND_TIMEOUT_SECS)
+}
+
+/// Default used when the model supplies no timeout (matches Settings default).
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 120;
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn tmp_ws() -> (std::path::PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!(
+            "neelima-exec-p4-{}",
+            uuid::Uuid::new_v4().simple().to_string()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::open(&dir).unwrap();
+        (dir, ws)
+    }
+
+    async fn run(ws: &Workspace, cwd: Option<&str>, command: &str, timeout: u64) -> RunOutcome {
+        let cancel = Arc::new(Notify::new());
+        run_command_streaming(ws, cwd, command, timeout, 4096, cancel, |_| {}).await
+    }
+
+    /// The timeout is model-supplied. Before Phase 4 an unbounded value reached
+    /// `Instant + Duration` and panicked the agent task (verified separately:
+    /// `Instant::now() + Duration::from_secs(u64::MAX)` overflows).
+    #[tokio::test]
+    async fn an_absurd_model_timeout_cannot_panic_the_runner() {
+        let (dir, ws) = tmp_ws();
+        let out = run(&ws, None, "echo bounded", u64::MAX).await;
+        assert!(out.ok, "{}", out.output);
+        assert!(out.output.contains("bounded"), "{}", out.output);
+        assert!(!out.timed_out && !out.killed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeout_is_clamped_to_the_documented_ceiling() {
+        assert_eq!(clamp_timeout(None), DEFAULT_COMMAND_TIMEOUT_SECS);
+        assert_eq!(clamp_timeout(Some(0)), 1);
+        assert_eq!(clamp_timeout(Some(30)), 30);
+        assert_eq!(clamp_timeout(Some(u64::MAX)), MAX_COMMAND_TIMEOUT_SECS);
+        assert_eq!(clamp_timeout(Some(90_000)), MAX_COMMAND_TIMEOUT_SECS);
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_is_refused_instead_of_handing_the_shell_nothing() {
+        let (dir, ws) = tmp_ws();
+        for command in ["", "   ", "\t\n"] {
+            let out = run(&ws, None, command, 5).await;
+            assert!(!out.ok, "empty command must not report success");
+            assert!(
+                out.output.contains("missing command"),
+                "expected a clear refusal, got {:?}",
+                out.output
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_escaping_cwd_is_refused_before_execution() {
+        let (dir, ws) = tmp_ws();
+        for cwd in ["../..", "/", "C:\\Windows", ".."] {
+            let out = run(&ws, Some(cwd), "echo should-not-run", 5).await;
+            assert!(!out.ok, "cwd {cwd:?} must be refused");
+            assert!(
+                out.output.starts_with("run_command:"),
+                "got {:?}",
+                out.output
+            );
+            assert!(!out.output.contains("should-not-run"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(all(test, unix))]

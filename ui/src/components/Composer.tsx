@@ -3,6 +3,8 @@ import { getState, resetTask, setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
 import { addWorkspace } from "./Sidebar";
 import { Icon } from "./Icon";
+import type { ContextPreview } from "../contextPreview";
+import { ContextPicker } from "./ContextPicker";
 
 const MODE_LABEL: Record<string, string> = {
   ask_all: "Ask every time",
@@ -24,11 +26,39 @@ export function Composer() {
   const [skills, setSkills] = useState<any[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [skillBudget, setSkillBudget] = useState(8192);
-  const readOnly = s.view === "task";
-  const hasText = !!s.composerText.trim();
+  // Step 3: project context. `contextToggle` is null until the user decides,
+  // so the saved settings value is the default without overriding a choice.
+  const [contextToggle, setContextToggle] = useState<boolean | null>(null);
+  const [contextExclude, setContextExclude] = useState<string[]>([]);
+  const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
+  const [contextScanning, setContextScanning] = useState(false);
   const taskBusy = s.taskStartPending || (s.agentState !== "idle" && s.agentState !== "done" && s.agentState !== "error" && s.agentState !== "cancelled");
+  const continuationTaskId = s.openTask?.id ?? (!taskBusy ? s.taskId : null);
+  const continuationLabel = s.openTask?.title ?? (continuationTaskId ? "this conversation" : null);
+  const readOnly = false;
+  const hasText = !!s.composerText.trim();
 
   useEffect(() => { void cmd.skillsList().then(setSkills).catch(() => setSkills([])); }, []);
+
+  const contextEnabled = contextToggle ?? s.settings?.context?.enabled ?? true;
+  // Preview is advisory and debounced: the backend re-runs the same selection
+  // when the task starts, and the transcript records the authoritative list.
+  useEffect(() => {
+    const text = s.composerText.trim();
+    if (!text || !s.activeWorkspacePath || !contextEnabled) {
+      setContextPreview(null);
+      setContextScanning(false);
+      return;
+    }
+    let cancelled = false;
+    setContextScanning(true);
+    const timer = setTimeout(() => {
+      cmd.contextPreview(text, s.providerSelected, contextExclude, continuationTaskId)
+        .then((preview) => { if (!cancelled) { setContextPreview(preview); setContextScanning(false); } })
+        .catch(() => { if (!cancelled) { setContextPreview(null); setContextScanning(false); } });
+    }, 450);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [s.composerText, s.activeWorkspacePath, s.providerSelected, contextEnabled, contextExclude.join("|"), continuationTaskId]);
 
   const send = async () => {
     const text = getState().composerText.trim();
@@ -45,15 +75,21 @@ export function Composer() {
     }
     if (selectedSkills.length && current.providerSelected.startsWith("web:") &&
         !window.confirm("Selected SKILL.md contents will be included in the first task message sent to the selected web AI provider. Continue?")) return;
-    resetTask();
+    const currentBusy = current.taskStartPending || (current.agentState !== "idle" && current.agentState !== "done" && current.agentState !== "error" && current.agentState !== "cancelled");
+    const sourceTaskId = current.openTask?.id ?? (!currentBusy ? current.taskId : null);
+    if (!sourceTaskId) resetTask();
     setState({ activeTaskSkills: selectedSkills.map((key) => skills.find((skill) => `${skill.location}:${skill.id}` === key)?.name ?? key) });
     // Preserve the prompt while the backend starts. A failed start must not eat user input.
     const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const context = { enabled: contextEnabled, exclude: contextExclude };
     setState({ composerText: text, taskStartPending: true, taskStartRequestId: requestId });
     try {
-      const taskId = await cmd.taskStart(text, current.providerSelected, requestId, selectedSkills, skillBudget);
+      const taskId = sourceTaskId
+        ? await cmd.taskContinue(sourceTaskId, current.providerSelected, text, requestId, context)
+        : await cmd.taskStart(text, current.providerSelected, requestId, selectedSkills, skillBudget, context);
       setState((s2) => ({
         taskId,
+        openTask: null,
         taskStartPending: false,
         taskStartRequestId: null,
         view: "chat",
@@ -63,8 +99,12 @@ export function Composer() {
         agentState: s2.agentState === "idle" ? "waiting_for_ai" : s2.agentState,
         taskStartedAt: s2.taskStartedAt ?? Date.now(),
       }));
+      // The next task starts with a clean veto list; the toggle keeps the user's
+      // preference. The transcript entry is the authoritative included list.
+      setContextExclude([]);
+      setContextPreview(null);
     } catch (e) {
-      setState({ taskId: null, taskStartPending: false, taskStartRequestId: null, composerText: text, activeTaskSkills: [] });
+      setState({ taskId: sourceTaskId ?? current.taskId, taskStartPending: false, taskStartRequestId: null, composerText: text, activeTaskSkills: [] });
       toast("error", String(e));
     }
   };
@@ -100,7 +140,7 @@ export function Composer() {
             ref={ref}
             rows={1}
             value={s.composerText}
-            placeholder={readOnly ? "Viewing a past task — start a new task to continue" : 'Example: "Explain this project in simple terms"'}
+            placeholder={continuationLabel ? `Continue ${continuationLabel}…` : 'Example: "Explain this project in simple terms"'}
             disabled={readOnly}
             onInput={(event: any) => setState({ composerText: event.currentTarget.value })}
             onKeyDown={(event: KeyboardEvent) => {
@@ -133,6 +173,16 @@ export function Composer() {
             <label class="task-skill-budget">Skill token budget (estimated)<input type="number" min="64" max="12000" step="256" value={skillBudget} onInput={(e: any) => setSkillBudget(Math.max(64, Math.min(12000, Number(e.currentTarget.value) || 64)))} /></label>
           </div>
         </details>
+        <ContextPicker
+          enabled={contextEnabled}
+          preview={contextPreview}
+          scanning={contextScanning}
+          excluded={contextExclude}
+          workspaceReady={!!s.activeWorkspacePath}
+          budgets={s.settings?.context ?? null}
+          onToggle={(next) => setContextToggle(next)}
+          onExclude={(path, include) => setContextExclude((current) => include ? current.filter((p) => p !== path) : [...current, path])}
+        />
       </div>
     </footer>
   );

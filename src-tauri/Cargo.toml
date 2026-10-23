@@ -30,7 +30,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 portable-pty = "0.8"
 notify = "8"
@@ -44,3 +44,13 @@ thiserror = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 libc = "0.2"
 tauri-plugin-single-instance = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO", "Win32_Security"] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["unstable", "test"] }
+tempfile = "3"
+# test-util enables paused-clock tests (tokio::time::advance / start_paused)
+# used by tests/action_bridge_e2e.rs. Dev-only; the release binary is unaffected.
+tokio = { version = "1", features = ["test-util"] }

@@ -181,6 +181,18 @@ Loop until the AI replies `DONE: <summary>`. Hard limits: max iterations (defaul
 
 Chunked writes via `append: true` because chat replies have length limits.
 
+## Project context (local retrieval)
+
+Before a task's first message is sent, Neelima selects the workspace files most likely to matter and attaches them to the prompt. It is deliberately simple and local:
+
+- **Lexical, not semantic.** A term-frequency score (BM25-style IDF weighting, with a boost for file-name matches) over one in-memory scan. No embedding model, no vector database, no index file, no network call — nothing is persisted and nothing leaves the machine except the text you chose to send to your provider.
+- **Bounded.** At most 12 MiB is read per selection, files over 256 KiB are skipped, and the rendered block never exceeds the provider budget (default 6,000 tokens for browser providers, 2,500 for local models, max 12 files; all editable in Settings → Local models). Overflow drops whole excerpts and says so.
+- **Confined and read-only.** Paths come from walking the canonical workspace root; symlinks are not followed, generated trees (`node_modules`, `target`, `dist`, …) are skipped, `.gitignore` is honoured, and retrieval never writes. It cannot grant filesystem or approval rights.
+- **Visible and vetoable.** The composer shows exactly which files are selected, their line ranges and sizes, and lets you untick any file (or disable context for the task) before sending. The transcript records the authoritative included list; the log records counts only, never file contents.
+- **Honest when empty.** If nothing matches, the prompt is unchanged and the transcript says so. Truncation, scan limits and skipped binary/oversized files are reported in the block and in the UI.
+
+Limitation: because retrieval is lexical, conceptually related code that shares no terms with the prompt is missed — use `grep`/`glob` or name the file. See [`docs/STEP3-PLAN.md`](docs/STEP3-PLAN.md) for the invariants this had to preserve.
+
 ## Browser extension (integration in progress)
 
 The repository includes the source for a Chrome and Edge Manifest V3 extension with ChatGPT, Claude, Gemini, generic-site, and manual relay adapters. The current extension package does **not** include a registered Native Messaging host or a browser-request handler in Neelima, so it cannot perform file operations yet. See [`docs/BROWSER_EXTENSION.md`](docs/BROWSER_EXTENSION.md) for the current status, installation, protocol, and security limitations.
@@ -229,6 +241,8 @@ src-tauri/src/
                 event-based input setting, extraction, inspector
   bridge.rs     the ONE command reachable from provider pages (typed, capped)
   adapters.rs   config-driven adapters (JSON), hot-reload via notify
+  context.rs    Step 3 project-context retrieval: bounded lexical scan, scoring,
+                excerpt windows, provider budgets, truncation reporting
   checkpoints.rs git-CLI snapshots (chosen over gitoxide: zero binary cost,
                 <200 ms snapshots on dev trees — see Performance)
   history.rs    append-only JSONL transcripts per task
@@ -245,7 +259,7 @@ Prereqs: Rust (MSVC on Windows), Node 20+, and on Linux `libwebkit2gtk-4.1-dev l
 ```bash
 npm ci --prefix ui           # run from the repository root; the lockfile is in ui/
 npm --prefix ui run build      # required before a plain cargo build
-cd src-tauri && cargo test     # unit tests: protocol, confinement, tools, guard
+npm run test:rust              # all Rust tests: unit, integration, agent e2e
 cargo build --release          # standalone app; serves the bundled UI
 npx --prefix ui tauri build    # release + installer for your OS
 ```
@@ -253,9 +267,18 @@ npx --prefix ui tauri build    # release + installer for your OS
 `tauri build` runs the UI build automatically; plain `cargo build --release`
 expects `ui/dist` to have been built already.
 
-Use `npx --prefix ui tauri dev` for development; Tauri starts the Vite server
-automatically using `beforeDevCommand`. Release builds use the bundled UI and do
-not require a localhost server.
+Run Rust tests with `npm run test:rust` (scripts/test-rust.mjs), not a bare
+`cargo test`. On Windows the lib unit-test binary imports a comctl32 v6-only
+symbol and cargo cannot embed a manifest into that target, so the loader aborts
+the exe with 0xc0000139 before any test runs; the script builds first, writes
+the manifest as an external `<exe>.manifest` sibling, then runs the suite.
+
+Use `cargo tauri dev` from the repository root (`zodecpy/`, the directory that
+contains `src-tauri/`) for development; Tauri starts the Vite server from
+`ui/` automatically using `beforeDevCommand`. The `beforeDevCommand` and
+`beforeBuildCommand` paths are relative to the repository root, because Tauri
+runs them there. Release builds use the bundled UI and do not require a
+localhost server.
 
 ### Signed Windows releases
 

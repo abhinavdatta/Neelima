@@ -24,6 +24,7 @@ commands.allow = [
   "ui_provider_clear_session",
   "ui_providers_list",
   "ui_models_local",
+  "ui_context_preview",
   "ui_task_start",
   "ui_task_stop",
   "ui_task_continue",
@@ -31,6 +32,10 @@ commands.allow = [
   "ui_relay_reply",
   "ui_webview_mode",
   "ui_webview_rect",
+  "ui_sync_viewport",
+  "ui_provider_mark_signed_in",
+  "ui_capture_reply",
+  "ui_provider_probe",
   "ui_terminal_create",
   "ui_terminal_write",
   "ui_terminal_resize",
@@ -56,6 +61,8 @@ commands.allow = [
   "ui_skill_read",
   "ui_open_github",
   "ui_provider_diagnose",
+  "ui_request_log",
+  "browser_bridge_propose",
 ]
 
 [[permission]]

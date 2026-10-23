@@ -1,4 +1,4 @@
-# Neelima Browser Bridge 0.1.0
+# Neelima Browser Bridge 0.3.0
 
 A Chrome/Edge Manifest V3 extension for connecting compatible browser AI chats to Neelima's local Rust/Tauri agent.
 
@@ -30,6 +30,8 @@ This extension folder can be loaded directly. Node.js is not required to install
 **The browser extension is built; the matching Neelima native host and Rust/Tauri backend changes are not included in this extension-only package.** Until those are implemented and registered, the extension will show a connection error and file operations will not run. It never accesses local files directly.
 
 The local backend must independently enforce workspace grants, path confinement, the selected permission mode, approvals, idempotency, and audit history. The extension setting for automatic writes is only a preference until the backend implements and verifies it.
+
+Request history persists only request IDs, tool/site names, timestamps, and lifecycle metadata. A backend acknowledgement is not proof of tool execution. On worker restart or a lost acknowledgement, the extension records an unknown outcome and never replays a side-effecting request automatically.
 
 ## Generic website setup
 

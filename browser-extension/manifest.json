@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Neelima Browser Bridge",
   "short_name": "Neelima Bridge",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Connect compatible browser AI chats to Neelima's local, permission-controlled workspace tools.",
   "permissions": ["nativeMessaging", "storage", "activeTab", "scripting"],
   "optional_host_permissions": ["https://*/*"],
@@ -10,8 +10,9 @@
   "action": { "default_title": "Neelima Browser Bridge", "default_popup": "popup/index.html" },
   "options_page": "options/index.html",
   "content_scripts": [
-    { "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"], "js": ["content/chatgpt.js"], "run_at": "document_idle" },
-    { "matches": ["https://claude.ai/*"], "js": ["content/claude.js"], "run_at": "document_idle" },
-    { "matches": ["https://gemini.google.com/*"], "js": ["content/gemini.js"], "run_at": "document_idle" }
-  ]
+    { "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"], "js": ["content/scan-scheduler.js", "content/result-relay.js", "content/chatgpt.js"], "run_at": "document_idle" },
+    { "matches": ["https://claude.ai/*"], "js": ["content/scan-scheduler.js", "content/result-relay.js", "content/claude.js"], "run_at": "document_idle" },
+    { "matches": ["https://gemini.google.com/*"], "js": ["content/scan-scheduler.js", "content/result-relay.js", "content/gemini.js"], "run_at": "document_idle" }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA+5E8in3uXvkMtLgv1OR9+BeSJdQocn7ut0VoWsohGi1zdbzs4ts79Peh8ltvetSmJ7YiS7fT2ZvtRtnCByNAFWfYHbYqNx01gUrvaYKRjLtXczxRHMIthCzZy1U2p6TfqGbWflHwnqh7CvS0Ghb/FmXR35Wczp0jQgbGq5VaOUo7qzRNGaTsxgdaR2tVo6h7sfcPVbnQ28cvXs23pqG4pRtOi2olT4HuJOoY+B4s5ydIyUdH6YBefsdcGhztieiAQGoGLlyhi3mJ6SfTSAlM60BhrgVyrTU4fqxqkDzhs8MyTdL09527arwd+wyqKe2mC1dPW3ruPDw0UIfJSqpv3QIDAQAB"
 }

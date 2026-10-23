@@ -1,0 +1,9 @@
+{
+  "name": "com.neelima.browser_bridge",
+  "description": "Neelima Browser Bridge Native Messaging Host",
+  "path": "/usr/local/bin/neelima_native_host",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://<EXTENSION_ID>/"
+  ]
+}

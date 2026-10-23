@@ -6,6 +6,7 @@ import { setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
 import { Icon } from "./Icon";
 import type { TranscriptEntry } from "../types";
+import { providerStateLabel } from "../providerStatus";
 
 export function Chat() {
   const s = useStore();
@@ -20,6 +21,9 @@ export function Chat() {
       {s.entries.map((e) => <Entry key={`${e.ts}-${e.id}`} e={e} taskId={s.taskId ?? s.openTask?.id ?? ""} readOnly={readOnly} />)}
 
       {s.pendingCalls.length > 0 ? <ApprovalCard /> : null}
+      {s.bridgeApproval ? <BridgeApprovalCard /> : null}
+      {s.agentState === "waiting_for_ai" && s.providerSelected !== "manual" ? <ProviderWaitCard /> : null}
+      {s.streamText && s.agentState === "waiting_for_ai" ? <StreamPreview text={s.streamText} /> : null}
       {s.relayOutbound && s.agentState === "waiting_for_ai" ? <RelayCard /> : null}
       <div ref={bottom} />
     </div>
@@ -125,6 +129,111 @@ function ApprovalCard() {
         <button class="btn-ok" disabled={!allChosen || submitting} onClick={() => void submit(allDecisions)}>{submitting ? "Submitting…" : "Submit decisions"}</button>
       </div>
       {!allChosen ? <div class="dim">Choose Approve or Reject for every item before submitting. Unselected items are never implicitly rejected.</div> : null}
+    </div>
+  );
+}
+
+function BridgeApprovalCard() {
+  const s = useStore();
+  const [submitting, setSubmitting] = useState(false);
+  const request = s.bridgeApproval!;
+  const decide = async (approved: boolean) => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await cmd.bridgeApprove(request.request_id, approved);
+      setState({ bridgeApproval: null });
+      toast("info", approved ? "Browser request approved and executed by Neelima." : "Browser request rejected; nothing was executed.");
+    } catch (e) {
+      setSubmitting(false);
+      // The request may have already timed out or been decided elsewhere.
+      toast("error", `Could not submit the decision: ${String(e)}`);
+    }
+  };
+  return (
+    <div class="approval-card">
+      <div class="approval-head">Approval required — browser extension request</div>
+      <div class="approval-item">
+        <span class="risk risk-high">{request.risk === "high" ? "high" : "read"}</span>
+        <span class="tool-name">{request.tool}</span>
+        <span class="dim">requested by {request.site}</span>
+        <pre class="tool-args">{JSON.stringify(request.args, null, 1)?.slice(0, 300)}</pre>
+        <div class="approval-actions">
+          <button class="btn-ok" disabled={submitting} onClick={() => void decide(true)}>Approve</button>
+          <button class="btn-no" disabled={submitting} onClick={() => void decide(false)}>Reject</button>
+        </div>
+        <div class="dim">Nothing runs until you decide. The request times out after 2 minutes.</div>
+      </div>
+    </div>
+  );
+}
+
+export function ProviderWaitCard() {
+  const s = useStore();
+  const requestState = s.providerRequest ? providerStateLabel(s.providerRequest.state) : "waiting";
+  const [elapsed, setElapsed] = useState(0);
+  const [capturing, setCapturing] = useState(false);
+  const [captureNote, setCaptureNote] = useState<string | null>(null);
+  useEffect(() => {
+    setElapsed(0);
+    const t = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [s.taskId]);
+  const isWeb = s.providerSelected.startsWith("web:");
+  const isLocal = s.providerSelected === "ollama" || s.providerSelected === "lmstudio";
+  const providerName = isWeb
+    ? (s.providers?.web ?? []).find((p: any) => p.id === s.providerSelected.slice(4))?.name ?? "the provider"
+    : s.providerSelected === "ollama" ? "Ollama"
+    : s.providerSelected === "lmstudio" ? "LM Studio"
+    : "the provider";
+  const capture = async () => {
+    if (capturing) return;
+    setCapturing(true);
+    try {
+      const r = await cmd.captureReply();
+      setCaptureNote(r.delivered
+        ? "Reply captured and delivered to the conversation."
+        : (r.reason ?? "No reply is visible on the provider page yet."));
+    } catch (e) {
+      setCaptureNote(`Capture failed: ${String(e)}`);
+    } finally {
+      setCapturing(false);
+    }
+  };
+  return (
+    <div class="approval-card">
+      <div class="approval-head">Waiting for {providerName}'s reply… {elapsed}s</div>
+      <div class="approval-item">
+        <div class="dim">The reply appears here automatically as soon as the provider finishes. The provider keeps working while you use other parts of Neelima.</div>
+        <div class="dim">Request: {requestState}{s.providerRequest?.provider ? ` · ${s.providerRequest.provider}` : ""}</div>
+        {s.providerEventNote ? <div class="dim">{s.providerEventNote}</div> : null}
+        {isWeb ? (
+          <div class="approval-actions">
+            <button class="btn-ok" disabled={capturing} onClick={() => void capture()}>{capturing ? "Capturing…" : "Capture current reply"}</button>
+            <button class="btn-no" onClick={() => { setState({ view: "provider", providerAuthOpen: true }); cmd.webviewMode("provider").catch(() => {}); }}>Open provider window</button>
+          </div>
+        ) : isLocal ? (
+          <div class="approval-actions">
+            <button class="btn-no" onClick={() => setState({ settingsOpen: true })}>Open Settings</button>
+          </div>
+        ) : null}
+        {captureNote ? <div class="dim">{captureNote}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function StreamPreview({ text }: { text: string }) {
+  // Display-only: the tail keeps this cheap for long file-writing replies.
+  const tail = text.length > 2400 ? text.slice(-2400) : text;
+  return (
+    <div class="stream-block">
+      <div class="stream-head">
+        <span class="stream-dot" />
+        <span>Live reply…</span>
+        <span class="dim">{text.length.toLocaleString()} chars</span>
+      </div>
+      <pre>{tail}</pre>
     </div>
   );
 }

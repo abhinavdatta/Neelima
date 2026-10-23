@@ -65,6 +65,8 @@ pub struct TranscriptEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMeta {
     pub id: String,
+    #[serde(default)]
+    pub conversation_id: String,
     pub title: String,
     pub started_ms: u64,
     #[serde(default)]
@@ -118,6 +120,20 @@ impl HistoryStore {
         valid_task_id(id) && self.task_dir(id).join("meta.json").is_file()
     }
 
+    pub fn read_task_meta(&self, id: &str) -> Result<TaskMeta, String> {
+        if !valid_task_id(id) {
+            return Err("invalid task ID".into());
+        }
+        let bytes = std::fs::read(self.task_dir(id).join("meta.json")).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "task not found".to_string()
+            } else {
+                error.to_string()
+            }
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+
     pub fn create_task(
         &self,
         id: &str,
@@ -125,8 +141,22 @@ impl HistoryStore {
         workspace: &str,
         provider: &str,
     ) -> Result<TaskMeta, String> {
+        self.create_task_in_conversation(id, id, title, workspace, provider)
+    }
+
+    pub fn create_task_in_conversation(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        title: &str,
+        workspace: &str,
+        provider: &str,
+    ) -> Result<TaskMeta, String> {
         if !valid_task_id(id) {
             return Err("invalid task ID".into());
+        }
+        if !valid_task_id(conversation_id) {
+            return Err("invalid conversation ID".into());
         }
         let id = id.to_string();
         let dir = self.task_dir(&id);
@@ -135,6 +165,7 @@ impl HistoryStore {
         }
         let meta = TaskMeta {
             id: id.clone(),
+            conversation_id: conversation_id.to_string(),
             title: title.chars().take(80).collect(),
             started_ms: now_ms(),
             ended_ms: None,
@@ -333,7 +364,7 @@ fn last_transcript_entry_id(root: &std::path::Path) -> u64 {
             Ok(file) => file,
             Err(_) => continue,
         };
-        for line in BufReader::new(file).lines().flatten() {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
             if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
                 max_id = max_id.max(entry.id);
             }
@@ -400,6 +431,30 @@ mod tests {
             .create_task(id, "again", "workspace", "manual")
             .is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn continuation_tasks_keep_their_stable_conversation_id() {
+        let (store, root) = store("conversation-id");
+        let conversation = "11111111111111111111111111111111";
+        let first = "22222222222222222222222222222222";
+        let second = "33333333333333333333333333333333";
+        let original = store
+            .create_task_in_conversation(first, conversation, "first", "workspace", "web:chat")
+            .unwrap();
+        let continuation = store
+            .create_task_in_conversation(
+                second,
+                &original.conversation_id,
+                "follow up",
+                "workspace",
+                "web:chat",
+            )
+            .unwrap();
+        assert_eq!(original.conversation_id, conversation);
+        assert_eq!(continuation.conversation_id, conversation);
+        assert_ne!(continuation.id, original.id);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -89,13 +89,10 @@ export function Sidebar() {
     <aside class="sidebar">
       <nav class="rail-nav" aria-label="Main navigation">
         <button class="rail-button rail-logo" title="Neelima home" aria-label="Neelima home" onClick={start}><span class="rail-logo-mark">N</span></button>
-        <button class={`rail-button ${s.settingsOpen ? "active" : ""}`} title="Settings" aria-label="Open Settings" aria-expanded={s.settingsOpen} onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>
-          <Icon name="settings" size={19} />
-        </button>
         <button class="rail-button rail-new" title={s.activeWorkspacePath ? "Select a new project folder" : "Select a project folder"} aria-label="Select project folder" onClick={() => void addWorkspace()}>
           <Icon name="folder" />
         </button>
-        <button class={`rail-button ${s.view === "provider" ? "active" : ""}`} title="Provider sign-in / Browse" aria-label="Provider sign-in" onClick={() => { setPanel(null); setState({ view: "provider", providerAuthOpen: !s.providerMounted }); }}>
+        <button class={`rail-button ${s.view === "provider" ? "active" : ""}`} title="Provider sign-in / Browse" aria-label="Provider sign-in" onClick={() => { setPanel(null); setState({ view: "provider", providerAuthOpen: false }); }}>
           <Icon name="compass" />
         </button>
         <button class={`rail-button ${s.view === "search" ? "active" : ""}`} title="Search" aria-label="Search" onClick={() => { setPanel(null); setState({ view: "search" }); }}>
@@ -133,6 +130,13 @@ export function Sidebar() {
           )}
         </div>
       ) : null}
+      {/* Settings lives at the bottom-left, separated from the primary nav
+          (rail-bottom is pushed down by margin-top:auto in styles.css). */}
+      <div class="rail-bottom">
+        <button class={`rail-button rail-settings ${s.settingsOpen ? "active" : ""}`} title="Settings" aria-label="Open Settings" aria-expanded={s.settingsOpen} onClick={() => { setPanel(null); setState({ settingsOpen: true }); }}>
+          <Icon name="settings" size={19} />
+        </button>
+      </div>
     </aside>
   );
 }

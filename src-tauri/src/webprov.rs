@@ -28,6 +28,97 @@ pub const PROVIDER_LABEL: &str = "provider";
 /// Idle time after which a hidden provider webview may be destroyed.
 pub const HIDDEN_IDLE_DESTROY_MS: u64 = 10 * 60 * 1000;
 
+/// Default RPC budget for quick page calls (ping, page_info, new_chat).
+pub const CALL_TIMEOUT_MS: u64 = 10_000;
+/// Budget for `send_message`. The page-side worst case is
+/// `waitForSendButton(3000) + waitSubmission(8000)` ≈ 11 s and always resolves;
+/// this budget must EXCEED it so the RPC is never cancelled mid-submission
+/// (a cancelled send is an unknown outcome that must not be retried).
+pub const SEND_CALL_TIMEOUT_MS: u64 = 25_000;
+/// After an unconfirmed submission the prompt may or may not have entered the
+/// conversation. Wait a bounded time for a reply push instead of the full
+/// provider timeout, so an unknown outcome is reported promptly and honestly.
+pub const UNCONFIRMED_REPLY_WAIT_MS: u64 = 90_000;
+
+// Response-contract lifecycle states, the terminal guard and the transition
+// table live in `crate::request` — the canonical, provider-independent model
+// shared with local inference providers and the manual relay (Step 2). They
+// are re-exported here so the web provider's contract surface stays stable.
+pub use crate::request::{
+    allow_request_state, is_terminal_request_state, REQUEST_CANCELLED, REQUEST_CANCEL_REQUESTED,
+    REQUEST_COMPLETED, REQUEST_CREATED, REQUEST_FAILED, REQUEST_STREAMING,
+    REQUEST_SUBMISSION_UNCONFIRMED, REQUEST_SUBMITTED, REQUEST_SUBMITTING, REQUEST_TIMED_OUT,
+};
+
+/// Terminal state for an unsuccessful reply wait (cancelled vs timed_out).
+pub use crate::request::reply_wait_state;
+
+/// The single message used when the provider window cannot be re-pointed at a
+/// different profile during a running task. A constant so the send path can
+/// tell this BUSY state apart from real page drift instead of string-matching
+/// an inline literal.
+pub const PROFILE_LOCKED: &str = "cannot change provider profile while an agent task is active";
+
+/// Coarse, non-sensitive failure category for diagnostics and the UI. Never
+/// carries prompt or reply text.
+pub fn error_category(e: &ProviderError) -> &'static str {
+    match e {
+        ProviderError::NeedsLogin => "login_required",
+        ProviderError::BridgeUnreachable(_) => "page_unavailable",
+        ProviderError::ProfileLocked(_) => "busy",
+        ProviderError::PageChanged(_) => "page_changed",
+        ProviderError::Timeout(_) => "timeout",
+        ProviderError::SendFailed(_) => "send_failed",
+    }
+}
+
+fn mounted_adapter_id(state: &WebviewState) -> String {
+    state
+        .mounted
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.adapter_id.clone())
+        .unwrap_or_else(|| "web".into())
+}
+
+/// Emit one lifecycle transition (metadata only). Returns false when the
+/// transition was suppressed by the terminal-state guard.
+fn emit_request_state(
+    app: &tauri::AppHandle,
+    state: &WebviewState,
+    provider: &str,
+    request_id: &str,
+    next: &str,
+    category: Option<&str>,
+) -> bool {
+    // Step 2: the shared registry is the canonical gate — it validates the
+    // transition, enforces at most one terminal outcome per request across
+    // ALL providers, and builds the metadata-only event payload. `begin` here
+    // is defensive: a request whose `created` event was missed (e.g. an older
+    // page session) is registered on first contact, never re-created.
+    let registry = crate::request::registry_of(app);
+    let task_id = state.active_task.lock().unwrap().clone();
+    let conversation_id = state.active_conversation.lock().unwrap().clone();
+    registry.begin(
+        request_id,
+        provider,
+        task_id.as_deref(),
+        conversation_id.as_deref(),
+    );
+    match registry.transition(request_id, next, category) {
+        Some(record) => {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "evt",
+                crate::request::request_event_payload(&record, category),
+            );
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(Default)]
 pub struct WebviewState {
     /// The currently-mounted provider webview session, if any.
@@ -45,9 +136,18 @@ pub struct WebviewState {
     pub login_changed: Arc<Notify>,
     /// Last assistant message pushed by the page, keyed by seq.
     pub last_message: Mutex<(u64, String)>,
+    /// Runtime identity reported by the current injected adapter instance.
+    pub runtime_session: Mutex<Option<String>>,
     /// Sequence captured immediately before a send, so a fast reply cannot be
     /// missed if it arrives before the agent begins waiting.
     pub response_baseline: std::sync::atomic::AtomicU64,
+    /// Last reply text visible on the page immediately BEFORE a send. The
+    /// read-only backstop uses it to tell a genuinely new answer from the
+    /// previous turn that is still rendered in the same provider chat.
+    pub response_baseline_text: Mutex<String>,
+    /// Correlation ID of the send currently awaiting a reply. Pushes carrying
+    /// any other (or no) ID belong to an earlier round and are rejected.
+    pub active_request: Mutex<Option<String>>,
     /// Incremented so waiters know a new message arrived.
     pub message_notify: Arc<Notify>,
     /// TCSO / stream relay: latest streaming text from the page.
@@ -58,8 +158,25 @@ pub struct WebviewState {
     pub task_active: Mutex<bool>,
     /// Chat started flag for the current task (A8: new_chat once per task).
     pub chat_started_for: Mutex<Option<String>>,
+    /// Whether the provider webview is parked off-screen instead of hidden
+    /// (parking keeps WebView2 timers live during a task).
+    pub parked: Mutex<bool>,
     /// Last bridge error string, for diagnostics.
     pub last_bridge_error: Mutex<Option<String>>,
+    /// Set when the last send was clicked but the provider did not confirm the
+    /// prompt entered its conversation (unknown outcome — never resent).
+    pub submission_unconfirmed: Mutex<Option<String>>,
+    /// Page-reported generation failure for the active request (request ID,
+    /// bounded message). Wakes the reply waiter with an honest failure instead
+    /// of letting it run to the full response deadline.
+    pub response_error: Mutex<Option<(String, String)>>,
+    /// Whether the first streaming transition was already emitted for the
+    /// active request (partial previews can arrive many times).
+    pub request_streaming: Mutex<bool>,
+    /// Task and conversation identity of the active request, kept for the
+    /// shared request registry's correlation + diagnostics (Step 2).
+    pub active_task: Mutex<Option<String>>,
+    pub active_conversation: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +290,15 @@ impl WebProvider {
     }
 
     async fn call(&self, method: &str, arg: &Value) -> Result<Value, ProviderError> {
+        self.call_with_timeout(method, arg, CALL_TIMEOUT_MS).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        method: &str,
+        arg: &Value,
+        timeout_ms: u64,
+    ) -> Result<Value, ProviderError> {
         let wv = self.app.get_webview(PROVIDER_LABEL).ok_or_else(|| {
             ProviderError::BridgeUnreachable(set_bridge_err(
                 &self.state.last_bridge_error,
@@ -194,7 +320,7 @@ impl WebProvider {
                 format!("eval failed: {e}"),
             )));
         }
-        let reply = crate::bridge::BridgeHub::wait(rx, 10_000)
+        let reply = crate::bridge::BridgeHub::wait(rx, timeout_ms)
             .await
             .map_err(|e| {
                 self.hub.cancel(&req_id);
@@ -284,16 +410,70 @@ impl WebProvider {
         }
     }
 
+    /// Emit one lifecycle transition for this provider (metadata only).
+    fn emit_state(&self, request_id: &str, next: &str, category: Option<&str>) {
+        emit_request_state(
+            &self.app,
+            &self.state,
+            &self.adapter.id,
+            request_id,
+            next,
+            category,
+        );
+    }
+
+    /// Start one request: assign its correlation ID, emit `created`, run the
+    /// send path, and report exactly one terminal `failed` if it errors.
     pub async fn send(
         &mut self,
+        conversation_id: &str,
         task_id: &str,
         text: &str,
         first_of_task: bool,
     ) -> Result<(), ProviderError> {
+        // One correlation ID per send: Rust generates it, the page echoes it on
+        // every push, and on_assistant_message rejects anything else. This is
+        // what stops an abandoned round's late completion from being used as
+        // the answer to a newer prompt.
+        let request_id = format!(
+            "{task_id}.{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        *self.state.active_request.lock().unwrap() = Some(request_id.clone());
+        *self.state.response_error.lock().unwrap() = None;
+        *self.state.request_streaming.lock().unwrap() = false;
+        *self.state.active_task.lock().unwrap() = Some(task_id.to_string());
+        *self.state.active_conversation.lock().unwrap() = Some(conversation_id.to_string());
+        self.emit_state(&request_id, REQUEST_CREATED, None);
+        let result = self
+            .send_inner(&request_id, conversation_id, text, first_of_task)
+            .await;
+        if let Err(e) = &result {
+            self.emit_state(&request_id, REQUEST_FAILED, Some(error_category(e)));
+        }
+        result
+    }
+
+    async fn send_inner(
+        &mut self,
+        request_id: &str,
+        conversation_id: &str,
+        text: &str,
+        first_of_task: bool,
+    ) -> Result<(), ProviderError> {
+        self.state.stream.lock().unwrap().clear();
         if !is_mounted(&self.state, &self.profile_id, &self.adapter.id) {
             mount(&self.app, &self.profile_id, &self.adapter, &self.state)
                 .await
-                .map_err(ProviderError::PageChanged)?;
+                .map_err(|e| {
+                    // A provider switch during an active task is a BUSY state,
+                    // not DOM drift: report it as such.
+                    if e == PROFILE_LOCKED {
+                        ProviderError::ProfileLocked(e)
+                    } else {
+                        ProviderError::PageChanged(e)
+                    }
+                })?;
         }
         // Keep the provider page hidden during ordinary work. The UI only
         // reveals it after an explicit sign-in action or a login-required event.
@@ -303,36 +483,60 @@ impl WebProvider {
             ProviderError::BridgeUnreachable(set_bridge_err(&self.state.last_bridge_error, e))
         })?;
 
-        // Wait for an observed chat/auth/challenge state. Document load alone
-        // is not evidence that the SPA or its composer has finished rendering.
-        loop {
-            let cur = { self.state.login.lock().unwrap().clone() };
-            match cur {
-                LoginState::LoggedIn { .. } => break,
-                LoginState::LoggedOut { .. } | LoginState::Challenge { .. } => {
+        // Ask the page directly what it sees. This single probe drives both the
+        // login gate and the composer check (no duplicate RPCs).
+        let info = match self.call("page_info", &json!(null)).await {
+            Ok(info) => info,
+            Err(e) => return Err(e),
+        };
+        let page_login_state = info["login"]["state"].as_str().unwrap_or("unknown");
+        let input_found = info["input_found"].as_bool() == Some(true);
+
+        match page_login_state {
+            "logged_in" => {}
+            "logged_out" | "challenge" => {
+                let reason = info["login"]["reason"]
+                    .as_str()
+                    .unwrap_or("sign-in is required")
+                    .to_string();
+                let _ = self.app.emit(
+                    "evt",
+                    json!({"kind": "provider-login-required", "adapter": self.adapter.name, "reason": reason}),
+                );
+                // Give the user a bounded window to finish signing in inside the
+                // provider window before failing the send.
+                match self.await_login(180).await {
+                    Ok(_) => {}
+                    Err(_) => return Err(ProviderError::NeedsLogin),
+                }
+            }
+            _ => {
+                // "unknown"/"loading": the detector could not positively confirm
+                // an authenticated session. A visible, editable composer with no
+                // login/challenge signals is enough to ATTEMPT the send — the
+                // submission-confirmation + response-push path decides the real
+                // outcome, and unknown outcomes are never resent.
+                if input_found {
+                    let reason = info["login"]["reason"]
+                        .as_str()
+                        .unwrap_or("provider login state is unverified")
+                        .to_string();
+                    *self.state.submission_unconfirmed.lock().unwrap() = None;
                     let _ = self.app.emit(
                         "evt",
-                        json!({"kind": "provider-login-required", "adapter": self.adapter.name, "reason": match &cur { LoginState::Challenge { reason, .. } => reason.as_str(), _ => "sign-in is required" }}),
+                        json!({
+                            "kind": "provider-login-unverified",
+                            "adapter": self.adapter.name,
+                            "reason": reason,
+                        }),
                     );
-                    match self.await_login(300).await {
-                        Ok(_) => break,
-                        Err(_) => return Err(ProviderError::NeedsLogin),
-                    }
-                }
-                LoginState::Unknown { .. } | LoginState::Loading { .. } => {
+                } else {
+                    // No composer and no definitive state: give the SPA a
+                    // bounded chance to finish rendering before declaring it
+                    // unreachable.
                     match self.await_known_login(Duration::from_secs(30)).await {
-                        Ok(LoginState::Challenge { reason, .. }) => {
-                            let _ = self.app.emit(
-                                "evt",
-                                json!({
-                                    "kind": "provider-login-required",
-                                    "adapter": self.adapter.name,
-                                    "reason": reason,
-                                }),
-                            );
-                            return Err(ProviderError::NeedsLogin);
-                        }
-                        Ok(LoginState::LoggedOut { .. }) => {
+                        Ok(LoginState::LoggedIn { .. }) => {}
+                        Ok(LoginState::LoggedOut { .. }) | Ok(LoginState::Challenge { .. }) => {
                             let _ = self.app.emit(
                                 "evt",
                                 json!({
@@ -343,8 +547,7 @@ impl WebProvider {
                             );
                             return Err(ProviderError::NeedsLogin);
                         }
-                        Ok(LoginState::LoggedIn { .. }) => break,
-                        Ok(LoginState::Unknown { .. } | LoginState::Loading { .. }) | Err(_) => {
+                        _ => {
                             let e = actionable_composer_error(&self.state.login.lock().unwrap());
                             let e = set_bridge_err(&self.state.last_bridge_error, e);
                             let _ = self.app.emit(
@@ -362,60 +565,267 @@ impl WebProvider {
             }
         }
 
-        // A8: new_chat ONLY for the first message of each task, after the
-        // supported chat interface has been positively identified.
+        // Reuse the provider chat for every task in the same stable Neelima
+        // conversation. A different conversation starts a new provider chat.
         let already = self.state.chat_started_for.lock().unwrap().clone();
-        if first_of_task && already.as_deref() != Some(task_id) {
+        if should_start_provider_chat(first_of_task, already.as_deref(), conversation_id) {
             if let Err(e) = self.fire("new_chat", &json!(null)) {
                 return Err(ProviderError::PageChanged(format!(
                     "could not start a provider chat: {e}"
                 )));
             }
-            *self.state.chat_started_for.lock().unwrap() = Some(task_id.to_string());
+            *self.state.chat_started_for.lock().unwrap() = Some(conversation_id.to_string());
         }
 
-        // Ensure the composer still exists immediately before each send; an
-        // SPA navigation can invalidate an earlier login-state observation.
-        match self.call("page_info", &json!(null)).await {
-            Ok(info) if info["value"]["input_found"].as_bool() == Some(true) => {}
-            Ok(info) => {
+        // Ensure the composer still exists immediately before the send; an SPA
+        // navigation between the probe above and the send can invalidate it.
+        if page_login_state == "logged_in" || input_found {
+            let info = if page_login_state == "logged_in" {
+                match self.call("page_info", &json!(null)).await {
+                    Ok(info) => info,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                info.clone()
+            };
+            if info["input_found"].as_bool() != Some(true) {
                 return Err(ProviderError::PageChanged(format!(
                     "chat composer is no longer available (page state: {})",
-                    info["value"]["login"]["reason"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                )))
+                    info["login"]["reason"].as_str().unwrap_or("unknown")
+                )));
             }
-            Err(e) => return Err(e),
         }
 
         let baseline = self.state.last_message.lock().unwrap().0;
         self.state
             .response_baseline
             .store(baseline, Ordering::Release);
+        // Snapshot the reply text already on screen. One reused provider chat
+        // keeps the previous answer mounted, so "has a reply" alone is not
+        // proof that the NEW prompt was answered.
+        let baseline_text = capture_reply_detail(&self.app, &self.hub, 3_000)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v["text"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        *self.state.response_baseline_text.lock().unwrap() = baseline_text.clone();
+        *self.state.submission_unconfirmed.lock().unwrap() = None;
 
-        // A10: trust only the explicit acknowledgement returned after the
-        // provider UI confirms that the submitted prompt entered its chat.
+        // A10 + budget: trust only the explicit acknowledgement returned after
+        // the provider UI confirms that the submitted prompt entered its chat.
+        // The page-side path always resolves (~11 s worst case) — this budget is
+        // larger, so the RPC is never cancelled mid-submission.
+        self.emit_state(request_id, REQUEST_SUBMITTING, None);
         let result = self
-            .call(
+            .call_with_timeout(
                 "send_message",
-                &json!({"text": text, "quiet_ms": self.adapter.quiet_ms}),
+                &json!({
+                    "text": text,
+                    "quiet_ms": self.adapter.quiet_ms,
+                    "request_id": request_id,
+                }),
+                SEND_CALL_TIMEOUT_MS,
             )
             .await?;
-        classify_send_result(&result)?;
+        classify_send_result(&self.state, &result)?;
+        // Metadata-only lifecycle event: identifies the last successful stage
+        // without carrying prompt or response text.
+        self.emit_state(
+            request_id,
+            if result["submission_confirmed"].as_bool() == Some(true) {
+                REQUEST_SUBMITTED
+            } else {
+                REQUEST_SUBMISSION_UNCONFIRMED
+            },
+            None,
+        );
+
+        // Read-only backstop. The page's own completion watch is the primary
+        // path; this covers the cases where it is silenced (renderer
+        // throttling, an SPA container swap, selector drift, a stuck stop
+        // control). It NEVER resends the prompt and NEVER touches the page.
+        //
+        // Delivery rule: a non-empty reply that differs from the pre-send text,
+        // no streaming stop control, and the same text on two consecutive
+        // polls. Two agreeing reads keep half-streamed tool blocks from being
+        // delivered as if they were complete.
+        let net_app = self.app.clone();
+        let net_state = self.state.clone();
+        let net_hub = self.hub.clone();
+        let net_baseline = baseline;
+        let net_timeout_ms = self.adapter.response_timeout_ms;
+        let net_request_id = request_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_millis(net_timeout_ms);
+            let mut stable: Option<String> = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if !*net_state.task_active.lock().unwrap() {
+                    return; // task finished or aborted; nothing to deliver to
+                }
+                if net_state.response_baseline.load(Ordering::Acquire) != net_baseline {
+                    return; // a newer send owns the reply slot now
+                }
+                let already = {
+                    let (seq, text) = net_state.last_message.lock().unwrap().clone();
+                    seq > net_baseline && !text.trim().is_empty()
+                };
+                if already {
+                    return; // the watch delivered first
+                }
+                let detail = capture_reply_detail(&net_app, &net_hub, 8_000)
+                    .await
+                    .ok()
+                    .flatten();
+                let candidate = backstop_candidate(detail.as_ref(), &baseline_text);
+                match candidate {
+                    Some(text) if stable.as_deref() == Some(text.as_str()) => {
+                        let mut last = net_state.last_message.lock().unwrap();
+                        if last.0 > net_baseline {
+                            return; // lost the race with the watch: deliver once
+                        }
+                        last.0 = net_baseline + 1;
+                        last.1 = text.clone();
+                        drop(last);
+                        // The page watch is the primary reporter; when the
+                        // backstop wins instead, close the lifecycle here so
+                        // the contract still reports one terminal state. Emit
+                        // the state BEFORE waking the agent, so a fast next
+                        // round cannot observe a stale "streaming" status.
+                        let provider = mounted_adapter_id(&net_state);
+                        let state_ref: &WebviewState = &net_state;
+                        emit_request_state(
+                            &net_app,
+                            state_ref,
+                            &provider,
+                            &net_request_id,
+                            REQUEST_COMPLETED,
+                            None,
+                        );
+                        net_state.message_notify.notify_one();
+                        net_hub.note(format!(
+                            "backstop delivered reply after {}ms (len={})",
+                            started.elapsed().as_millis(),
+                            text.len()
+                        ));
+                        let _ = net_app.emit(
+                            "evt",
+                            json!({"kind": "assistant-captured", "at_ms": 0, "len": text.len()}),
+                        );
+                        return;
+                    }
+                    other => stable = other,
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    net_hub.note("backstop gave up at the reply deadline".into());
+                    return;
+                }
+            }
+        });
         Ok(())
     }
 
     /// Wait for the assistant message push (A3). Cancel-safe via Notify.
     pub async fn wait_reply(&mut self, cancel: Arc<Notify>) -> Result<String, String> {
         let start_seq = self.state.response_baseline.load(Ordering::Acquire);
-        wait_for_reply_state(
-            &self.state,
-            start_seq,
-            Duration::from_millis(self.adapter.response_timeout_ms),
-            cancel,
-        )
-        .await
+        // An unconfirmed submission may or may not have reached the provider:
+        // wait a bounded window for a reply push, then report the uncertainty
+        // instead of sitting out the full provider timeout.
+        let unconfirmed = self.state.submission_unconfirmed.lock().unwrap().clone();
+        let timeout = if unconfirmed.is_some() {
+            Duration::from_millis(UNCONFIRMED_REPLY_WAIT_MS.min(self.adapter.response_timeout_ms))
+        } else {
+            Duration::from_millis(self.adapter.response_timeout_ms)
+        };
+        let outcome = wait_for_reply_state(&self.state, start_seq, timeout, cancel).await;
+        match outcome {
+            Ok(text) => Ok(text),
+            Err(e) => {
+                let provider_failure = self.state.response_error.lock().unwrap().is_some();
+                let request_id = self.state.active_request.lock().unwrap().clone();
+                if let Some(request_id) = request_id.as_deref() {
+                    if provider_failure {
+                        self.emit_state(request_id, REQUEST_FAILED, Some("provider_error"));
+                    } else if e == "stopped" {
+                        // C5: report the cancel REQUEST first, then its
+                        // completion — the two are distinguishable.
+                        self.emit_state(request_id, REQUEST_CANCEL_REQUESTED, None);
+                        self.emit_state(request_id, reply_wait_state(&e), None);
+                    } else {
+                        self.emit_state(request_id, reply_wait_state(&e), None);
+                    }
+                }
+                // Tear down the page-side watch. Waiting again after it has
+                // finished is not allowed, and a late completion push must not
+                // land in the next request's window.
+                let _ = self.fire("cancel_response", &json!(null));
+                if let Some(note) = self.state.submission_unconfirmed.lock().unwrap().clone() {
+                    if e.contains("response timeout") {
+                        return Err(format!(
+                            "{} and no assistant reply arrived within {}s. The prompt outcome is unknown — Neelima did NOT resend it. Open the provider window to check the conversation, then retry or start a new task.",
+                            note,
+                            timeout.as_secs()
+                        ));
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// One-shot, read-only reply capture from the provider page via the
+/// `capture_reply` page method. Returns Some(text) only when the page reports
+/// a present, non-empty reply candidate. Never resends anything.
+pub async fn capture_reply_once(
+    app: &tauri::AppHandle,
+    hub: &Arc<BridgeHub>,
+    timeout_ms: u64,
+) -> Result<Option<String>, String> {
+    match capture_reply_detail(app, hub, timeout_ms).await {
+        Ok(Some(v)) => {
+            let has_reply = v["has_reply"].as_bool() == Some(true);
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            if has_reply && !text.trim().is_empty() {
+                Ok(Some(text))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Full `capture_reply` payload (text, assistant count, stop-control state).
+/// Metadata only — the payload never leaves this process except as the reply
+/// text the agent already needs. Returns None when the page did not answer.
+pub async fn capture_reply_detail(
+    app: &tauri::AppHandle,
+    hub: &Arc<BridgeHub>,
+    timeout_ms: u64,
+) -> Result<Option<Value>, String> {
+    let Some(wv) = app.get_webview(PROVIDER_LABEL) else {
+        return Ok(None);
+    };
+    let (req_id, nonce, rx) = hub.begin();
+    let js = format!(
+        "window.__LB__ && window.__LB__.call('capture_reply', null, {:?}, {:?})",
+        req_id, nonce
+    );
+    if let Err(e) = wv.eval(js) {
+        hub.cancel(&req_id);
+        return Err(format!("capture eval failed: {e}"));
+    }
+    match BridgeHub::wait(rx, timeout_ms).await {
+        Ok(v) if v["ok"] == true => Ok(Some(v["value"].clone())),
+        Ok(_) => Ok(None),
+        Err(_) => {
+            hub.cancel(&req_id);
+            Ok(None)
+        }
     }
 }
 
@@ -430,6 +840,11 @@ async fn wait_for_reply_state(
         let notified = state.message_notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        // A page-reported generation failure ends the wait immediately; the
+        // agent must not sit out the full provider deadline after an error.
+        if let Some((_, message)) = state.response_error.lock().unwrap().clone() {
+            return Err(format!("provider reported an error: {message}"));
+        }
         let (seq, text) = state.last_message.lock().unwrap().clone();
         if seq > start_seq && !text.trim().is_empty() {
             return Ok(text);
@@ -442,6 +857,17 @@ async fn wait_for_reply_state(
             },
         }
     }
+}
+
+/// The read-only backstop's delivery rule. A candidate must be a real reply,
+/// not the previous turn still mounted in a reused provider chat, and not a
+/// reply that is still streaming.
+fn backstop_candidate(detail: Option<&Value>, baseline_text: &str) -> Option<String> {
+    let v = detail?;
+    let has_reply = v["has_reply"].as_bool() == Some(true);
+    let streaming = v["stop_visible"].as_bool() == Some(true);
+    let text = v["text"].as_str().unwrap_or("").trim().to_string();
+    (!text.is_empty() && has_reply && !streaming && text != baseline_text).then_some(text)
 }
 
 fn actionable_composer_error(state: &LoginState) -> String {
@@ -468,6 +894,11 @@ impl From<ProviderError> for String {
 pub enum ProviderError {
     NeedsLogin,
     BridgeUnreachable(String),
+    /// A DIFFERENT provider profile is mounted while this task is running, so
+    /// no send can be attempted. This is not page drift and must never be
+    /// reported as "provider page changed" — that message would send the user
+    /// hunting for stale selectors while the real cause is provider switching.
+    ProfileLocked(String),
     PageChanged(String),
     Timeout(String),
     SendFailed(String),
@@ -478,6 +909,9 @@ impl ProviderError {
         match self {
             ProviderError::NeedsLogin => "Provider sign-in or verification is required. Open the provider sign-in window, complete it, then retry; or select a configured API/local model.".into(),
             ProviderError::BridgeUnreachable(d) => format!("can't reach the provider page ({d})"),
+            ProviderError::ProfileLocked(d) => format!(
+                "{d}. Neelima kept the provider window it is already using; finish or stop the running task before switching providers, then retry."
+            ),
             ProviderError::PageChanged(d) => {
                 format!("provider page changed (selectors may be stale): {d}")
             }
@@ -493,14 +927,27 @@ impl std::fmt::Display for ProviderError {
     }
 }
 
-fn classify_send_result(result: &Value) -> Result<(), ProviderError> {
+fn classify_send_result(state: &WebviewState, result: &Value) -> Result<(), ProviderError> {
     match result["error_type"].as_str() {
+        // Nothing was clicked / nothing was submitted: a known, safe failure.
         Some("page_changed") => Err(ProviderError::PageChanged(
             result["error"]
                 .as_str()
                 .unwrap_or("provider input selector is missing")
                 .to_string(),
         )),
+        // The click happened but the provider did not confirm the prompt
+        // entered its conversation. Outcome UNKNOWN: continue (the response
+        // watch stays armed in the page), remember the uncertainty, and never
+        // resend. wait_reply reports it honestly if no reply arrives.
+        Some("send_unconfirmed") => {
+            let note = result["warning"]
+                .as_str()
+                .unwrap_or("the provider did not confirm the prompt entered its conversation")
+                .to_string();
+            *state.submission_unconfirmed.lock().unwrap() = Some(note);
+            Ok(())
+        }
         Some(_) => Err(ProviderError::SendFailed(
             result["error"]
                 .as_str()
@@ -537,8 +984,22 @@ fn mounted_profile_matches(
 }
 
 /// Push-event intake from bridge.rs.
-pub fn on_page_ready(app: &tauri::AppHandle) {
+pub fn on_page_ready(app: &tauri::AppHandle, runtime_id: &str) {
     let st: State<'_, Arc<WebviewState>> = app.state();
+    if !valid_runtime_id(runtime_id) {
+        return;
+    }
+    *st.runtime_session.lock().unwrap() = Some(runtime_id.to_string());
+    *st.last_message.lock().unwrap() = (0, String::new());
+    st.response_baseline.store(0, Ordering::Release);
+    // A (re)loaded document has no send bound to it; drop any stale ID so a
+    // previous page's completion cannot answer this page's request.
+    *st.active_request.lock().unwrap() = None;
+    *st.response_error.lock().unwrap() = None;
+    *st.request_streaming.lock().unwrap() = false;
+    *st.active_task.lock().unwrap() = None;
+    *st.active_conversation.lock().unwrap() = None;
+    st.stream.lock().unwrap().clear();
     st.page_ready.store(true, Ordering::Release);
     st.ready.notify_waiters();
     let _ = app.emit("evt", json!({"kind": "provider-page-ready"}));
@@ -579,22 +1040,247 @@ pub fn on_login_state(
     st.login_changed.notify_waiters();
 }
 
-pub fn on_assistant_message(webview: &Webview, text: String, seq: u64) {
+/// Streaming preview only. Rejected unless it belongs to the live page and
+/// the send Rust is currently waiting on; it never feeds the agent loop.
+pub fn on_assistant_partial(
+    webview: &Webview,
+    runtime_id: &str,
+    request_id: &str,
+    text: String,
+    truncated: bool,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(app) = webview.app_handle_or_empty() {
+        let st: State<'_, Arc<WebviewState>> = app.state();
+        let accepted = {
+            let current_runtime = st.runtime_session.lock().unwrap();
+            let active_request = st.active_request.lock().unwrap();
+            current_runtime.as_deref() == Some(runtime_id)
+                && active_request.as_deref() == Some(request_id)
+        };
+        if !accepted {
+            let _ = app.emit(
+                "evt",
+                json!({"kind": "assistant-partial-rejected", "request_id": request_id}),
+            );
+            return;
+        }
+        {
+            let mut stream = st.stream.lock().unwrap();
+            if *stream == text {
+                return; // nothing new to display
+            }
+            *stream = text.clone();
+        }
+        // First preview of this request: report the streaming transition once.
+        let mark_streaming = {
+            let mut streamed = st.request_streaming.lock().unwrap();
+            let first = !*streamed;
+            *streamed = true;
+            first
+        };
+        if mark_streaming {
+            let provider = mounted_adapter_id(&st);
+            let state_ref: &WebviewState = &st;
+            emit_request_state(
+                &app,
+                state_ref,
+                &provider,
+                request_id,
+                REQUEST_STREAMING,
+                None,
+            );
+        }
+        let _ = app.emit(
+            "evt",
+            json!({
+                "kind": "assistant-partial",
+                "request_id": request_id,
+                "text": text,
+                "truncated": truncated
+            }),
+        );
+    }
+}
+
+/// Page-side generation failure (provider error banner, interrupted stream,
+/// removed response). Only the active request may fail; a stale report is
+/// diagnosed and dropped. Never carries prompt/reply text.
+pub fn on_response_error(webview: &Webview, runtime_id: &str, request_id: &str, message: &str) {
+    if let Some(app) = webview.app_handle_or_empty() {
+        let st: State<'_, Arc<WebviewState>> = app.state();
+        let accepted = {
+            let current_runtime = st.runtime_session.lock().unwrap();
+            let active_request = st.active_request.lock().unwrap();
+            current_runtime.as_deref() == Some(runtime_id)
+                && active_request.as_deref() == Some(request_id)
+        };
+        if !accepted {
+            let _ = app.emit(
+                "evt",
+                json!({
+                    "kind": "assistant-push-rejected",
+                    "request_id": request_id,
+                    "reason": "stale provider error report"
+                }),
+            );
+            return;
+        }
+        let bounded: String = message.chars().take(300).collect();
+        *st.response_error.lock().unwrap() = Some((request_id.to_string(), bounded));
+        st.message_notify.notify_one();
+    }
+}
+
+pub fn on_assistant_message(
+    webview: &Webview,
+    runtime_id: &str,
+    request_id: &str,
+    text: String,
+    seq: u64,
+) {
     let _ = webview;
     if let Some(app) = webview.app_handle_or_empty() {
         let st: State<'_, Arc<WebviewState>> = app.state();
-        {
+        let accepted = {
+            let current_runtime = st.runtime_session.lock().unwrap();
+            let active_request = st.active_request.lock().unwrap().clone();
             let mut last = st.last_message.lock().unwrap();
-            if seq >= last.0 {
+            if current_runtime
+                .as_deref()
+                .map(|current| {
+                    accept_assistant_push(
+                        current,
+                        last.0,
+                        runtime_id,
+                        seq,
+                        active_request.as_deref(),
+                        request_id,
+                    )
+                })
+                .unwrap_or(false)
+                && !text.trim().is_empty()
+            {
                 *last = (seq, text.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !accepted {
+            // Correlation rejections must be diagnosable: a silently dropped
+            // push looks identical to "no response ever arrived" and wastes a
+            // live debugging session. Diagnose stale runtime vs stale seq.
+            let (current_runtime, last_seq, active_request) = {
+                let current_runtime = st.runtime_session.lock().unwrap();
+                let last = st.last_message.lock().unwrap();
+                let active = st.active_request.lock().unwrap().clone();
+                (current_runtime.clone(), last.0, active)
+            };
+            let reason = match current_runtime.as_deref() {
+                None => "no page ready has been processed yet",
+                Some(current) if current != runtime_id => "stale runtime (page reloaded mid-wait)",
+                Some(_) if active_request.as_deref() != Some(request_id) => {
+                    "stale request (reply belongs to an earlier send)"
+                }
+                Some(_) if seq <= last_seq => "stale sequence (duplicate or late push)",
+                Some(_) => "empty response text",
+            };
+            let _ = app.emit(
+                "evt",
+                json!({
+                    "kind": "assistant-push-rejected",
+                    "request_id": request_id,
+                    "seq": seq,
+                    "reason": reason
+                }),
+            );
+            return;
+        }
+        // A delivered reply is positive proof of an authenticated provider
+        // session: flip the login posture so the sign-in card stops claiming
+        // "unknown" for a profile that is demonstrably chatting.
+        {
+            let mut login = st.login.lock().unwrap();
+            if !matches!(*login, LoginState::LoggedIn { .. }) {
+                let url = match &*login {
+                    LoginState::LoggedIn { url }
+                    | LoginState::LoggedOut { url }
+                    | LoginState::Unknown { url, .. }
+                    | LoginState::Loading { url, .. }
+                    | LoginState::Challenge { url, .. } => url.clone(),
+                };
+                *login = LoginState::LoggedIn { url };
             }
         }
+        st.stream.lock().unwrap().clear();
         st.message_notify.notify_one();
+        st.login_changed.notify_waiters();
         let _ = app.emit(
             "evt",
-            json!({"kind": "assistant-stream-complete", "len": text.len()}),
+            json!({
+                "kind": "assistant-stream-complete",
+                "request_id": request_id,
+                "len": text.len()
+            }),
+        );
+        let provider = mounted_adapter_id(&st);
+        let state_ref: &WebviewState = &st;
+        emit_request_state(
+            &app,
+            state_ref,
+            &provider,
+            request_id,
+            REQUEST_COMPLETED,
+            None,
+        );
+        let _ = app.emit(
+            "evt",
+            json!({"kind": "provider-login-state", "state": "logged_in", "url": "", "reason": "assistant reply received"}),
         );
     }
+}
+
+fn valid_runtime_id(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn should_start_provider_chat(
+    first_of_task: bool,
+    active_conversation: Option<&str>,
+    conversation_id: &str,
+) -> bool {
+    first_of_task && active_conversation != Some(conversation_id)
+}
+
+fn accept_runtime_sequence(
+    current_runtime: &str,
+    last_seq: u64,
+    incoming_runtime: &str,
+    incoming_seq: u64,
+) -> bool {
+    current_runtime == incoming_runtime && incoming_seq > last_seq
+}
+
+/// Every push must match the live page instance, be newer than the last
+/// delivered sequence, AND belong to the send Rust is currently waiting on.
+/// The request check is what prevents a late completion from an abandoned
+/// round being used as the answer to a newer prompt.
+fn accept_assistant_push(
+    current_runtime: &str,
+    last_seq: u64,
+    incoming_runtime: &str,
+    incoming_seq: u64,
+    active_request: Option<&str>,
+    incoming_request: &str,
+) -> bool {
+    accept_runtime_sequence(current_runtime, last_seq, incoming_runtime, incoming_seq)
+        && active_request == Some(incoming_request)
 }
 
 /// Small helper so tests can compile without a real Webview handle.
@@ -624,7 +1310,7 @@ pub async fn mount(
         return Ok(());
     }
     if current.is_some() && *state.task_active.lock().unwrap() {
-        return Err("cannot change provider profile while an agent task is active".into());
+        return Err(PROFILE_LOCKED.to_string());
     }
     unmount_if_any(app, state);
     let mount_nonce = hub.new_nonce();
@@ -635,9 +1321,11 @@ pub async fn mount(
         url: String::new(),
     };
     *state.last_message.lock().unwrap() = (0, String::new());
+    *state.runtime_session.lock().unwrap() = None;
     *state.chat_started_for.lock().unwrap() = None;
     *state.last_bridge_error.lock().unwrap() = None;
     *state.hidden_since.lock().unwrap() = None;
+    *state.parked.lock().unwrap() = false;
 
     let window = app.get_window("main").ok_or("main window missing")?;
     let script = injection_script(adapter, &mount_nonce);
@@ -660,8 +1348,18 @@ pub async fn mount(
     let nav_app = app.clone();
     let mut builder = WebviewBuilder::new(PROVIDER_LABEL, url)
         .initialization_script(script)
-        .focused(false)
-        .on_navigation(move |url| {
+        .focused(false);
+    #[cfg(windows)]
+    {
+        // Keep WebView2 timers and rendering live while the pane is parked or
+        // hidden during a task. The first flag list is Tauri's Windows default
+        // --disable-features set (kept intact); the rest disable background
+        // throttling so a busy task is never slowed by pane visibility.
+        builder = builder.additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows",
+        );
+    }
+    let mut builder = builder.on_navigation(move |url| {
             let s = url.to_string();
             if let Ok(parsed) = tauri::Url::parse(&s) {
                 if provider_url_allowed(
@@ -884,11 +1582,30 @@ fn valid_profile_id(profile_id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A7: hide the webview (do NOT destroy) so the page never reloads when the
-/// user clicks Chat. Destroying only happens via explicit close/idle sweep.
+/// A7: when a task is active, PARK the webview (move it off-screen) instead of
+/// hiding it — a hidden WebView2 page reports visibilityState "hidden", which
+/// can throttle timers and defer rendering and has been observed to stretch
+/// the page-side send path past Rust's budget. Parked at its real size, the
+/// page stays fully live while never covering the UI. When no task runs, hide
+/// as before and schedule the idle destroy sweep.
+/// Hide the provider pane. It is a real browser view: it must never be left
+/// partially on screen. Parking it at a negative offset used the pane's
+/// *reported* rect, which is 0×0 until the provider screen has been laid out —
+/// so during a chat task the webview was nudged a few hundred pixels left and
+/// stayed visible over the UI. Hiding it outright removes that failure mode.
+///
+/// The page keeps working while hidden: mount() disables Chromium background
+/// throttling for this webview and the runtime overrides document visibility,
+/// and live bridge logs show ready/login pushes arriving from a hidden pane.
 pub fn hide_if_any(app: &tauri::AppHandle, state: &WebviewState) {
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         let _ = wv.hide();
+        *state.parked.lock().unwrap() = false;
+        if *state.task_active.lock().unwrap() {
+            // An active task owns the page: never queue its idle destruction.
+            *state.hidden_since.lock().unwrap() = None;
+            return;
+        }
         *state.hidden_since.lock().unwrap() = Some(Instant::now());
         let app = app.clone();
         let state = app.state::<Arc<WebviewState>>().inner().clone();
@@ -899,22 +1616,42 @@ pub fn hide_if_any(app: &tauri::AppHandle, state: &WebviewState) {
     }
 }
 
-pub fn apply_rect(app: &tauri::AppHandle, state: &WebviewState, rect: Rect) {
-    *state.rect.lock().unwrap() = rect;
-    if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
+/// Return a parked/hidden provider webview to its real pane position.
+fn unpark(wv: &tauri::Webview, state: &WebviewState) {
+    if *state.parked.lock().unwrap() {
+        let rect = *state.rect.lock().unwrap();
         let _ = wv.set_position(Position::Physical(tauri::PhysicalPosition::new(
             rect.x, rect.y,
         )));
+        *state.parked.lock().unwrap() = false;
+    }
+}
+
+pub fn apply_rect(app: &tauri::AppHandle, state: &WebviewState, rect: Rect) {
+    *state.rect.lock().unwrap() = rect;
+    if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         let _ = wv.set_size(Size::Physical(tauri::PhysicalSize::new(
             rect.w.max(1) as u32,
             rect.h.max(1) as u32,
         )));
+        if *state.parked.lock().unwrap() {
+            // Keep the pane parked off-screen at its (possibly new) size.
+            let _ = wv.set_position(Position::Physical(tauri::PhysicalPosition::new(
+                -rect.w.max(1) - 200,
+                rect.y,
+            )));
+        } else {
+            let _ = wv.set_position(Position::Physical(tauri::PhysicalPosition::new(
+                rect.x, rect.y,
+            )));
+        }
     }
 }
 
 pub fn set_visible(app: &tauri::AppHandle, state: &WebviewState, visible: bool) {
     if let Some(wv) = app.get_webview(PROVIDER_LABEL) {
         if visible {
+            unpark(&wv, state);
             let _ = wv.show();
             *state.hidden_since.lock().unwrap() = None;
         } else {
@@ -980,6 +1717,112 @@ fn safe_web_origin(url: &tauri::Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_sequence_accepts_only_current_runtime_and_strictly_new_sequences() {
+        assert!(accept_runtime_sequence("runtime-a", 0, "runtime-a", 1));
+        assert!(!accept_runtime_sequence("runtime-a", 1, "runtime-a", 1));
+        assert!(!accept_runtime_sequence("runtime-a", 3, "runtime-a", 2));
+        assert!(!accept_runtime_sequence("runtime-b", 9, "runtime-a", 10));
+        assert!(accept_runtime_sequence("runtime-b", 0, "runtime-b", 1));
+    }
+
+    /// The cross-round leak: a watch from send #1 completes after send #2 has
+    /// started. Same page, higher sequence — only the request ID distinguishes
+    /// them, and the stale push must be rejected.
+    #[test]
+    fn assistant_push_must_match_the_active_request_id() {
+        assert!(accept_assistant_push(
+            "runtime-a",
+            2,
+            "runtime-a",
+            3,
+            Some("task-1.aaaaaaaa"),
+            "task-1.aaaaaaaa"
+        ));
+        assert!(!accept_assistant_push(
+            "runtime-a",
+            2,
+            "runtime-a",
+            9,
+            Some("task-1.bbbbbbbb"),
+            "task-1.aaaaaaaa"
+        ));
+        assert!(!accept_assistant_push(
+            "runtime-a",
+            2,
+            "runtime-a",
+            9,
+            None,
+            "task-1.aaaaaaaa"
+        ));
+        assert!(!accept_assistant_push(
+            "runtime-a",
+            2,
+            "runtime-b",
+            3,
+            Some("task-1.aaaaaaaa"),
+            "task-1.aaaaaaaa"
+        ));
+        assert!(!accept_assistant_push(
+            "runtime-a",
+            5,
+            "runtime-a",
+            5,
+            Some("task-1.aaaaaaaa"),
+            "task-1.aaaaaaaa"
+        ));
+    }
+
+    /// The read-only backstop must never resurface the previous turn of a
+    /// reused provider chat, never deliver a still-streaming reply, and never
+    /// deliver an empty capture.
+    #[test]
+    fn backstop_only_accepts_a_new_finished_reply() {
+        let old = json!({"has_reply": true, "stop_visible": false, "text": "OLD REPLY"});
+        assert_eq!(backstop_candidate(Some(&old), "OLD REPLY"), None);
+
+        let streaming = json!({"has_reply": true, "stop_visible": true, "text": "NEW"});
+        assert_eq!(backstop_candidate(Some(&streaming), "OLD REPLY"), None);
+
+        let empty = json!({"has_reply": false, "stop_visible": false, "text": ""});
+        assert_eq!(backstop_candidate(Some(&empty), ""), None);
+
+        let fresh = json!({"has_reply": true, "stop_visible": false, "text": "  NEW REPLY  "});
+        assert_eq!(
+            backstop_candidate(Some(&fresh), "OLD REPLY").as_deref(),
+            Some("NEW REPLY")
+        );
+        assert_eq!(backstop_candidate(None, ""), None);
+    }
+
+    #[test]
+    fn provider_chat_is_reused_for_followups_and_reset_for_a_new_conversation() {
+        assert!(!should_start_provider_chat(
+            true,
+            Some("conversation-a"),
+            "conversation-a"
+        ));
+        assert!(!should_start_provider_chat(
+            false,
+            Some("conversation-a"),
+            "conversation-a"
+        ));
+        assert!(should_start_provider_chat(
+            true,
+            Some("conversation-a"),
+            "conversation-b"
+        ));
+        assert!(should_start_provider_chat(true, None, "conversation-a"));
+    }
+
+    #[test]
+    fn runtime_ids_are_bounded_and_safe_for_bridge_identity() {
+        assert!(valid_runtime_id("session-123456"));
+        assert!(!valid_runtime_id("short"));
+        assert!(!valid_runtime_id("runtime id with spaces"));
+        assert!(!valid_runtime_id(&"x".repeat(129)));
+    }
 
     #[tokio::test]
     async fn missing_provider_response_returns_a_recoverable_timeout() {
@@ -1150,13 +1993,56 @@ mod tests {
 
     #[test]
     fn stale_send_selector_is_classified_as_page_changed() {
-        let err = classify_send_result(&json!({
-            "error_type": "page_changed",
-            "error": "input selector was not found"
-        }))
+        let state = WebviewState::default();
+        let err = classify_send_result(
+            &state,
+            &json!({
+                "error_type": "page_changed",
+                "error": "input selector was not found"
+            }),
+        )
         .unwrap_err();
         assert!(matches!(err, ProviderError::PageChanged(_)));
-        assert!(classify_send_result(&json!({"sent": true})).is_ok());
+        assert!(classify_send_result(&state, &json!({"sent": true})).is_ok());
+        assert!(state.submission_unconfirmed.lock().unwrap().is_none());
+    }
+
+    /// The r8 regression: a clicked-but-unconfirmed submission is an UNKNOWN
+    /// outcome — the send is accepted (the response watch stays armed in the
+    /// page), the uncertainty is recorded, and nothing is resent.
+    #[test]
+    fn unconfirmed_submission_is_accepted_with_uncertainty_recorded() {
+        let state = WebviewState::default();
+        let result = classify_send_result(
+            &state,
+            &json!({
+                "sent": true,
+                "submission_confirmed": false,
+                "error_type": "send_unconfirmed",
+                "warning": "the provider did not confirm the prompt entered its conversation; awaiting a response without resending"
+            }),
+        );
+        assert!(result.is_ok(), "unconfirmed must NOT abort the task");
+        let note = state.submission_unconfirmed.lock().unwrap().clone();
+        assert!(
+            note.is_some(),
+            "uncertainty is recorded for the honest wait message"
+        );
+        assert!(note.unwrap().contains("did not confirm"));
+    }
+
+    /// The send RPC budget must exceed the page-side worst case
+    /// (waitForSendButton 3s + waitSubmission 8s ≈ 11s) or a slow-but-succeeding
+    /// submission is cancelled mid-flight and its late result is discarded.
+    #[test]
+    fn send_budget_exceeds_page_side_worst_case() {
+        // The page can spend ~11s locating the button and confirming the
+        // submission; the RPC budget must keep margin over that.
+        const {
+            assert!(SEND_CALL_TIMEOUT_MS > 13_000);
+            assert!(CALL_TIMEOUT_MS <= SEND_CALL_TIMEOUT_MS);
+            assert!(UNCONFIRMED_REPLY_WAIT_MS >= 30_000);
+        };
     }
 
     #[test]
@@ -1169,6 +2055,99 @@ mod tests {
         assert!(!mounted_profile_matches(Some(&mounted), "p2", "a1"));
         assert!(!mounted_profile_matches(Some(&mounted), "p1", "a2"));
         assert!(!mounted_profile_matches(None, "p1", "a1"));
+    }
+
+    /// Step 1 contract: every request reports ordered transitions and exactly
+    /// one terminal outcome, even if error paths race after it.
+    #[test]
+    fn lifecycle_reports_exactly_one_terminal_state_per_request() {
+        let mut terminal = None;
+        for state in [
+            REQUEST_CREATED,
+            REQUEST_SUBMITTING,
+            REQUEST_SUBMITTED,
+            REQUEST_STREAMING,
+        ] {
+            assert!(
+                allow_request_state(&mut terminal, "r1", state),
+                "{state} should be emitted"
+            );
+        }
+        assert!(allow_request_state(&mut terminal, "r1", REQUEST_COMPLETED));
+        for late in [
+            REQUEST_STREAMING,
+            REQUEST_COMPLETED,
+            REQUEST_TIMED_OUT,
+            REQUEST_CANCELLED,
+        ] {
+            assert!(
+                !allow_request_state(&mut terminal, "r1", late),
+                "{late} after the terminal state must be suppressed"
+            );
+        }
+        // A different request ID begins a fresh lifecycle.
+        assert!(allow_request_state(&mut terminal, "r2", REQUEST_CREATED));
+        assert!(allow_request_state(&mut terminal, "r2", REQUEST_FAILED));
+    }
+
+    #[tokio::test]
+    async fn a_page_reported_error_wakes_the_reply_waiter_immediately() {
+        let st = WebviewState::default();
+        *st.response_error.lock().unwrap() = Some((
+            "r1".into(),
+            "the provider stopped generating without a reply".into(),
+        ));
+        let err = wait_for_reply_state(&st, 0, Duration::from_secs(30), Arc::new(Notify::new()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("provider reported an error"), "got: {err}");
+        assert!(err.contains("stopped generating"));
+    }
+
+    #[test]
+    fn terminal_reply_wait_states_distinguish_cancel_from_timeout() {
+        assert_eq!(reply_wait_state("stopped"), REQUEST_CANCELLED);
+        assert_eq!(reply_wait_state("response timeout"), REQUEST_TIMED_OUT);
+        assert!(is_terminal_request_state(REQUEST_CANCELLED));
+        assert!(is_terminal_request_state(REQUEST_TIMED_OUT));
+        assert!(!is_terminal_request_state(REQUEST_STREAMING));
+        assert!(!is_terminal_request_state(REQUEST_SUBMISSION_UNCONFIRMED));
+    }
+
+    /// A provider switch during a running task is a BUSY state, not DOM drift:
+    /// reporting it as "provider page changed (selectors may be stale)" sent
+    /// users hunting for stale selectors while the reply sat on the page.
+    #[test]
+    fn a_locked_provider_window_is_reported_as_busy_not_page_drift() {
+        let err = ProviderError::ProfileLocked(PROFILE_LOCKED.to_string());
+        assert_eq!(error_category(&err), "busy");
+        let msg = err.message();
+        assert!(!msg.contains("selectors may be stale"), "got: {msg}");
+        assert!(msg.contains("stop the running task"), "actionable: {msg}");
+        assert!(msg.contains(PROFILE_LOCKED), "keeps the real cause: {msg}");
+    }
+
+    #[test]
+    fn failure_categories_never_carry_page_text() {
+        for (err, category) in [
+            (ProviderError::NeedsLogin, "login_required"),
+            (
+                ProviderError::BridgeUnreachable("secret page text".into()),
+                "page_unavailable",
+            ),
+            (ProviderError::PageChanged("secret".into()), "page_changed"),
+            (ProviderError::Timeout("secret".into()), "timeout"),
+            (ProviderError::SendFailed("secret".into()), "send_failed"),
+        ] {
+            assert_eq!(error_category(&err), category);
+        }
+        let st = WebviewState::default();
+        let busy = classify_send_result(
+            &st,
+            &json!({"error_type": "busy", "error": "a prompt is already being submitted"}),
+        )
+        .unwrap_err();
+        assert_eq!(error_category(&busy), "send_failed");
     }
 
     /// A2: the page's ONLY allowed message types never include file ops.

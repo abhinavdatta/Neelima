@@ -13,12 +13,14 @@ Windows). They are **hot-reloaded on save** — no rebuild, no restart.
     "input": "textarea",                     // the prompt box
     "send_button": "button[type=submit]",    // the send control
     "stop_button": null,                     // optional: visible while generating
-    "messages": "main",                      // container that mutates during streaming
+    "messages": "main",                      // assistant reply nodes (may go stale)
     "new_chat": null,                        // optional: start a fresh chat
-    "logged_in": null                        // optional: selector that exists only when logged in
+    "logged_in": null,                       // optional: ACCOUNT marker (never the composer)
+    "logged_out": null,                      // optional: sign-in marker
+    "user_message": null                     // optional: the user's own turn (confirmation identity)
   },
   "input": { "kind": "textarea", "max_chars": 8000 },
-  "quiet_ms": 2000,                          // completion = this much mutation-silence
+  "quiet_ms": 2000,                          // one quiet window (completion needs two when no stop control)
   "response_timeout_ms": 300000,
   "built_in": false
 }
@@ -29,9 +31,44 @@ Windows). They are **hot-reloaded on save** — no rebuild, no restart.
   `insertText` via `execCommand` — fires the real InputEvents that
   ProseMirror/Slate editors listen to).
 - Prompts longer than `max_chars` are inserted in chunks (single send).
-- Completion detection is **event-driven**: a `MutationObserver` on the
-  messages container re-arms a quiet-period timer; the stop-button state is
-  checked with bounded rechecks. No `setInterval` polling anywhere.
+- A click is never treated as submission success. Confirmation requires a new
+  matching user turn (exact or head+tail match), or an emptied composer plus a
+  visible stop control / new assistant turn. An unconfirmed send is reported
+  as `send_unconfirmed`, is never retried automatically, and waits a bounded
+  window while the reply watch stays armed.
+- Completion detection is **event-driven**: a `MutationObserver` on
+  `document.body` (SPAs may replace the conversation container) compares reply
+  content against a pre-send baseline. The configured `stop_button` is
+  authoritative while visible; without one, two independent quiet windows with
+  identical content are required, so a stream pause is not reported as a
+  finished answer. An SPA that replaces `main` mid-stream cannot deafen it.
+- If `messages` selectors go stale, the reply is found as the sibling following
+  the last confirmed user turn. If the stop control was seen and then vanished
+  without a new assistant turn, the page reports `response_error` and the wait
+  fails immediately instead of running to the deadline.
+- Streaming previews are display-only, throttled accumulated tails; the agent
+  only ever consumes the single completed message.
+- Cancellation (Rust cancel/timeout or a superseding send) tears down the page
+  watch and disconnects its observer, so a late reply cannot land in the next
+  request.
+
+## Response contract and live verification
+
+One request ID is generated per send and echoed on every push; Rust rejects a
+push with a missing ID, a mismatched ID, a stale page runtime, or a
+non-increasing sequence, and emits `assistant-push-rejected` with the reason.
+Lifecycle metadata (`provider-request-state`, no prompt/reply text) is emitted
+as `created → submitting → submitted | submission_unconfirmed → streaming →
+completed | failed | timed_out | cancelled`. Exactly one terminal state is
+reported per request.
+
+The provider sign-in pane's **Send READY check** button (and
+`ui_provider_probe`) sends the harmless prompt
+`For this connectivity check, reply with exactly READY. Do not use tools.`
+through the real send/watch pipeline and displays the captured reply, elapsed
+time and request ID. Use it per provider to verify the live path; a reply that
+is not exactly `READY` is shown as captured-but-not-READY rather than passed
+off as success.
 
 ## The Adapter Inspector
 

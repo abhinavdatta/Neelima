@@ -20,8 +20,58 @@ async function refresh() {
   $('mode-state').textContent = s.permissionMode === 'workspace_auto_write' ? 'Automatic workspace writes*' : 'Approve each modification';
   $('sites-state').textContent = [...(s.enabledSites || []), ...(s.genericSites?.length ? [`${s.genericSites.length} custom`] : [])].join(', ') || 'None';
   $('paused').checked = Boolean(s.paused);
+  await refreshActivity();
+}
+async function refreshActivity() {
+  const list = $('activity-list');
+  if (!list) return;
+  list.replaceChildren();
+  try {
+    const response = await send({ type: 'NEELIMA_GET_ACTIVITY' });
+    const entries = Array.isArray(response?.activity) ? response.activity : [];
+    for (const entry of entries.slice(0, 8)) {
+      const li = document.createElement('li');
+      const heading = document.createElement('strong'); heading.textContent = `${entry.type || 'Event'}${entry.site ? ` · ${entry.site}` : ''}`;
+      const detail = document.createElement('span'); detail.textContent = [entry.status, entry.message].filter(Boolean).join(' — ') || 'Recorded';
+      const time = document.createElement('time'); time.textContent = entry.at ? new Date(entry.at).toLocaleTimeString() : '';
+      li.append(heading, detail, time); list.appendChild(li);
+    }
+    const requestResponse = await send({ type: 'NEELIMA_GET_REQUESTS' });
+    for (const request of (Array.isArray(requestResponse?.requests) ? requestResponse.requests : []).slice(0, 8)) {
+      const li = document.createElement('li');
+      const heading = document.createElement('strong');
+      heading.textContent = `Request ${request.status || 'unknown'}${request.site ? ` · ${request.site}` : ''}`;
+      const detail = document.createElement('span');
+      detail.textContent = [request.tool, request.message].filter(Boolean).join(' · ') || 'No details';
+      const time = document.createElement('time');
+      time.textContent = request.updatedAt ? new Date(request.updatedAt).toLocaleTimeString() : '';
+      li.append(heading, detail, time); list.appendChild(li);
+    }
+    if (!list.children.length) { const li = document.createElement('li'); li.textContent = 'No activity recorded yet.'; list.appendChild(li); }
+  } catch (error) { const li = document.createElement('li'); li.textContent = error?.message || 'Could not load activity.'; list.appendChild(li); }
 }
 $('refresh').addEventListener('click', () => void refresh());
+$('refresh-activity').addEventListener('click', () => void refreshActivity());
+$('clear-activity').addEventListener('click', async () => {
+  const response = await send({ type: 'NEELIMA_CLEAR_ACTIVITY' });
+  $('diagnostics-result').textContent = response?.ok ? 'Activity history cleared.' : 'Could not clear activity history.';
+  await refreshActivity();
+});
+$('export-diagnostics').addEventListener('click', async () => {
+  const result = $('diagnostics-result');
+  try {
+    const [status, diagnostics, activity] = await Promise.all([
+      send({ type: 'NEELIMA_GET_STATUS' }),
+      send({ type: 'NEELIMA_GET_DIAGNOSTICS' }),
+      send({ type: 'NEELIMA_GET_ACTIVITY' })
+    ]);
+    const report = { generatedAt: new Date().toISOString(), status: { connected: Boolean(status?.nativeHostConnected), error: status?.connectionError || '', protocolVersion: status?.protocolVersion || 1 }, diagnostics: diagnostics?.diagnostics || {}, recentActivity: activity?.activity || [] };
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob); const link = document.createElement('a');
+    link.href = url; link.download = `neelima-extension-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    link.click(); URL.revokeObjectURL(url); result.textContent = 'Diagnostic report exported. It contains operational metadata, not prompt or file contents.';
+  } catch (error) { result.textContent = error?.message || 'Could not export diagnostics.'; }
+});
 $('open-options').addEventListener('click', () => chrome.runtime.openOptionsPage());
 $('paused').addEventListener('change', async event => {
   const current = await send({ type: 'NEELIMA_GET_SETTINGS' });
