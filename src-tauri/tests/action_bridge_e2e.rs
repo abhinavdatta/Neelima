@@ -561,3 +561,42 @@ async fn forged_authorization_fields_cannot_authorize() {
     assert!(!serialized.contains("forged-task"));
     assert_eq!(record.descriptor.risk, neelima_lib::action::Risk::Write);
 }
+
+/// FullAccess auto-approves WRITES on the bridge route too — completing the
+/// mode×risk matrix at the e2e level (reads: full_access test above).
+#[tokio::test]
+async fn full_access_auto_approves_writes() {
+    let handle = headless_app();
+    let hub = Arc::new(BrowserBridgeHub::default());
+    let slot = workspace_slot();
+    let settings = settings_for(PermissionMode::FullAccess);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let args = json!({"path": "notes.txt", "content": "full access write"});
+
+    let task = spawn_propose(
+        &handle,
+        &hub,
+        &slot,
+        &settings,
+        request_id.clone(),
+        "write_file",
+        args,
+    );
+    let (status, result) = task.await.expect("task completes");
+
+    assert_eq!(status, "executed");
+    assert!(
+        result["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("notes.txt"),
+        "the write really ran: {}",
+        result["output"]
+    );
+    assert_eq!(hub.pending_count(), 0, "FullAccess never asks");
+    let ledger = handle.state::<Arc<ActionLedger>>();
+    let record = ledger.find_by_transport(&request_id).expect("recorded");
+    assert!(!record.approval.required);
+    assert_eq!(record.approval.status, ApprovalStatus::NotRequired);
+    assert_eq!(record.outcome, Some(ActionOutcome::Succeeded));
+}

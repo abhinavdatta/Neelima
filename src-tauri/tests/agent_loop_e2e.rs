@@ -1008,3 +1008,76 @@ fn action_ledger_records_agent_route_actions() {
     assert_eq!(read.outcome, Some(ActionOutcome::Succeeded));
     assert!(!read.execution.as_ref().unwrap().had_diff);
 }
+
+// ---------------------------------------------------------------------------
+// 10. Phase B: under AskAll the AGENT route asks for reads too — the same
+//     policy the browser-bridge route now follows (one shared mapping).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ask_all_requires_approval_for_agent_reads() {
+    use neelima_lib::action::{ActionOutcome, ApprovalStatus};
+
+    let h = harness_seeded(
+        "askall-read",
+        PermissionMode::AskAll,
+        12,
+        "Read notes.txt with the read_file tool.",
+        &[("notes.txt", "agent read probe")],
+    );
+    let deadline = Instant::now() + DEADLINE;
+
+    // Round 1: a READ under AskAll must stop for an explicit approval.
+    h.wait_prompts(1, deadline);
+    h.paste(&tool_block("rd1", "read_file", "{\"path\":\"notes.txt\"}"));
+    h.wait_state(AgentState::AwaitingApproval, deadline);
+    h.shared
+        .cmd_tx
+        .send(AgentCommand::Approve(vec![CallDecision {
+            id: "rd1".into(),
+            approved: true,
+        }]))
+        .expect("approval channel is open");
+
+    // Round 2: the approved read really executed.
+    h.wait_prompts(2, deadline);
+    let payload = result_payload(&h.snapshot().prompts[1], "rd1");
+    assert_eq!(
+        payload["ok"],
+        Value::Bool(true),
+        "approved read ran: {payload}"
+    );
+    assert!(
+        payload["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent read probe"),
+        "the real file content came back: {payload}"
+    );
+
+    h.paste("DONE: read approved and executed");
+    h.wait_terminal(deadline);
+
+    let task_id = h
+        .shared
+        .task_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("task id recorded");
+    let ledger = h.app.state::<Arc<neelima_lib::action::ActionLedger>>();
+    let records: Vec<_> = ledger
+        .snapshot()
+        .into_iter()
+        .filter(|r| r.task_id.as_deref() == Some(&task_id))
+        .collect();
+    assert_eq!(records.len(), 1, "one record for the one call");
+    let record = &records[0];
+    assert!(
+        record.approval.required,
+        "AskAll requires approval for reads"
+    );
+    assert_eq!(record.approval.status, ApprovalStatus::Approved);
+    assert_eq!(record.approval.decision_source.as_deref(), Some("user_ui"));
+    assert_eq!(record.outcome, Some(ActionOutcome::Succeeded));
+}
