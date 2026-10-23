@@ -108,8 +108,11 @@ impl ActiveAgent {
 pub struct AgentInput {
     pub app: tauri::AppHandle,
     pub task_id: String,
+    pub conversation_id: String,
     pub prompt: String,
     pub skill_context: String,
+    /// Step 3: which workspace files may be attached, and which the user vetoed.
+    pub context: crate::context::Options,
     pub provider: Provider,
     pub ws: Workspace,
     pub settings: Settings,
@@ -117,6 +120,56 @@ pub struct AgentInput {
     pub webview_state: Arc<WebviewState>,
     pub shared: Arc<AgentShared>,
     pub prior_entries: Vec<TranscriptEntry>,
+}
+
+/// Metadata-only summary of the project context attached to this task. It
+/// names the files (provenance) but never their contents.
+fn context_note(sel: &crate::context::Selection) -> String {
+    let skipped = &sel.skipped;
+    let mut skips: Vec<String> = Vec::new();
+    if skipped.binary > 0 {
+        skips.push(format!("{} binary", skipped.binary));
+    }
+    if skipped.oversized > 0 {
+        skips.push(format!("{} oversized", skipped.oversized));
+    }
+    if skipped.unreadable > 0 {
+        skips.push(format!("{} unreadable", skipped.unreadable));
+    }
+    if skipped.outside > 0 {
+        skips.push(format!("{} outside the workspace", skipped.outside));
+    }
+    let skip_text = if skips.is_empty() {
+        String::new()
+    } else {
+        format!("; skipped {}", skips.join(", "))
+    };
+    if sel.files.is_empty() {
+        return format!(
+            "Project context: no workspace file matched this prompt, so it was sent without file contents ({} files scanned{skip_text}).",
+            sel.considered
+        );
+    }
+    let shown: Vec<&str> = sel.files.iter().take(6).map(|f| f.path.as_str()).collect();
+    let extra = sel.files.len().saturating_sub(shown.len());
+    format!(
+        "Project context: {} file(s), {} of {} budget{} from {} files scanned{skip_text}. Included: {}{}.",
+        sel.files.len(),
+        crate::context::human_bytes(sel.bytes),
+        crate::context::human_bytes(sel.budget_bytes),
+        if sel.truncated {
+            " — truncated to the provider budget"
+        } else {
+            ""
+        },
+        sel.considered,
+        shown.join(", "),
+        if extra > 0 {
+            format!(" and {extra} more")
+        } else {
+            String::new()
+        }
+    )
 }
 
 fn entry(kind: &str, text: String) -> TranscriptEntry {
@@ -176,6 +229,154 @@ fn completion_reports_unavailable_tools(summary: &str) -> bool {
         .any(|phrase| summary.contains(phrase))
 }
 
+// ---------------------------------------------------------------------------
+// Phase A: unified action ledger (observational — never an authorization input)
+// ---------------------------------------------------------------------------
+
+/// Mint + validate the ledger record for one call of the current batch and,
+/// when the approval decision is already known, record it. Returns `None`
+/// when no ledger is managed (some tests) — recording must never be
+/// load-bearing, and every decision below is still made by the existing
+/// approval/execution code.
+#[allow(clippy::too_many_arguments)]
+fn record_action_begin(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    request_id: Option<&str>,
+    call: &ToolCall,
+    approved: bool,
+    approval_required: bool,
+    mode: crate::settings::PermissionMode,
+    provider: &str,
+) -> Option<String> {
+    let ledger = crate::action::ledger_of(app)?;
+    let risk = crate::action::risk_of_tool(&call.tool);
+    let begin = crate::action::BeginAction {
+        origin: crate::action::ActionOrigin {
+            proposer: crate::action::Proposer::Agent,
+            provider: Some(provider.to_string()),
+            site: None,
+            page_origin: None,
+        },
+        intake: crate::action::Intake::AgentLoop,
+        category: crate::action::category_of_tool(&call.tool),
+        tool: Some(&call.tool),
+        risk,
+        args: Some(&call.args),
+        task_id: Some(task_id),
+        request_id,
+        transport_request_id: None,
+        approval_required,
+        approval_reason: Some(format!("mode={mode:?} risk={risk:?}")),
+    };
+    let action_id = ledger.begin(&begin)?;
+    let _ = ledger.validate(&action_id);
+    if approval_required {
+        let _ = ledger.await_approval(&action_id);
+        if approved {
+            let _ = ledger.decide_approval(&action_id, true);
+        }
+    }
+    Some(action_id)
+}
+
+/// A call the user did not approve. When approval was required this is a real
+/// rejection; in a mixed batch a call that did not need approval can also end
+/// up unapproved (the user acted only on the risky one) — recorded as such.
+fn action_record_not_approved(
+    app: &tauri::AppHandle,
+    action_id: Option<&str>,
+    approval_required: bool,
+) {
+    let (Some(ledger), Some(action_id)) = (crate::action::ledger_of(app), action_id) else {
+        return;
+    };
+    if approval_required {
+        let _ = ledger.decide_approval(action_id, false);
+    } else {
+        let _ = ledger.refuse(action_id, crate::action::category::NOT_APPROVED);
+    }
+}
+
+fn action_record_refused(app: &tauri::AppHandle, action_id: Option<&str>, category: &str) {
+    let (Some(ledger), Some(action_id)) = (crate::action::ledger_of(app), action_id) else {
+        return;
+    };
+    let _ = ledger.refuse(action_id, category);
+}
+
+/// The approval gate passed and the tool is about to run.
+fn action_record_execution_started(
+    app: &tauri::AppHandle,
+    action_id: Option<&str>,
+    executor: crate::action::Executor,
+) {
+    let (Some(ledger), Some(action_id)) = (crate::action::ledger_of(app), action_id) else {
+        return;
+    };
+    let _ = ledger.begin_execution(action_id, executor);
+}
+
+fn action_record_tool_settled(
+    app: &tauri::AppHandle,
+    action_id: Option<&str>,
+    ok: bool,
+    output_len: usize,
+    had_diff: bool,
+) {
+    let (Some(ledger), Some(action_id)) = (crate::action::ledger_of(app), action_id) else {
+        return;
+    };
+    let outcome = if ok {
+        crate::action::ActionOutcome::Succeeded
+    } else {
+        crate::action::ActionOutcome::Failed
+    };
+    let _ = ledger.settle(
+        action_id,
+        outcome,
+        crate::action::ExecutionMeta {
+            output_len: Some(output_len),
+            had_diff,
+            ..Default::default()
+        },
+        (!ok).then_some(crate::action::category::TOOL_ERROR),
+    );
+}
+
+fn action_record_command_settled(
+    app: &tauri::AppHandle,
+    action_id: Option<&str>,
+    ok: bool,
+    output_len: usize,
+    timed_out: bool,
+    killed: bool,
+) {
+    let (Some(ledger), Some(action_id)) = (crate::action::ledger_of(app), action_id) else {
+        return;
+    };
+    let outcome = if timed_out {
+        crate::action::ActionOutcome::TimedOut
+    } else if killed {
+        crate::action::ActionOutcome::Cancelled
+    } else if ok {
+        crate::action::ActionOutcome::Succeeded
+    } else {
+        crate::action::ActionOutcome::Failed
+    };
+    let _ = ledger.settle(
+        action_id,
+        outcome,
+        crate::action::ExecutionMeta {
+            output_len: Some(output_len),
+            process_timed_out: timed_out,
+            process_killed: killed,
+            ..Default::default()
+        },
+        (!ok && !timed_out && !killed).then_some(crate::action::category::TOOL_ERROR),
+    );
+}
+
 pub async fn run(mut input: AgentInput) {
     let app = input.app.clone();
     let shared = input.shared.clone();
@@ -214,8 +415,15 @@ pub async fn run(mut input: AgentInput) {
     }
 
     let ws_name = input.ws.display_name();
-    let mut meta = match input.history.create_task(
+    // Approval decisions can arrive while the loop is still in WaitingForAi
+    // (the user clicks before the agent re-enters the approval wait). Buffer
+    // them here so no decision is ever dropped; each is applied to the next
+    // pending batch it matches. Decisions left over after a batch belong to a
+    // different round and are ignored on purpose (per-batch approval).
+    let mut buffered_decisions: Vec<CallDecision> = Vec::new();
+    let mut meta = match input.history.create_task_in_conversation(
         &input.task_id,
+        &input.conversation_id,
         input.prompt.lines().next().unwrap_or("task"),
         &ws_name,
         &input.provider.describe(),
@@ -314,6 +522,49 @@ pub async fn run(mut input: AgentInput) {
         ));
     }
 
+    // ---- Step 3: project context -----------------------------------------
+    // Selection happens BEFORE the first send and is read-only. The prompt is
+    // unaffected when nothing is selected, so Step 2 behaviour is preserved
+    // byte-for-byte for no-context prompts.
+    let context_selection = {
+        let prior_prompts: Vec<String> = input
+            .prior_entries
+            .iter()
+            .filter(|e| e.kind == "user_prompt")
+            .map(|e| e.text.clone())
+            .collect();
+        let query = crate::context::query_for(&input.prompt, &prior_prompts);
+        crate::context::select_for(
+            &input.ws,
+            &query,
+            &input.settings,
+            input.provider.context_kind(),
+            &input.context,
+        )
+    };
+    if input.context.enabled {
+        let note = context_note(&context_selection);
+        // Metadata only: counts, budget and paths — never file contents.
+        let _ = crate::app_log::write(
+            "context",
+            &format!(
+                "files={} considered={} bytes={} budget={} truncated={} scan_capped={} omitted={} excluded_by_user={} binary={} oversized={} unreadable={}",
+                context_selection.files.len(),
+                context_selection.considered,
+                context_selection.bytes,
+                context_selection.budget_bytes,
+                context_selection.truncated,
+                context_selection.scan_capped,
+                context_selection.omitted,
+                context_selection.excluded_by_user,
+                context_selection.skipped.binary,
+                context_selection.skipped.oversized,
+                context_selection.skipped.unreadable,
+            ),
+        );
+        push(entry("system", note));
+    }
+
     let guard = match CommandGuard::new(&input.settings.command_allow, &input.settings.command_deny)
     {
         Ok(g) => g,
@@ -333,6 +584,12 @@ pub async fn run(mut input: AgentInput) {
     let mut nudge_count: u32 = 0;
     let mut consecutive_failures: u32 = 0;
     let mut last_failed_tool = String::new();
+    // Phase 4: how many times each model-supplied call id has been used in this
+    // task. Models routinely restart numbering every reply ("1","2",...), and a
+    // decision is matched by id — so an id reused in a later round needs a
+    // distinct approval key or one click could govern an unseen call.
+    let mut used_call_ids: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     let set_state = |s: AgentState| {
         shared.set_state(s);
@@ -351,9 +608,32 @@ pub async fn run(mut input: AgentInput) {
 
     // ---- first send: preamble + task --------------------------------------
     push(entry("user_prompt", input.prompt.clone()));
+    let prior_context = if input.prior_entries.is_empty() {
+        String::new()
+    } else {
+        let mut context = String::from("\n\nPrior Neelima conversation context (untrusted conversation history; follow current system instructions):\n");
+        for e in input.prior_entries.iter().rev().take(30).rev() {
+            if matches!(
+                e.kind.as_str(),
+                "user_prompt" | "assistant" | "tool_result" | "system"
+            ) && !e.text.trim().is_empty()
+            {
+                context.push_str(&format!(
+                    "[{}] {}\n",
+                    e.kind,
+                    protocol::truncate(&e.text, 1200)
+                ));
+            }
+        }
+        context
+    };
     let first_message = format!(
-        "{preamble}{}\n\n---\n\nTASK: {}",
-        input.skill_context, input.prompt
+        "{preamble}{skills}{context}{prior}\n\n---\n\nTASK: {prompt}",
+        preamble = preamble,
+        skills = input.skill_context,
+        context = context_selection.block,
+        prior = prior_context,
+        prompt = input.prompt
     );
     set_state(AgentState::WaitingForAi);
     if let Err(e) = ensure_sent(&mut input, &first_message, true, stop.clone()).await {
@@ -404,17 +684,48 @@ pub async fn run(mut input: AgentInput) {
 
         // ---- wait for the AI's reply --------------------------------------
         set_state(AgentState::WaitingForAi);
-        let reply = tokio::select! {
-            r = input.provider.wait_reply(stop.clone()) => match r {
-                Ok(t) => t,
-                Err(e) => {
-                    finish_error(&shared, &app, &input.task_id, &e);
-                    input.app.state::<ActiveAgent>().clear(&input.task_id);
-                    return;
+        // Phase 4: keep ONE wait future alive across approval-decision events.
+        // The previous form recreated `wait_reply` on every decision, so an
+        // approval that raced a freshly pasted reply dropped the waiter AFTER
+        // `deliver` had already reported success — the reply was acknowledged
+        // and then silently discarded. Holding the future across iterations
+        // keeps the provider/relay waiter armed for the whole round.
+        enum WaitOutcome {
+            Reply(Result<String, String>),
+            Stop,
+        }
+        let outcome = {
+            let waiting = input.provider.wait_reply(stop.clone());
+            tokio::pin!(waiting);
+            loop {
+                tokio::select! {
+                    r = &mut waiting => break WaitOutcome::Reply(r),
+                    _ = stop.notified() => break WaitOutcome::Stop,
+                    Some(d) = approve_rx.recv() => {
+                        buffered_decisions.extend(d);
+                    }
                 }
-            },
-            _ = stop.notified() => { continue; }
-            _ = approve_rx.recv() => { continue; }
+            }
+        };
+        let reply = match outcome {
+            WaitOutcome::Stop => continue,
+            WaitOutcome::Reply(Ok(t)) => t,
+            WaitOutcome::Reply(Err(e)) => {
+                if halted.load(Ordering::SeqCst) || e == "stopped" {
+                    finish(
+                        &shared,
+                        &app,
+                        &mut meta,
+                        &input,
+                        AgentState::Cancelled,
+                        "stopped by user".into(),
+                    );
+                } else {
+                    finish_error(&shared, &app, &input.task_id, &e);
+                }
+                input.app.state::<ActiveAgent>().clear(&input.task_id);
+                return;
+            }
         };
 
         set_state(AgentState::Parsing);
@@ -528,11 +839,25 @@ pub async fn run(mut input: AgentInput) {
                     tool_needs_approval(&c.tool, &c.args, input.settings.permission_mode, &guard)
                 };
                 let any_needs = calls.iter().any(needs_approval);
+                // Unique approval key per call occurrence in this task (first use
+                // keeps the model's id, later uses are prefixed with the count).
+                let approval_keys: Vec<String> = calls
+                    .iter()
+                    .map(|c| {
+                        let count = used_call_ids.entry(c.id.clone()).or_insert(0);
+                        *count += 1;
+                        if *count == 1 {
+                            c.id.clone()
+                        } else {
+                            format!("{count}:{}", c.id)
+                        }
+                    })
+                    .collect();
                 let decisions: Vec<(ToolCall, bool)> = if any_needs {
                     set_state(AgentState::AwaitingApproval);
                     let mut pending = Vec::new();
-                    for c in &calls {
-                        let mut obj = json!({"id": c.id, "tool": c.tool, "args": c.args, "risk": call_risk(&c.tool)});
+                    for (c, key) in calls.iter().zip(&approval_keys) {
+                        let mut obj = json!({"id": key, "tool": c.tool, "args": c.args, "risk": call_risk(&c.tool)});
                         if WRITE_TOOLS.contains(&c.tool.as_str()) {
                             if let Some(d) = preview_diff(&input.ws, c) {
                                 obj["diff"] = d;
@@ -560,12 +885,21 @@ pub async fn run(mut input: AgentInput) {
                             return;
                         }
                     };
+                    // Merge early decisions buffered while WaitingForAi: a
+                    // decision delivered before this wait must still count.
+                    let merged = {
+                        let mut all = buffered_decisions.clone();
+                        all.extend(decisions);
+                        all
+                    };
+                    buffered_decisions.clear();
                     calls
                         .iter()
-                        .map(|c| {
-                            let approved = decisions
+                        .zip(&approval_keys)
+                        .map(|(c, key)| {
+                            let approved = merged
                                 .iter()
-                                .find(|d| d.id == c.id)
+                                .find(|d| &d.id == key)
                                 .map(|d| d.approved)
                                 .unwrap_or(false);
                             (c.clone(), approved)
@@ -589,7 +923,29 @@ pub async fn run(mut input: AgentInput) {
                 }
 
                 let mut result_blocks = String::from("Results of your tool calls:\n");
+                // Phase A: correlate this batch to the task's most recent
+                // provider request (it has usually already completed by the
+                // time tools run — unlike live_for_task, this survives that).
+                let ledger_request_id = app
+                    .try_state::<std::sync::Arc<crate::request::RequestRegistry>>()
+                    .and_then(|registry| registry.latest_for_task(&task_id));
                 for (call, approved) in &decisions {
+                    let approval_required = tool_needs_approval(
+                        &call.tool,
+                        &call.args,
+                        input.settings.permission_mode,
+                        &guard,
+                    );
+                    let action_id = record_action_begin(
+                        &app,
+                        &task_id,
+                        ledger_request_id.as_deref(),
+                        call,
+                        *approved,
+                        approval_required,
+                        input.settings.permission_mode,
+                        &input.provider.describe(),
+                    );
                     let mut record = CallRecord {
                         id: call.id.clone(),
                         tool: call.tool.clone(),
@@ -599,6 +955,7 @@ pub async fn run(mut input: AgentInput) {
                     };
                     let (ok, output, diff): (bool, String, Option<DiffInfo>) = if !*approved {
                         record.status = "rejected".into();
+                        action_record_not_approved(&app, action_id.as_deref(), approval_required);
                         (false, "rejected by the user".into(), None)
                     } else if call.tool == "run_command" {
                         let command = call
@@ -608,6 +965,11 @@ pub async fn run(mut input: AgentInput) {
                             .unwrap_or("")
                             .to_string();
                         if let Err(e) = guard.check(&command) {
+                            action_record_refused(
+                                &app,
+                                action_id.as_deref(),
+                                crate::action::category::GUARD_DENIED,
+                            );
                             (false, format!("blocked: {e}"), None)
                         } else {
                             let cwd = call
@@ -615,11 +977,20 @@ pub async fn run(mut input: AgentInput) {
                                 .get("cwd")
                                 .and_then(Value::as_str)
                                 .map(String::from);
-                            let timeout = call
+                            action_record_execution_started(
+                                &app,
+                                action_id.as_deref(),
+                                crate::action::Executor::RustExec,
+                            );
+                            // Phase 4: both sources of this value are untrusted
+                            // (model args and a hand-edited settings file), so the
+                            // clamp happens here as well as inside exec.
+                            let requested = call
                                 .args
                                 .get("timeout")
                                 .and_then(Value::as_u64)
-                                .unwrap_or(input.settings.command_timeout_secs);
+                                .or(Some(input.settings.command_timeout_secs));
+                            let timeout = exec::clamp_timeout(requested);
                             let app2 = app.clone();
                             let chunk_task = task_id.clone();
                             let call_id = call.id.clone();
@@ -638,10 +1009,30 @@ pub async fn run(mut input: AgentInput) {
                                     }
                                 },
                             ).await;
+                            action_record_command_settled(
+                                &app,
+                                action_id.as_deref(),
+                                out.ok,
+                                out.output.len(),
+                                out.timed_out,
+                                out.killed,
+                            );
                             (out.ok, out.output, None)
                         }
                     } else {
+                        action_record_execution_started(
+                            &app,
+                            action_id.as_deref(),
+                            crate::action::Executor::RustTools,
+                        );
                         let out = tools::execute(&input.ws, call, &input.settings);
+                        action_record_tool_settled(
+                            &app,
+                            action_id.as_deref(),
+                            out.ok,
+                            out.output.len(),
+                            out.diff.is_some(),
+                        );
                         let diff = out.diff.map(|(p, o, n)| DiffInfo {
                             path: p,
                             old: o,
@@ -723,7 +1114,7 @@ async fn ensure_sent(
     let web_provider = matches!(&input.provider, Provider::Web(_));
     let result = tokio::select! {
         _ = stop.notified() => return Err("stopped by user while waiting for provider".into()),
-        result = input.provider.send(&input.task_id, text, first_of_task) => result,
+        result = input.provider.send(&input.task_id, &input.conversation_id, text, first_of_task) => result,
     };
     result.map_err(|error| provider_send_failure(&provider_name, &error.to_string(), web_provider))
 }
@@ -753,6 +1144,9 @@ impl AgentLifecycleGuard {
         state: Arc<crate::webprov::WebviewState>,
     ) -> Self {
         *state.task_active.lock().unwrap() = true;
+        // A running task uses the provider page in the background. Make sure its
+        // browser pane is not left on screen over Neelima's own conversation.
+        crate::webprov::hide_if_any(&app, &state);
         Self {
             app,
             task_id,
@@ -777,6 +1171,12 @@ impl Drop for AgentLifecycleGuard {
             );
         }
         let _ = self.history.fail_if_running(&self.task_id);
+        // Phase A: after the guard drops, nothing can progress this task's
+        // open ledger records anymore — close them truthfully (executing ones
+        // become UnknownOutcome, earlier ones NotExecuted).
+        if let Some(ledger) = crate::action::ledger_of(&self.app) {
+            let _ = ledger.fail_open_for_task(&self.task_id);
+        }
         // Clear the webview task flag before releasing the active-task slot.
         // A new task can only start after `clear`, so the old guard cannot
         // overwrite the new task's flag afterward.
@@ -1099,6 +1499,44 @@ mod tests {
         assert!(!local.contains("sign-in window"));
     }
 
+    /// Early-approval race: a decision delivered while the loop is still in
+    /// WaitingForAi is buffered and applied to the next approval wait instead
+    /// of being silently dropped (which would deadlock until Stop).
+    #[test]
+    fn early_approval_decisions_are_buffered_not_dropped() {
+        // (Behavior probe of the same channel plumbing the loop uses.)
+        let (approve_tx, mut approve_rx) = mpsc::unbounded_channel::<Vec<CallDecision>>();
+        approve_tx
+            .send(vec![CallDecision {
+                id: "1".into(),
+                approved: true,
+            }])
+            .unwrap();
+        // Replaying the loop's select arms: the recv returns the early decision.
+        let got = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(approve_rx.recv())
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "1");
+        assert!(got[0].approved);
+    }
+
+    /// Phase A: the approval gate's risk strings and the ledger's risk
+    /// mapping must never drift — the ledger records what the gate used.
+    #[test]
+    fn call_risk_agrees_with_action_risk_mapping() {
+        for (tool, _) in tools::tool_names() {
+            let expected = match crate::action::risk_of_tool(tool) {
+                crate::action::Risk::Read => "read",
+                crate::action::Risk::Write => "write",
+                crate::action::Risk::Command => "command",
+                crate::action::Risk::Other => "other",
+            };
+            assert_eq!(call_risk(tool), expected, "risk drift for {tool}");
+        }
+    }
+
     #[test]
     fn preview_diff_skips_large_existing_files() {
         let root = std::env::temp_dir().join(format!("neelima-preview-{}", uuid::Uuid::new_v4()));
@@ -1118,5 +1556,86 @@ mod tests {
         assert_eq!(preview["new"], "[diff omitted: file exceeds 2 MB]");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Phase 4: the approval gate is the trust boundary for model output.
+    /// Every tool class x permission mode combination is asserted explicitly so
+    /// a future edit cannot quietly widen one of them.
+    #[test]
+    fn approval_matrix_covers_every_tool_class_and_permission_mode() {
+        use crate::sec::CommandGuard;
+        use crate::settings::PermissionMode::{AskAll, AskWrites, FullAccess};
+        let guard = CommandGuard::new(&[], &[]).unwrap();
+        let read = json!({"path": "src/main.rs"});
+        let write = json!({"path": "new.txt", "content": "x"});
+        let benign_cmd = json!({"command": "cargo test"});
+
+        let needs = |tool: &str, args: &Value, mode| tool_needs_approval(tool, args, mode, &guard);
+
+        // Reads: only AskAll asks.
+        for mode in [AskAll, AskWrites, FullAccess] {
+            assert_eq!(
+                needs("read_file", &read, mode),
+                mode == AskAll,
+                "{mode:?} read"
+            );
+        }
+        // Writes: AskAll and AskWrites ask; FullAccess does not.
+        for mode in [AskAll, AskWrites, FullAccess] {
+            assert_eq!(
+                needs("write_file", &write, mode),
+                mode != FullAccess,
+                "{mode:?} write"
+            );
+        }
+        // Commands follow the same rule as writes...
+        for mode in [AskAll, AskWrites, FullAccess] {
+            assert_eq!(
+                needs("run_command", &benign_cmd, mode),
+                mode != FullAccess,
+                "{mode:?} command"
+            );
+        }
+        // ...UNLESS the command matches an always-ask pattern, which forces the
+        // dialog even in FullAccess.
+        let destructive = json!({"command": "rm -rf ~"});
+        for mode in [AskAll, AskWrites, FullAccess] {
+            assert!(
+                needs("run_command", &destructive, mode),
+                "{mode:?} rm -rf ~"
+            );
+        }
+        // A missing/empty command is not an auto-approve: it is still subject to
+        // the mode (and the runner refuses it separately).
+        let empty = json!({});
+        assert!(needs("run_command", &empty, AskAll));
+        assert!(needs("run_command", &empty, AskWrites));
+
+        // Unknown tools are never auto-approved outside FullAccess, and even
+        // there the dispatcher refuses them (tools::execute has no arm for them).
+        let unknown = json!({"anything": true});
+        for mode in [AskAll, AskWrites] {
+            assert!(needs("exec_everything", &unknown, mode), "{mode:?} unknown");
+        }
+        let outcome = crate::tools::execute(
+            &Workspace::open(&std::env::temp_dir()).unwrap(),
+            &ToolCall {
+                id: "u".into(),
+                tool: "exec_everything".into(),
+                args: unknown,
+                security_nonce: None,
+            },
+            &Settings::default(),
+        );
+        assert!(
+            !outcome.ok,
+            "an unknown tool must never run: {:?}",
+            outcome.output
+        );
+        assert!(
+            outcome.output.contains("unknown tool"),
+            "{}",
+            outcome.output
+        );
     }
 }
