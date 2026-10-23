@@ -39,7 +39,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, State, Webview};
 use tokio::sync::oneshot;
 
-use crate::settings::{PermissionMode, SettingsStore};
+use crate::settings::SettingsStore;
 use crate::tools;
 use crate::ui::WorkspaceSlot;
 
@@ -435,20 +435,19 @@ pub async fn approve_and_execute(
         source,
     } = *req;
     let permission_mode = settings.get().permission_mode;
-    let write_tool = matches!(
-        tool,
-        "write_file" | "edit_file" | "move_file" | "delete_file"
-    );
-    let needs_approval = matches!(
-        permission_mode,
-        PermissionMode::AskAll | PermissionMode::AskWrites
-    ) && write_tool;
+    // Phase B: the bridge follows the SAME risk→approval mapping as the agent
+    // route (`action::approval_required`). Under AskAll, read proposals now
+    // wait for an explicit user decision too — previously the bridge
+    // auto-executed reads in every mode. The extension's stored preference
+    // and any webpage-supplied fields remain irrelevant: the backend's mode
+    // is the only authority.
+    let risk = crate::action::risk_of_tool(tool);
+    let needs_approval = crate::action::approval_required(risk, permission_mode);
 
     // Phase A: record this proposal in the unified action ledger before any
     // decision. The ledger is observational; every gate below is unchanged.
     let ledger = crate::action::ledger_of(app);
     let action_id = ledger.as_ref().and_then(|l| {
-        let risk = crate::action::risk_of_tool(tool);
         let begin = crate::action::BeginAction {
             origin: crate::action::ActionOrigin {
                 proposer: crate::action::Proposer::BrowserExtension,

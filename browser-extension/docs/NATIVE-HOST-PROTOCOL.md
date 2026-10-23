@@ -131,7 +131,7 @@ Statuses the backend returns:
 
 | Status | Meaning |
 |---|---|
-| `executed` | Read-only tool ran without approval (per the backend's permission mode) |
+| `executed` | The tool ran without approval — possible for reads under `ask_writes`/`full_access`, and for any bridge tool under `full_access` (per the backend's permission mode) |
 | `approved_and_executed` | The user approved in Neelima and the tool ran |
 | `rejected` | The user (or a cancelled approval) declined; nothing executed |
 | `timeout` | No approval decision within the backend window; nothing executed |
@@ -149,6 +149,17 @@ The extension additionally maps unknown statuses to a defensive
 `accepted_by_backend` ("acknowledged only — never claim execution") and keeps
 `awaiting_approval` in its known-status table for forward compatibility; the
 backend does not return either value today.
+
+**Approval policy (implemented, Phase B).** The bridge applies the SAME
+risk-based mapping as the agent route — one shared function
+(`action::approval_required`), so the two routes cannot drift. Reads require
+approval only in `ask_all`; writes require approval in `ask_all` and
+`ask_writes`; `full_access` auto-approves inside the workspace (confinement,
+the tool allowlist, and argument validation still always apply — the bridge
+allowlist never includes `run_command`). The authority is the desktop
+backend's permission mode alone; the extension's stored preference and any
+webpage-supplied authorization fields are ignored. `bridge.capabilities`
+reports this policy machine-readably under `approval_policy`.
 
 ### Timing budgets (implemented)
 

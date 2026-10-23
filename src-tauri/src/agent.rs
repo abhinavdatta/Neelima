@@ -205,12 +205,9 @@ fn tool_needs_approval(
             return true;
         }
     }
-    match call_risk(tool) {
-        "read" => !mode.auto_approve_read(),
-        "write" => !mode.auto_approve_write(),
-        "command" => !mode.auto_approve_command(),
-        _ => !mode.auto_approve_write(),
-    }
+    // Phase B: one shared risk→approval mapping for both routes — the bridge
+    // cannot drift from the agent's policy because this IS the agent's policy.
+    crate::action::approval_required(crate::action::risk_of_tool(tool), mode)
 }
 
 const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "delete_file", "move_file"];

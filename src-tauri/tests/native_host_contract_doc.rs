@@ -99,3 +99,18 @@ fn implemented_section_lists_the_real_error_codes() {
         );
     }
 }
+
+/// Phase B: the doc must describe the unified, mode-dependent approval policy
+/// (reads ask in ask_all; same mapping as the agent route).
+#[test]
+fn implemented_section_states_the_unified_approval_policy() {
+    let doc = contract_doc();
+    assert!(
+        doc.contains("approval_policy"),
+        "the doc must reference the machine-readable approval_policy field"
+    );
+    assert!(
+        doc.contains("risk-based mapping") || doc.contains("risk-based\nmapping"),
+        "the doc must state the bridge uses the same risk-based mapping as the agent route"
+    );
+}

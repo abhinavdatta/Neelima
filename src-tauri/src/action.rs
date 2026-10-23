@@ -131,6 +131,26 @@ pub fn risk_of_tool(tool: &str) -> Risk {
     }
 }
 
+/// The single risk → approval mapping used by BOTH intake routes (agent loop
+/// and browser bridge), so `AskAll`/`AskWrites` mean the same thing
+/// everywhere. The agent route additionally force-asks for dangerous
+/// `run_command` forms via `CommandGuard::needs_ask` BEFORE consulting this
+/// (bridge tools never reach that case: the allowlist excludes commands).
+///
+/// Phase B: the browser bridge previously auto-executed reads in every mode;
+/// it now follows this mapping exactly, so under AskAll a read proposal waits
+/// for an explicit user decision just like an agent-proposed read. The
+/// authority is always the backend's `SettingsStore` mode — extension
+/// preferences and webpage-supplied fields never reach this decision.
+pub fn approval_required(risk: Risk, mode: crate::settings::PermissionMode) -> bool {
+    match risk {
+        Risk::Read => !mode.auto_approve_read(),
+        Risk::Write => !mode.auto_approve_write(),
+        Risk::Command => !mode.auto_approve_command(),
+        Risk::Other => !mode.auto_approve_write(),
+    }
+}
+
 /// Coarse category for a registered tool. Unregistered tools map to `Other`.
 pub fn category_of_tool(tool: &str) -> ActionCategory {
     match tool {
@@ -1249,5 +1269,46 @@ mod tests {
         assert_eq!(risk_of_tool("totally_unknown"), Risk::Other);
         assert_eq!(category_of_tool("totally_unknown"), ActionCategory::Other);
         assert_eq!(category_of_tool("run_command"), ActionCategory::Terminal);
+    }
+
+    /// Phase B: the shared risk→approval policy matrix — the SAME mapping
+    /// both routes use. This pins the AskAll fix: reads REQUIRE approval in
+    /// ask_all (the bridge used to auto-execute them in every mode).
+    #[test]
+    fn approval_policy_matrix_is_risk_based_per_mode() {
+        use crate::settings::PermissionMode;
+        // (risk, mode, approval required?)
+        let cases = [
+            (Risk::Read, PermissionMode::AskAll, true),
+            (Risk::Write, PermissionMode::AskAll, true),
+            (Risk::Command, PermissionMode::AskAll, true),
+            (Risk::Other, PermissionMode::AskAll, true),
+            (Risk::Read, PermissionMode::AskWrites, false),
+            (Risk::Write, PermissionMode::AskWrites, true),
+            (Risk::Command, PermissionMode::AskWrites, true),
+            (Risk::Other, PermissionMode::AskWrites, true),
+            (Risk::Read, PermissionMode::FullAccess, false),
+            (Risk::Write, PermissionMode::FullAccess, false),
+            (Risk::Command, PermissionMode::FullAccess, false),
+            (Risk::Other, PermissionMode::FullAccess, false),
+        ];
+        for (risk, mode, want) in cases {
+            assert_eq!(
+                approval_required(risk, mode),
+                want,
+                "risk={risk:?} mode={mode:?}"
+            );
+        }
+        // Every registered tool's classification flows through the shared fn:
+        // agent route and bridge route get identical answers by construction.
+        for (tool, _) in crate::tools::tool_names() {
+            for mode in [
+                PermissionMode::AskAll,
+                PermissionMode::AskWrites,
+                PermissionMode::FullAccess,
+            ] {
+                let _ = approval_required(risk_of_tool(tool), mode);
+            }
+        }
     }
 }

@@ -556,6 +556,12 @@ fn handle_bridge_capabilities(request_id: String) -> NativeHostResponse {
             "approval_timeout_secs": crate::browser_bridge::APPROVAL_TIMEOUT.as_secs(),
             "idempotency": "in-memory ring (not durable across app restarts)",
             "approval_required_for": ["write_file", "edit_file", "move_file", "delete_file"],
+            "approval_policy": {
+                "authority": "desktop backend permission mode only (any extension preference is display-only)",
+                "reads": "approval required in ask_all; auto-approved in ask_writes and full_access",
+                "writes": "approval required in ask_all and ask_writes; auto-approved in full_access",
+                "shared_with_agent_route": true,
+            },
         })),
         error: None,
     }
@@ -810,6 +816,17 @@ mod tests {
         assert!(tools.contains(&"read_file"));
         assert_eq!(result["max_propose_bytes"], 256 * 1024);
         assert_eq!(result["approval_timeout_secs"], 120);
+        // Phase B: the capabilities report states the unified, mode-dependent
+        // approval policy shared with the agent route.
+        assert_eq!(result["approval_policy"]["shared_with_agent_route"], true);
+        assert!(result["approval_policy"]["reads"]
+            .as_str()
+            .unwrap()
+            .contains("ask_all"));
+        assert!(result["approval_policy"]["authority"]
+            .as_str()
+            .unwrap()
+            .contains("display-only"));
     }
 
     /// bridge.status reports the bounded, metadata-only state the extension
