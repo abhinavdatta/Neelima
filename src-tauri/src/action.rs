@@ -120,14 +120,13 @@ pub enum Risk {
     Other,
 }
 
-/// Mirrors `agent::call_risk` for the registered tool set (parity-tested in
-/// agent.rs so the two mappings cannot drift).
+/// Risk for a tool name — delegated to the authoritative per-tool registry
+/// (`tools::REGISTRY`), so schema, risk classification and dispatch share
+/// one source. Unregistered names classify as `Other`.
 pub fn risk_of_tool(tool: &str) -> Risk {
-    match tool {
-        "read_file" | "list_dir" | "glob" | "grep" => Risk::Read,
-        "write_file" | "edit_file" | "delete_file" | "move_file" => Risk::Write,
-        "run_command" => Risk::Command,
-        _ => Risk::Other,
+    match crate::tools::find_tool(tool) {
+        Some(spec) => spec.risk,
+        None => Risk::Other,
     }
 }
 
@@ -151,13 +150,11 @@ pub fn approval_required(risk: Risk, mode: crate::settings::PermissionMode) -> b
     }
 }
 
-/// Coarse category for a registered tool. Unregistered tools map to `Other`.
+/// Coarse category for a tool name — delegated to the registry as well.
 pub fn category_of_tool(tool: &str) -> ActionCategory {
-    match tool {
-        "run_command" => ActionCategory::Terminal,
-        "read_file" | "write_file" | "edit_file" | "list_dir" | "glob" | "grep" | "delete_file"
-        | "move_file" => ActionCategory::Workspace,
-        _ => ActionCategory::Other,
+    match crate::tools::find_tool(tool) {
+        Some(spec) => spec.category,
+        None => ActionCategory::Other,
     }
 }
 

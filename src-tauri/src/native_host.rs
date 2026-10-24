@@ -562,6 +562,12 @@ fn handle_bridge_capabilities(request_id: String) -> NativeHostResponse {
                 "writes": "approval required in ask_all and ask_writes; auto-approved in full_access",
                 "shared_with_agent_route": true,
             },
+            // Phase C: the full per-tool argument schemas, derived directly
+            // from the authoritative registry (tools::REGISTRY). Includes
+            // agent-only tools with bridge_allowed:false so discovery is
+            // truthful about what the desktop supports vs what the bridge
+            // exposes — capability data is informational, never authorization.
+            "tool_schemas": crate::tools::capability_schemas(),
         })),
         error: None,
     }

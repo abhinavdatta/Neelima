@@ -961,7 +961,19 @@ pub async fn run(mut input: AgentInput) {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        if let Err(e) = guard.check(&command) {
+                        // Phase C: typed argument validation from the shared
+                        // registry — a missing or non-string command fails
+                        // closed without spawning anything. Out-of-range
+                        // timeouts stay a clamp (executor) by design.
+                        if let Err(e) = crate::tools::validate_tool_args("run_command", &call.args)
+                        {
+                            action_record_refused(
+                                &app,
+                                action_id.as_deref(),
+                                crate::action::category::INVALID_ARGS,
+                            );
+                            (false, format!("run_command: invalid arguments: {e}"), None)
+                        } else if let Err(e) = guard.check(&command) {
                             action_record_refused(
                                 &app,
                                 action_id.as_deref(),

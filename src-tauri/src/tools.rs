@@ -55,18 +55,307 @@ fn cap_str(s: &str, cap: usize) -> (String, bool) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase C: shared per-tool argument-schema registry (the authoritative one)
+// ---------------------------------------------------------------------------
+//
+// One static registry describes every supported tool's executor contract:
+// argument names, types, required/optional, bounds, bridge availability and
+// risk metadata. BOTH intake routes validate against it (the bridge at
+// intake, the executor as a gate), and `action::risk_of_tool` /
+// `category_of_tool` delegate to it — so schema, risk classification and
+// dispatch cannot drift apart. Semantic checks (exact-match editing, path
+// confinement, regex compilation, timeout clamping) stay in the executor;
+// the schema gates types, presence and size only.
+
+/// Anti-DoS rail for any string argument. Far above legitimate use; the
+/// per-arg bound (`max_bytes`) may only be tighter, never looser.
+pub const MAX_ARG_STRING_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    /// JSON string.
+    Str,
+    /// JSON boolean.
+    Bool,
+    /// Non-negative integer (usize semantics; negatives/floats/strings fail).
+    Count,
+}
+
+/// Declared unknown-argument policy. `Ignore` is the shipped behavior:
+/// unknown keys are never interpreted, never authorize anything, and reach
+/// the action ledger only as shape metadata (kind + length), never values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownArgs {
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArgSpec {
+    pub name: &'static str,
+    pub kind: ArgKind,
+    pub required: bool,
+    /// Upper bound for `Str` args in bytes. `None` = MAX_ARG_STRING_BYTES.
+    pub max_bytes: Option<usize>,
+}
+
+const fn arg(name: &'static str, kind: ArgKind, required: bool) -> ArgSpec {
+    ArgSpec {
+        name,
+        kind,
+        required,
+        max_bytes: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    /// Human-readable signature for capability discovery (also the model
+    /// preamble text — one source for both).
+    pub description: &'static str,
+    pub category: crate::action::ActionCategory,
+    pub risk: crate::action::Risk,
+    /// Available through the browser bridge. `run_command` is false: shell
+    /// execution is never exposed over the bridge.
+    pub bridge_allowed: bool,
+    pub unknown_args: UnknownArgs,
+    pub args: &'static [ArgSpec],
+}
+
+const fn spec(tool: ToolSpec) -> ToolSpec {
+    tool
+}
+
+/// THE registry. Order is stable (it feeds capability reporting).
+pub static REGISTRY: &[ToolSpec] = &[
+    spec(ToolSpec {
+        name: "read_file",
+        description: "read_file(path, offset?, limit?) — read a text file, lines [offset, offset+limit).",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Read,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[
+            arg("path", ArgKind::Str, true),
+            arg("offset", ArgKind::Count, false),
+            arg("limit", ArgKind::Count, false),
+        ],
+    }),
+    spec(ToolSpec {
+        name: "write_file",
+        description: "write_file(path, content, append?) — create or overwrite (append:true to continue a chunked write).",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Write,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[
+            arg("path", ArgKind::Str, true),
+            ArgSpec {
+                max_bytes: Some(MAX_WRITE_BYTES),
+                ..arg("content", ArgKind::Str, true)
+            },
+            arg("append", ArgKind::Bool, false),
+        ],
+    }),
+    spec(ToolSpec {
+        name: "edit_file",
+        description: "edit_file(path, old_string, new_string, replace_all?) — exact-match replace; errors if ambiguous or missing.",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Write,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[
+            arg("path", ArgKind::Str, true),
+            // old_string must be non-empty — semantic, enforced by the executor.
+            arg("old_string", ArgKind::Str, true),
+            arg("new_string", ArgKind::Str, true),
+            arg("replace_all", ArgKind::Bool, false),
+        ],
+    }),
+    spec(ToolSpec {
+        name: "list_dir",
+        description: "list_dir(path) — one directory level: [type] name.",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Read,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[arg("path", ArgKind::Str, false)],
+    }),
+    spec(ToolSpec {
+        name: "glob",
+        description: "glob(pattern) — workspace-relative glob, .gitignore respected.",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Read,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[arg("pattern", ArgKind::Str, true)],
+    }),
+    spec(ToolSpec {
+        name: "grep",
+        description: "grep(pattern, path?, include?) — regex search, .gitignore respected, returns path:line: text.",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Read,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[
+            arg("pattern", ArgKind::Str, true),
+            arg("path", ArgKind::Str, false),
+            arg("include", ArgKind::Str, false),
+        ],
+    }),
+    spec(ToolSpec {
+        name: "run_command",
+        description: "run_command(command, cwd?, timeout?) — run a shell command inside the workspace (cwd is an optional workspace-relative folder, default the workspace root); output is streamed and capped.",
+        category: crate::action::ActionCategory::Terminal,
+        risk: crate::action::Risk::Command,
+        // Shell execution is intentionally unavailable over the browser
+        // bridge; the agent route guards it with CommandGuard + approval.
+        bridge_allowed: false,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[
+            arg("command", ArgKind::Str, true),
+            arg("cwd", ArgKind::Str, false),
+            // Out-of-range timeouts are CLAMPED by the executor (documented
+            // compatibility behavior), not rejected here.
+            arg("timeout", ArgKind::Count, false),
+        ],
+    }),
+    spec(ToolSpec {
+        name: "delete_file",
+        description: "delete_file(path) — remove a file (checkpoints can restore it).",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Write,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[arg("path", ArgKind::Str, true)],
+    }),
+    spec(ToolSpec {
+        name: "move_file",
+        description: "move_file(from, to) — rename/move within the workspace.",
+        category: crate::action::ActionCategory::Workspace,
+        risk: crate::action::Risk::Write,
+        bridge_allowed: true,
+        unknown_args: UnknownArgs::Ignore,
+        args: &[arg("from", ArgKind::Str, true), arg("to", ArgKind::Str, true)],
+    }),
+];
+
+/// Registry lookup by stable tool name.
+pub fn find_tool(name: &str) -> Option<&'static ToolSpec> {
+    REGISTRY.iter().find(|s| s.name == name)
+}
+
+/// Validate raw arguments against a tool spec. Fails closed on: non-object
+/// args, missing required args, wrong types, and out-of-bounds strings.
+/// Unknown keys are ignored per the spec's declared policy. `Value::Null`
+/// args are treated as an empty object (the protocol's `#[serde(default)]`
+/// produces Null when a call omits `args` entirely — list_dir relies on it).
+pub fn validate_args(spec: &ToolSpec, args: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let obj = match args {
+        Value::Null => &empty,
+        Value::Object(map) => map,
+        _ => return Err("arguments must be a JSON object".into()),
+    };
+    for arg in spec.args {
+        let Some(value) = obj.get(arg.name) else {
+            if arg.required {
+                return Err(format!("missing required argument '{}'", arg.name));
+            }
+            continue;
+        };
+        match value {
+            Value::Null if !arg.required => continue,
+            Value::Null => return Err(format!("missing required argument '{}'", arg.name)),
+            Value::String(s) if arg.kind == ArgKind::Str => {
+                let max = arg.max_bytes.unwrap_or(MAX_ARG_STRING_BYTES);
+                if s.len() > max {
+                    return Err(format!(
+                        "argument '{}' exceeds the maximum of {max} bytes",
+                        arg.name
+                    ));
+                }
+            }
+            Value::Bool(_) if arg.kind == ArgKind::Bool => {}
+            Value::Number(n) if arg.kind == ArgKind::Count => {
+                if n.as_u64().is_none() {
+                    return Err(format!(
+                        "argument '{}' must be a non-negative number",
+                        arg.name
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "argument '{}' must be {} (got {})",
+                    arg.name,
+                    match arg.kind {
+                        ArgKind::Str => "a string",
+                        ArgKind::Bool => "a boolean",
+                        ArgKind::Count => "a non-negative number",
+                    },
+                    json_kind_name(other)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate by tool name (for intake routes that hold the raw name).
+pub fn validate_tool_args(tool: &str, args: &Value) -> Result<(), String> {
+    match find_tool(tool) {
+        Some(spec) => validate_args(spec, args),
+        None => Err(format!("unknown tool '{tool}'")),
+    }
+}
+
+fn json_kind_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Tool names + human-readable signatures, derived from the registry (used
+/// by the model preamble and kept byte-identical to the historical text).
 pub fn tool_names() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("read_file", "read_file(path, offset?, limit?) — read a text file, lines [offset, offset+limit)."),
-        ("write_file", "write_file(path, content, append?) — create or overwrite (append:true to continue a chunked write)."),
-        ("edit_file", "edit_file(path, old_string, new_string, replace_all?) — exact-match replace; errors if ambiguous or missing."),
-        ("list_dir", "list_dir(path) — one directory level: [type] name."),
-        ("glob", "glob(pattern) — workspace-relative glob, .gitignore respected."),
-        ("grep", "grep(pattern, path?, include?) — regex search, .gitignore respected, returns path:line: text."),
-        ("run_command", "run_command(command, cwd?, timeout?) — run a shell command inside the workspace (cwd is an optional workspace-relative folder, default the workspace root); output is streamed and capped."),
-        ("delete_file", "delete_file(path) — remove a file (checkpoints can restore it)."),
-        ("move_file", "move_file(from, to) — rename/move within the workspace."),
-    ]
+    REGISTRY.iter().map(|s| (s.name, s.description)).collect()
+}
+
+/// Machine-readable schema summary for `bridge.capabilities`, derived
+/// directly from the registry — no second hard-coded list.
+pub fn capability_schemas() -> Value {
+    Value::Array(
+        REGISTRY
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "category": s.category,
+                    "risk": s.risk,
+                    "description": s.description,
+                    "bridge_allowed": s.bridge_allowed,
+                    "unknown_args": "ignore",
+                    "args": s.args.iter().map(|a| serde_json::json!({
+                        "name": a.name,
+                        "kind": match a.kind {
+                            ArgKind::Str => "string",
+                            ArgKind::Bool => "boolean",
+                            ArgKind::Count => "count",
+                        },
+                        "required": a.required,
+                        "max_bytes": a.max_bytes,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    )
 }
 
 pub fn execute(
@@ -75,6 +364,23 @@ pub fn execute(
     settings: &crate::settings::Settings,
 ) -> ToolOutcome {
     let args = &call.args;
+    // Phase C gate: every dispatch validates against the registry first, so
+    // no route can reach an executor with wrongly-typed, missing or
+    // oversized arguments. Semantic checks stay in the executors below.
+    let Some(spec) = find_tool(&call.tool) else {
+        return err_out(format!(
+            "unknown tool '{}'. Available: {}",
+            call.tool,
+            REGISTRY
+                .iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    if let Err(e) = validate_args(spec, args) {
+        return err_out(format!("{}: invalid arguments: {e}", call.tool));
+    }
     match call.tool.as_str() {
         "read_file" => read_file(ws, args, settings.result_cap_bytes),
         "write_file" => write_file(ws, args),
@@ -88,9 +394,9 @@ pub fn execute(
         "run_command" => err_out("run_command must be executed by the agent loop".into()),
         other => err_out(format!(
             "unknown tool '{other}'. Available: {}",
-            tool_names()
+            REGISTRY
                 .iter()
-                .map(|(n, _)| *n)
+                .map(|s| s.name)
                 .collect::<Vec<_>>()
                 .join(", ")
         )),

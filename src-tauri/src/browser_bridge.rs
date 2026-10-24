@@ -264,6 +264,11 @@ pub fn validate_browser_bridge_request(
     if !args.is_object() && !args.is_null() {
         return Err(BridgeValidationError::InvalidArgs);
     }
+    // Phase C: typed schema validation from the shared registry — wrong
+    // types, missing required arguments and oversized values fail closed at
+    // intake (the executor gate remains as defense in depth).
+    crate::tools::validate_tool_args(&tool, &args)
+        .map_err(|_| BridgeValidationError::InvalidArgs)?;
 
     let site = proposal
         .get("site")
@@ -347,6 +352,10 @@ pub fn validate_proposal(
     if !args.is_object() && !args.is_null() {
         return Err(ProposalValidationError::InvalidArgs);
     }
+    // Phase C: typed schema validation from the shared registry (same
+    // validator as the UI-webview route and the executor gate).
+    crate::tools::validate_tool_args(&tool, &args)
+        .map_err(|_| ProposalValidationError::InvalidArgs)?;
 
     let site = proposal
         .get("site")
