@@ -114,3 +114,14 @@ fn implemented_section_states_the_unified_approval_policy() {
         "the doc must state the bridge uses the same risk-based mapping as the agent route"
     );
 }
+
+/// Phase C: the doc must mention the registry-derived tool_schemas in the
+/// capabilities report.
+#[test]
+fn implemented_section_documents_the_tool_schemas_field() {
+    let doc = contract_doc();
+    assert!(
+        doc.contains("tool_schemas"),
+        "the doc must document the registry-derived tool_schemas field"
+    );
+}

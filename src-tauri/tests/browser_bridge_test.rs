@@ -253,6 +253,40 @@ fn proposal_validation_refuses_webpage_supplied_identity_and_bad_args() {
     );
 }
 
+/// Phase C: the pipe-route intake validates typed arguments against the SAME
+/// shared registry the executor uses — wrong types, missing required args
+/// and oversized values refuse as InvalidArgs before any approval or
+/// execution, while valid calls and the run_command exclusion are unchanged.
+#[test]
+fn typed_schema_validation_refuses_invalid_args_at_intake() {
+    let oversized = "x".repeat(neelima_lib::tools::MAX_WRITE_BYTES + 1);
+    let cases = [
+        serde_json::json!({"tool": "read_file", "args": {"path": 123}}),
+        serde_json::json!({"tool": "write_file", "args": {"path": "a.txt"}}),
+        serde_json::json!({"tool": "write_file", "args": {"path": "a.txt", "content": oversized}}),
+        serde_json::json!({"tool": "move_file", "args": {"from": "a"}}),
+    ];
+    for proposal_value in &cases {
+        let err = bridge_proposal(proposal_value).unwrap_err();
+        assert!(
+            matches!(err, ProposalValidationError::InvalidArgs),
+            "{proposal_value} produced {err}"
+        );
+    }
+    // The allowlist still refuses commands before schema work happens.
+    let err = bridge_proposal(&serde_json::json!({
+        "tool": "run_command", "args": {"command": "dir"}
+    }))
+    .unwrap_err();
+    assert!(matches!(err, ProposalValidationError::UnsupportedTool));
+    // Valid typed calls remain compatible.
+    let ok = bridge_proposal(&serde_json::json!({
+        "tool": "read_file", "args": {"path": "a.txt"}
+    }))
+    .unwrap();
+    assert_eq!(ok.tool, "read_file");
+}
+
 fn bridge_proposal(
     value: &serde_json::Value,
 ) -> Result<browser_bridge::ValidatedProposalData, ProposalValidationError> {

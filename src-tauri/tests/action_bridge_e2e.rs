@@ -600,3 +600,63 @@ async fn full_access_auto_approves_writes() {
     assert_eq!(record.approval.status, ApprovalStatus::NotRequired);
     assert_eq!(record.outcome, Some(ActionOutcome::Succeeded));
 }
+
+/// Phase C: the executor's schema gate fails closed — the wire reports
+/// execution_failed, nothing is written, and the ledger records a truthful
+/// FAILED execution attempt (never a success, never a phantom run).
+#[tokio::test]
+async fn invalid_arguments_fail_closed_and_record_truthfully() {
+    let handle = headless_app();
+    let hub = Arc::new(BrowserBridgeHub::default());
+    let slot = workspace_slot();
+    let settings = settings_for(PermissionMode::FullAccess);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let args = json!({"path": 123, "content": "should never land"});
+
+    let task = spawn_propose(
+        &handle,
+        &hub,
+        &slot,
+        &settings,
+        request_id.clone(),
+        "write_file",
+        args,
+    );
+    let (status, result) = task.await.expect("task completes");
+
+    assert_eq!(status, "execution_failed");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid arguments"),
+        "the schema gate explains: {}",
+        result["error"]
+    );
+
+    let ledger = handle.state::<Arc<ActionLedger>>();
+    let record = ledger.find_by_transport(&request_id).expect("recorded");
+    assert_eq!(record.outcome, Some(ActionOutcome::Failed));
+    assert_eq!(
+        record.error_category.as_deref(),
+        Some(neelima_lib::action::category::TOOL_ERROR)
+    );
+    let execution = record.execution.as_ref().expect("attempt recorded");
+    assert_eq!(execution.executor, Executor::RustTools);
+    assert!(!execution.had_diff);
+
+    // Nothing was written: the validator fired before any filesystem work.
+    let ws_root = slot
+        .0
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("workspace open")
+        .root()
+        .to_path_buf();
+    let entries: Vec<_> = std::fs::read_dir(&ws_root)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1, "only the seeded notes.txt exists");
+}

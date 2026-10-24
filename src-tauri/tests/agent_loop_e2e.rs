@@ -1081,3 +1081,62 @@ fn ask_all_requires_approval_for_agent_reads() {
     assert_eq!(record.approval.decision_source.as_deref(), Some("user_ui"));
     assert_eq!(record.outcome, Some(ActionOutcome::Succeeded));
 }
+
+// ---------------------------------------------------------------------------
+// 11. Phase C: a run_command call with invalid arguments fails closed at the
+//     shared schema gate — no process spawns, the model gets a truthful
+//     ok:false result, and the ledger records the refusal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_command_argument_fails_closed_without_spawning() {
+    use neelima_lib::action::{category, ActionOutcome};
+
+    let h = harness("no-cmd", PermissionMode::FullAccess, 12, "Run a command.");
+    let deadline = Instant::now() + DEADLINE;
+
+    h.wait_prompts(1, deadline);
+    h.paste(&tool_block("nc1", "run_command", "{}"));
+
+    h.wait_prompts(2, deadline);
+    let payload = result_payload(&h.snapshot().prompts[1], "nc1");
+    assert_eq!(
+        payload["ok"],
+        Value::Bool(false),
+        "invalid args must fail: {payload}"
+    );
+    assert!(
+        payload["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid arguments"),
+        "the schema gate explains: {payload}"
+    );
+
+    h.paste("DONE: stopped after the invalid command call.");
+    let state = h.wait_terminal(deadline);
+    assert_eq!(state, AgentState::Done);
+
+    // Ledger truth: refused with the invalid_args category, never executed.
+    let task_id = h
+        .shared
+        .task_id
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("task id recorded");
+    let ledger = h.app.state::<Arc<neelima_lib::action::ActionLedger>>();
+    let records: Vec<_> = ledger
+        .snapshot()
+        .into_iter()
+        .filter(|r| r.task_id.as_deref() == Some(&task_id))
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.outcome, Some(ActionOutcome::NotExecuted));
+    assert_eq!(
+        record.error_category.as_deref(),
+        Some(category::INVALID_ARGS)
+    );
+    assert!(record.execution.is_none(), "no process ever ran");
+}

@@ -822,7 +822,7 @@ mod tests {
         assert!(tools.contains(&"read_file"));
         assert_eq!(result["max_propose_bytes"], 256 * 1024);
         assert_eq!(result["approval_timeout_secs"], 120);
-        // Phase B: the capabilities report states the unified, mode-dependent
+        // Phase C: the capabilities report states the unified, mode-dependent
         // approval policy shared with the agent route.
         assert_eq!(result["approval_policy"]["shared_with_agent_route"], true);
         assert!(result["approval_policy"]["reads"]
@@ -833,6 +833,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("display-only"));
+        // Phase C: tool_schemas come from the authoritative registry — one
+        // entry per registered tool; run_command is described but flagged
+        // not-bridgable and never appears in the bridge allowlist.
+        let schemas = result["tool_schemas"]
+            .as_array()
+            .expect("tool_schemas present");
+        assert_eq!(schemas.len(), crate::tools::REGISTRY.len());
+        let run = schemas.iter().find(|s| s["name"] == "run_command").unwrap();
+        assert_eq!(run["bridge_allowed"], false);
+        assert!(
+            !result["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "run_command"),
+            "the allowlist never exposes shell execution"
+        );
     }
 
     /// bridge.status reports the bounded, metadata-only state the extension

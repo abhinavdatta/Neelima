@@ -116,7 +116,7 @@ path plus the extension's use of it — not by the mere existence of a function.
 | Operation | Status |
 |---|---|
 | `bridge.status` | Implemented (pipe route). Result: `{"connected":true,"has_workspace":bool,"permission_mode":"<Debug name>","recent_requests":<event-log length>,"pending_approvals":<n>}` |
-| `bridge.capabilities` | Implemented (pipe route). Returns the honest machine-readable capability list: operations, allowed tools, `max_propose_bytes`, `approval_timeout_secs`, idempotency scope, `approval_required_for` |
+| `bridge.capabilities` | Implemented (pipe route). Returns the honest machine-readable capability list: operations, allowed tools, per-tool argument schemas (`tool_schemas`, derived from the authoritative Rust registry — informational, never authorization), `max_propose_bytes`, `approval_timeout_secs`, idempotency scope, `approval_required_for`, `approval_policy` |
 | `tool.propose` | Implemented (pipe route + UI-webview route), sharing one approval/execution path |
 | `workspace.list`, `task.status`, `task.cancel` | **Reserved and unsupported.** Clients must not send them or claim task completion/cancellation |
 
