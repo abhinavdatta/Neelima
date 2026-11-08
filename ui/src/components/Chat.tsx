@@ -7,11 +7,34 @@ import { cmd } from "../tauri";
 import { Icon } from "./Icon";
 import type { TranscriptEntry } from "../types";
 import { providerStateLabel } from "../providerStatus";
+import { executionStatusLabel, formatExecutionDuration, formatExitCode } from "../executionHistory";
 
 export function Chat() {
   const s = useStore();
   const bottom = useRef<HTMLDivElement>(null);
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [s.entries.length, s.pendingCalls.length]);
+
+  // Approval-card lifecycle: a decision that can no longer be honoured (its
+  // request timed out, was refused, or timed out while the agent moved on)
+  // must not sit in the column indefinitely. Rules live in
+  // ui/src/approvalLifecycle.ts (unit-tested); here we act on the store.
+  const awaitingDecision =
+    s.pendingCalls.length > 0 &&
+    ["awaiting_approval", "executing"].includes(s.agentState);
+  useEffect(() => {
+    if (awaitingDecision || s.bridgeApproval) return;
+    const count = s.pendingCalls.length;
+    if (count === 0) return;
+    const t = setTimeout(() => {
+      setState((st) => (st.pendingCalls.length ? { pendingCalls: [] } : {}));
+      toast(
+        "warn",
+        `Cleared ${count} stale approval prompt${count === 1 ? "" : "s"}: the underlying request can no longer be decided. Nothing was auto-approved.`,
+      );
+    }, 400);
+    return () => clearTimeout(t);
+  }, [awaitingDecision, s.bridgeApproval, s.pendingCalls.length, s.agentState]);
+
 
   const readOnly = s.view === "task";
 
@@ -45,7 +68,10 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
   if (e.kind === "tool_calls") {
     return (
       <div class="msg-block">
-        {e.calls.map((c) => (
+        {e.calls.map((c) => {
+          const duration = formatExecutionDuration(c.duration_ms ?? null);
+          const exit = formatExitCode(c.exit_code ?? null);
+          return (
           <details class={`tool-card status-${c.status}`} key={c.id}>
             <summary class="tool-head">
               <span class={`dot ${c.status}`} />
@@ -54,7 +80,7 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
               <span class={`risk risk-${c.tool === "read_file" || c.tool === "list_dir" || c.tool === "glob" || c.tool === "grep" ? "read" : c.tool === "run_command" ? "command" : "write"}`}>
                 {c.tool === "run_command" ? "command" : c.tool.startsWith("read") || ["list_dir", "glob", "grep"].includes(c.tool) ? "read" : "write"}
               </span>
-              <span class="tool-status-label">{c.status}</span>
+              <span class="tool-status-label">{executionStatusLabel(c.status)}</span>
             </summary>
             <div class="tool-detail">
               {e.diff ? (
@@ -62,12 +88,18 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
                   <button class="link" onClick={() => setState({ diffEntry: { taskId, entryId: e.id } })}>View diff</button>
                 )
               ) : null}
+            {duration || exit || c.action_id ? <div class="tool-meta">
+              {duration ? <span>{duration}</span> : null}
+              {exit ? <span>{exit}</span> : null}
+              {c.action_id ? <span title={c.action_id}>action {c.action_id.slice(0, 12)}…</span> : null}
+            </div> : null}
             <pre class="tool-args">{JSON.stringify(c.args, null, 1)?.slice(0, 400)}</pre>
             {c.output ? <pre class="tool-out">{c.output.slice(0, 4000)}</pre> : null}
             {e.injection_warning ? <div class="inj-warn"><Icon name="alert" size={15} /> {e.injection_warning}</div> : null}
             </div>
           </details>
-        ))}
+          );
+        })}
       </div>
     );
   }
@@ -81,6 +113,20 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
     return <div class="err-row"><Icon name="close" size={14} /> {e.text}</div>;
   }
   // system
+  // Continuation headers carry the entire compressed prior transcript as one
+  // wall of protocol text; collapse them to a one-line toggle (expandable for
+  // the full record).
+  if (e.text.startsWith("You are continuing a previous task in this workspace.")) {
+    return (
+      <details class="sys-continued">
+        <summary>Continued from a previous task — prior context carried over</summary>
+        <pre>{e.text}</pre>
+      </details>
+    );
+  }
+  // Internal bridge telemetry: which transport handled the send. Kept in the
+  // task log, but it is not conversation content — don't paint it in chat.
+  if (e.text.startsWith("protocol preamble sent to ")) return null;
   return <div class="sys-row">{e.text}</div>;
 }
 

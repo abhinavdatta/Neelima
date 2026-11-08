@@ -75,6 +75,12 @@ pub mod category {
     pub const APPROVAL_EXPIRED: &str = "approval_expired";
     pub const APPROVAL_CANCELLED: &str = "approval_cancelled";
     pub const TOOL_ERROR: &str = "tool_error";
+    /// CP6: the destination changed after the approval preview was shown, so
+    /// the approved call was refused instead of overwriting newer content.
+    pub const STALE_BASELINE: &str = "stale_baseline";
+    /// CP6: an approval-gated mutation had NO capturable baseline (>2 MB or
+    /// unreadable). It fails closed rather than executing without protection.
+    pub const BASELINE_UNAVAILABLE: &str = "baseline_unavailable";
     pub const TASK_ENDED: &str = "task_ended";
     pub const UNKNOWN: &str = "unknown";
 }
@@ -293,6 +299,10 @@ pub struct ActionExecution {
     /// Byte length of the result the route produced. Never the text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_len: Option<usize>,
+    /// CP8: real child exit code when the executor observed one. Absent for
+    /// non-process tools, spawn/wait failures, and legacy records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub had_diff: bool,
     pub process_timed_out: bool,
     pub process_killed: bool,
@@ -375,6 +385,7 @@ impl<'a> BeginAction<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExecutionMeta {
     pub output_len: Option<usize>,
+    pub exit_code: Option<i32>,
     pub had_diff: bool,
     pub process_timed_out: bool,
     pub process_killed: bool,
@@ -386,11 +397,63 @@ pub struct ActionLedger {
     records: Mutex<VecDeque<ActionRecord>>,
 }
 
+/// Phase 3O: outcome classification for file-mutating actions, used to ground
+/// completion summaries in what actually executed (never model claims).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOpOutcome {
+    Succeeded,
+    Failed,
+    /// Still executing / unsettled: neither proof of success nor of failure.
+    Unknown,
+}
+
 impl ActionLedger {
     /// Mint a record for a new proposal. Returns `None` (no record) when the
     /// transport request ID already has a record: a duplicate proposal must
     /// never gain a second lifecycle. The caller's own duplicate handling
     /// (e.g. `BrowserBridgeHub`) stays the authority; this is a second wall.
+    /// Phase 3O: file-mutating outcomes recorded for one task, in record
+    /// order. Returns (tool, capped path, outcome-class). Refused/rejected
+    /// writes that never stored a path are omitted (unattributable); records
+    /// still in flight are classed [`FileOpOutcome::Unknown`].
+    pub fn file_ops_for_task(&self, task_id: &str) -> Vec<(String, String, FileOpOutcome)> {
+        let records = self.records.lock().unwrap();
+        records
+            .iter()
+            .filter(|r| r.task_id.as_deref() == Some(task_id))
+            .filter_map(|r| {
+                let tool = r.descriptor.tool.as_deref()?;
+                if !matches!(
+                    tool,
+                    "write_file" | "edit_file" | "delete_file" | "move_file"
+                ) {
+                    return None;
+                }
+                let path = r.descriptor.primary_path.clone()?;
+                let outcome = match (r.stage, r.outcome) {
+                    (ActionStage::Settled, Some(ActionOutcome::Succeeded)) => {
+                        FileOpOutcome::Succeeded
+                    }
+                    (ActionStage::Refused, _)
+                    | (
+                        ActionStage::Settled,
+                        Some(
+                            ActionOutcome::Failed
+                            | ActionOutcome::TimedOut
+                            | ActionOutcome::Cancelled
+                            | ActionOutcome::NotExecuted
+                            | ActionOutcome::Partial,
+                        ),
+                    ) => FileOpOutcome::Failed,
+                    (ActionStage::Settled, Some(ActionOutcome::UnknownOutcome))
+                    | (ActionStage::Settled, None) => FileOpOutcome::Unknown,
+                    _ => FileOpOutcome::Unknown,
+                };
+                Some((tool.to_string(), path, outcome))
+            })
+            .collect()
+    }
+
     pub fn begin(&self, req: &BeginAction) -> Option<String> {
         let mut records = self.records.lock().unwrap();
         if let Some(t) = req.transport_request_id {
@@ -552,6 +615,7 @@ impl ActionLedger {
                 started_at_ms: now(),
                 duration_ms: None,
                 output_len: None,
+                exit_code: None,
                 had_diff: false,
                 process_timed_out: false,
                 process_killed: false,
@@ -579,6 +643,7 @@ impl ActionLedger {
             };
             execution.duration_ms = Some(now().saturating_sub(execution.started_at_ms));
             execution.output_len = meta.output_len;
+            execution.exit_code = meta.exit_code;
             execution.had_diff = meta.had_diff;
             execution.process_timed_out = meta.process_timed_out;
             execution.process_killed = meta.process_killed;
@@ -740,6 +805,99 @@ mod tests {
         }
     }
 
+    /// Phase 3O: task-attributed variant of the mint helper.
+    fn workspace_begin_for<'a>(
+        tool: &'a str,
+        args: &'a Value,
+        task_id: &'a str,
+        required: bool,
+    ) -> BeginAction<'a> {
+        // Test helper: request ids share the task's lifetime; leaking a tiny
+        // formatted string is fine inside a test process.
+        let request_id: &'a str = Box::leak(format!("{task_id}.aa11bb22").into_boxed_str());
+        BeginAction {
+            origin: ActionOrigin {
+                proposer: Proposer::Agent,
+                provider: Some("local:Ollama".into()),
+                site: None,
+                page_origin: None,
+            },
+            intake: Intake::AgentLoop,
+            category: category_of_tool(tool),
+            tool: Some(tool),
+            risk: risk_of_tool(tool),
+            args: Some(args),
+            task_id: Some(task_id),
+            request_id: Some(request_id),
+            transport_request_id: None,
+            approval_required: required,
+            approval_reason: Some("mode=AskWrites risk=Write".into()),
+        }
+    }
+
+    /// Phase 3O: ledger outcome classification must describe exactly the file
+    /// operations of the requested task — successes, failures, and nothing
+    /// from any other task.
+    #[test]
+    fn file_ops_for_task_isolates_tasks_and_classes_outcomes() {
+        let l = ledger();
+        let ws_write = json!({"path": "src/main.py", "content": "print(1)"});
+        let ws_edit = json!({"path": "src/main.py", "old_string": "1", "new_string": "2"});
+        let ws_read = json!({"path": "src/main.py"});
+        let ok_write = workspace_begin_for("write_file", &ws_write, "t1", true);
+        let fail_edit = workspace_begin_for("edit_file", &ws_edit, "t1", true);
+        let other_read = workspace_begin_for("read_file", &ws_read, "t1", false);
+        let other_task = workspace_begin_for("write_file", &ws_write, "t2", true);
+        let id1 = l.begin(&ok_write).unwrap();
+        let id2 = l.begin(&fail_edit).unwrap();
+        let _ = l.begin(&other_read).unwrap();
+        let _ = l.begin(&other_task).unwrap();
+        // Full lifecycle the agent route runs: validate → approval → execute.
+        for id in [&id1, &id2] {
+            assert!(l.validate(id), "must validate {id}");
+            assert!(l.await_approval(id));
+            assert!(l.decide_approval(id, true));
+            assert!(l.begin_execution(id, Executor::RustTools));
+        }
+        l.settle(
+            &id1,
+            ActionOutcome::Succeeded,
+            ExecutionMeta::default(),
+            None,
+        );
+        l.settle(
+            &id2,
+            ActionOutcome::Failed,
+            ExecutionMeta::default(),
+            Some(category::TOOL_ERROR),
+        );
+
+        let ops = l.file_ops_for_task("t1");
+        assert_eq!(
+            ops.len(),
+            2,
+            "reads are excluded, other-task writes excluded"
+        );
+        assert!(ops.iter().any(|(t, p, o)| t == "write_file"
+            && p == "src/main.py"
+            && *o == FileOpOutcome::Succeeded));
+        assert!(ops.iter().any(|(t, p, o)| t == "edit_file"
+            && p == "src/main.py"
+            && *o == FileOpOutcome::Failed));
+        assert!(l.file_ops_for_task("t2").len() == 1);
+        assert!(l.file_ops_for_task("missing").is_empty());
+
+        // A write still executing is not proof of failure: it is Unknown.
+        let pending = workspace_begin_for("write_file", &ws_write, "t3", true);
+        let id3 = l.begin(&pending).unwrap();
+        assert!(l.validate(&id3));
+        assert!(l.await_approval(&id3));
+        assert!(l.decide_approval(&id3, true));
+        assert!(l.begin_execution(&id3, Executor::RustTools));
+        let ops3 = l.file_ops_for_task("t3");
+        assert!(ops3.iter().all(|(_, _, o)| *o == FileOpOutcome::Unknown));
+    }
+
     fn record_json(record: &ActionRecord) -> Value {
         serde_json::to_value(record).expect("record serializes")
     }
@@ -806,6 +964,7 @@ mod tests {
                     started_at_ms: 4,
                     duration_ms: Some(5),
                     output_len: Some(30),
+                    exit_code: Some(0),
                     had_diff: true,
                     process_timed_out: false,
                     process_killed: false,

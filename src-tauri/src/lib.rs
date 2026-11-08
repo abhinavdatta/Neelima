@@ -83,6 +83,9 @@ pub fn run() {
             ui::ui_workspace_rename,
             ui::ui_workspace_open_in_explorer,
             ui::ui_tree,
+            ui::ui_file_preview,
+            ui::ui_file_text,
+            ui::ui_file_save,
             ui::ui_settings_get,
             ui::ui_settings_set,
             ui::ui_adapters_list,
@@ -240,13 +243,16 @@ pub fn run() {
 /// Global emergency stop: kills every running command + terminal and halts the
 /// agent loop. Wired to the user-configurable hotkey.
 pub fn emergency_stop(app: &tauri::AppHandle) {
-    if let Some(term) = app.try_state::<terminal::TermState>() {
-        term.kill_all();
-    }
+    // Lock order `ActiveAgent` -> terminal matches workspace switch/removal.
+    // Taking the terminal lock first could deadlock with a switch that is
+    // already holding the active-task slot while waiting to kill terminals.
     if let Some(active) = app.try_state::<agent::ActiveAgent>() {
         if let Some(shared) = active.get() {
             let _ = shared.cmd_tx.send(agent::AgentCommand::Stop);
         }
+    }
+    if let Some(term) = app.try_state::<terminal::TermState>() {
+        term.kill_all();
     }
     let _ = app.emit(agent::EVT, serde_json::json!({"kind": "notify", "level": "warn", "text": "Emergency stop: commands killed, agent halted."}));
 }

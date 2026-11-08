@@ -213,6 +213,13 @@ pub fn select(
             continue;
         }
         sel.considered += 1;
+        // Documents, archives, media and executables are not source text. The
+        // NUL-byte sniff below misses ASCII-only containers (PDF is the common
+        // case), so a PDF's raw object syntax used to be sent as "context".
+        if is_opaque(&rel) {
+            sel.skipped.binary += 1;
+            continue;
+        }
         if is_excluded(&rel, &exclusions) {
             sel.excluded_by_user += 1;
             continue;
@@ -652,6 +659,75 @@ fn is_stopword(term: &str) -> bool {
     )
 }
 
+/// Files whose bytes are a container or media payload, never prompt text.
+/// Extension-based: a denylist cannot be exhaustive, so the NUL sniff stays as
+/// the second line of defense for everything else.
+fn is_opaque(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    matches!(
+        ext,
+        "pdf"
+            | "docx"
+            | "doc"
+            | "xlsx"
+            | "xls"
+            | "pptx"
+            | "ppt"
+            | "odt"
+            | "ods"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "ico"
+            | "tif"
+            | "tiff"
+            | "psd"
+            | "mp3"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "mp4"
+            | "mov"
+            | "avi"
+            | "mkv"
+            | "webm"
+            | "zip"
+            | "gz"
+            | "tgz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "7z"
+            | "rar"
+            | "jar"
+            | "war"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "bin"
+            | "iso"
+            | "dmg"
+            | "msi"
+            | "msix"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "sqlite"
+            | "db"
+            | "class"
+            | "pyc"
+            | "wasm"
+            | "node"
+    )
+}
+
 fn is_generated(rel: &str) -> bool {
     rel.split('/').any(|part| {
         matches!(
@@ -796,6 +872,36 @@ mod tests {
         assert_eq!(sel.files[0].path, "src/a.rs");
         assert!(!sel.block.contains("huge.rs"));
         assert!(!sel.block.contains("node_modules"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Phase 3M live defect: a PDF is ASCII, so the NUL sniff passed it through
+    /// and the PDF object syntax was sent to the model as project context.
+    #[test]
+    fn opaque_document_extensions_never_become_context_text() {
+        let dir = tmp("opaque");
+        write(&dir, "src/auth.rs", "token handler\n");
+        write(
+            &dir,
+            "report.pdf",
+            "%PDF-1.4\n1 0 obj << /Page token handler >> endobj\n%%EOF\n",
+        );
+        write(&dir, "brief.docx", "token handler");
+        write(&dir, "shot.png", "token handler");
+        write(&dir, "archive.zip", "token handler");
+        let ws = Workspace::open(&dir).unwrap();
+        let sel = select(&ws, "token handler", 64 * 1024, 8, &[]);
+        assert_eq!(
+            sel.files.len(),
+            1,
+            "only real source is eligible: {:?}",
+            sel.files
+        );
+        assert_eq!(sel.files[0].path, "src/auth.rs");
+        assert_eq!(sel.skipped.binary, 4);
+        for opaque in ["report.pdf", "brief.docx", "shot.png", "archive.zip"] {
+            assert!(!sel.block.contains(opaque), "{opaque} leaked into context");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

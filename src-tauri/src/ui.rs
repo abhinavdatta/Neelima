@@ -3,7 +3,10 @@
 //! exactly one command — lb_bridge — and the app ACL manifest denies it
 //! everything else anyway. This guard is the second wall.)
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Position, Size, State, Webview};
@@ -127,6 +130,7 @@ pub fn ui_workspace_use(
     active: State<'_, ActiveAgent>,
     slot: State<'_, WorkspaceSlot>,
     settings: State<'_, SettingsStore>,
+    term: State<'_, TermState>,
     id: String,
 ) -> Result<(), String> {
     guard(&webview)?;
@@ -142,6 +146,17 @@ pub fn ui_workspace_use(
         .find(|w| w.id == id)
         .ok_or("workspace not found")?;
     let ws = Workspace::open(std::path::Path::new(&entry.path)).map_err(|e| e.to_string())?;
+    // A PTY is bound to the workspace root it was spawned in. Never leave a
+    // shell silently attached to the previous project after a switch. Only
+    // kill when the root actually changes (re-selecting the active project
+    // must not terminate a running terminal).
+    let changed = slot_guard
+        .as_ref()
+        .map(|old| old.root() != ws.root())
+        .unwrap_or(false);
+    if changed {
+        term.kill_all();
+    }
     settings.patch(|st| st.active_workspace_id = Some(id))?;
     *slot_guard = Some(ws);
     Ok(())
@@ -153,6 +168,7 @@ pub fn ui_workspace_remove(
     active: State<'_, ActiveAgent>,
     slot: State<'_, WorkspaceSlot>,
     settings: State<'_, SettingsStore>,
+    term: State<'_, TermState>,
     id: String,
 ) -> Result<Value, String> {
     guard(&webview)?;
@@ -181,6 +197,10 @@ pub fn ui_workspace_remove(
         .map(|ws| ws.root() == std::path::Path::new(&entry.path))
         .unwrap_or(false);
     if matches {
+        // Removing the active project must not leave its shell running with a
+        // working directory that the UI can no longer display or switch away
+        // from.
+        term.kill_all();
         *slot_guard = None;
     }
     Ok(json!({"removed": id, "path": entry.path}))
@@ -254,6 +274,62 @@ pub fn ui_workspace_open_in_explorer(
     Ok(())
 }
 
+/// Upper bound on entries returned for one directory. The native explorer loads
+/// children lazily, so a capped folder stays responsive; the cap is now applied
+/// AFTER sorting (see `list_workspace_dir`) and reported to the UI.
+const TREE_ENTRY_LIMIT: usize = 400;
+
+/// List one workspace directory for the native explorer.
+///
+/// Previously this stopped reading after 400 entries in OS `read_dir` order and
+/// only THEN sorted, so which entries disappeared from a large folder was
+/// arbitrary. Sorting first makes the visible page deterministic (directories
+/// first, then names). Per-entry read errors are counted instead of silently
+/// dropped, and `truncated`/`limit`/`unreadable` let the UI state the truth
+/// instead of implying the folder is complete.
+fn list_workspace_dir(dir: &std::path::Path, rel_path: &str) -> Result<Value, String> {
+    let mut listing: Vec<(String, bool, String)> = Vec::new();
+    let mut unreadable = 0usize;
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| format!("Could not read directory: {error}"))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Fail closed for unknown types: only a confirmed directory is
+        // expandable; anything else opens through the file-preview path.
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let child = if rel_path.is_empty() || rel_path == "." {
+            name.clone()
+        } else {
+            format!("{}/{}", rel_path.trim_end_matches('/'), name)
+        };
+        listing.push((name, is_dir, child));
+    }
+    listing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let truncated = listing.len() > TREE_ENTRY_LIMIT;
+    listing.truncate(TREE_ENTRY_LIMIT);
+    let entries: Vec<Value> = listing
+        .into_iter()
+        .map(|(name, dir, path)| json!({"name": name, "dir": dir, "path": path}))
+        .collect();
+    Ok(json!({
+        "path": rel_path,
+        "entries": entries,
+        "truncated": truncated,
+        "limit": TREE_ENTRY_LIMIT,
+        "unreadable": unreadable,
+    }))
+}
+
 #[tauri::command]
 pub fn ui_tree(
     webview: Webview,
@@ -267,33 +343,513 @@ pub fn ui_tree(
     } else {
         ws.resolve(&path).map_err(|e| e.to_string())?
     };
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let child = if path.is_empty() || path == "." {
-            name.clone()
-        } else {
-            format!("{}/{}", path.trim_end_matches('/'), name)
-        };
-        entries.push(json!({"name": name, "dir": is_dir, "path": child}));
-        if entries.len() >= 400 {
-            break;
-        }
+    list_workspace_dir(&dir, &path)
+}
+
+const FILE_PREVIEW_CAP_BYTES: usize = 30 * 1024;
+const FILE_PREVIEW_LINE_LIMIT: usize = 300;
+/// Manual edits from the native editor are text-only and bounded; larger
+/// rewrites belong to the agent's chunked `write_file` tool.
+const FILE_EDIT_MAX_BYTES: usize = 1024 * 1024;
+
+/// Extensions the native viewer may read as text AND the editor may write.
+/// One list keeps reading and writing in lock-step: anything the editor can
+/// open it can save, and nothing else.
+fn is_text_source_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "txt"
+            | "md"
+            | "markdown"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "csv"
+            | "log"
+            | "rs"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "html"
+            | "css"
+            | "scss"
+            | "sh"
+            | "py"
+            | "go"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "sql"
+            | "ps1"
+            | "bat"
+            | "ini"
+            | "conf"
+            | "vue"
+            | "svelte"
+            | "mdx"
+            | "graphql"
+            | "proto"
+            | "lock"
+    )
+}
+
+fn read_workspace_file_preview(
+    ws: &Workspace,
+    rel_path: &str,
+    offset: usize,
+) -> Result<Value, String> {
+    let path = ws
+        .resolve(rel_path)
+        .map_err(|_| "Path is outside the selected workspace or invalid".to_string())?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("Could not inspect file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Select a file, not a directory or special file".into());
     }
-    entries.sort_by(|a, b| {
-        b["dir"]
-            .as_bool()
-            .cmp(&a["dir"].as_bool())
-            .then(a["name"].as_str().cmp(&b["name"].as_str()))
-    });
-    Ok(json!({ "path": path, "entries": entries }))
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_text_source_extension(extension.as_str()) {
+        return Err(format!(
+            "Preview supports text/source files; .{extension} is not a supported text type. Use Attach files for PDF/DOCX extraction."
+        ));
+    }
+    let outcome = crate::tools::read_file(
+        ws,
+        &json!({"path": rel_path, "offset": offset, "limit": FILE_PREVIEW_LINE_LIMIT}),
+        FILE_PREVIEW_CAP_BYTES,
+    );
+    if !outcome.ok {
+        return Err(outcome.output);
+    }
+    let lines_read = outcome
+        .output
+        .rsplit_once('[')
+        .and_then(|(_, note)| note.strip_suffix(']'))
+        .and_then(|note| note.split_whitespace().next())
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    let next_offset = offset.saturating_add(FILE_PREVIEW_LINE_LIMIT);
+    let has_more = if outcome.output.contains("output truncated") {
+        true
+    } else if lines_read == FILE_PREVIEW_LINE_LIMIT {
+        let probe = crate::tools::read_file(
+            ws,
+            &json!({"path": rel_path, "offset": next_offset, "limit": 1}),
+            1,
+        );
+        probe.ok
+            && probe
+                .output
+                .rsplit_once('[')
+                .and_then(|(_, note)| note.strip_suffix(']'))
+                .and_then(|note| note.split_whitespace().next())
+                .and_then(|count| count.parse::<usize>().ok())
+                .unwrap_or(0)
+                > 0
+    } else {
+        false
+    };
+    // The reader appends an AI-facing "[N lines read from line X]" trailer for
+    // its tool results. The preview shows plain file content, so the trailer is
+    // removed here and reported as structured fields instead.
+    let content = match outcome.output.rsplit_once('[') {
+        Some((body, note))
+            if note.trim_end().ends_with(']') && note.contains("lines read from line") =>
+        {
+            body.trim_end().to_string()
+        }
+        _ => outcome.output.clone(),
+    };
+    Ok(json!({
+        "path": ws.display(&path),
+        "content": content,
+        "offset": offset,
+        "line_limit": FILE_PREVIEW_LINE_LIMIT,
+        "size_bytes": metadata.len(),
+        "has_more": has_more,
+        "lines_read": lines_read,
+        "start_line": offset + 1,
+    }))
+}
+
+#[tauri::command]
+pub fn ui_file_preview(
+    webview: Webview,
+    slot: State<'_, WorkspaceSlot>,
+    path: String,
+    offset: Option<usize>,
+) -> Result<Value, String> {
+    guard(&webview)?;
+    read_workspace_file_preview(&ws_from(&slot)?, &path, offset.unwrap_or(0))
+}
+
+/// Exact on-disk text for the native editor.
+///
+/// The paged preview is lossy on purpose (it trims the trailing newline and
+/// caps the page), so it must never be round-tripped back to disk. The editor
+/// starts from this exact text, which makes "no changes" mean no changes and
+/// keeps line endings intact on save.
+fn read_workspace_file_text(ws: &Workspace, rel_path: &str) -> Result<Value, String> {
+    let path = ws
+        .resolve(rel_path)
+        .map_err(|_| "Path is outside the selected workspace or invalid".to_string())?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("Could not inspect file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Select a file, not a directory or special file".into());
+    }
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_text_source_extension(extension.as_str()) {
+        return Err(format!(
+            "The editor supports text/source files; .{extension} is not a supported text type."
+        ));
+    }
+    if metadata.len() as usize > FILE_EDIT_MAX_BYTES {
+        return Err(format!(
+            "This file is larger than the {} KB editing limit. Read it in pages, or ask the agent to change it.",
+            FILE_EDIT_MAX_BYTES / 1024
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| format!("Could not read file: {error}"))?;
+    if bytes.iter().take(8 * 1024).any(|byte| *byte == 0) {
+        return Err("This file is binary on disk; the editor only writes text.".into());
+    }
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(json!({
+        "path": ws.display(&path),
+        "content": content,
+        "bytes": metadata.len(),
+    }))
+}
+
+#[tauri::command]
+pub fn ui_file_text(
+    webview: Webview,
+    slot: State<'_, WorkspaceSlot>,
+    path: String,
+) -> Result<Value, String> {
+    guard(&webview)?;
+    read_workspace_file_text(&ws_from(&slot)?, &path)
+}
+
+/// Save an edit made in the native code view.
+///
+/// This is deliberately NOT a second filesystem permission system: the path
+/// goes through the same `Workspace::resolve` confinement the agent tools use,
+/// the same text-type allowlist as the viewer, and the UI shows the diff before
+/// calling it. Only existing, text, complete files can be written here; new
+/// files and large rewrites stay with the agent's approval-gated tools.
+///
+/// Checkpoint 4 (Phase 3P) — save integrity:
+///   * optimistic concurrency: `expected_original` must byte-match the on-disk
+///     file AT SAVE TIME. The frontend passes the exact baseline its reviewed
+///     diff was computed against; if the file changed externally in the
+///     meantime the save is refused and a `CONFLICT::` error is returned.
+///   * the authoritative check and the replacement happen inside this single
+///     backend operation: the baseline is rechecked immediately before the
+///     atomic rename, as close to the replacement as std::fs permits (see the
+///     TOCTOU note below).
+///   * durability: the temp sibling is fully written and fsynced
+///     (`File::sync_all`) BEFORE the rename, so a failed write cannot leave a
+///     half-written destination; the original file is preserved on failure.
+///     This is FILE-CONTENT synchronization only: it does not guarantee that
+///     the directory entry (the rename) survives a sudden power loss — see the
+///     durability note below.
+///   * verification: after a successful replacement the file is read back and
+///     the exact bytes are compared with the intended content; success is only
+///     returned when that verification passes.
+///   * temp-file safety: every operation creates its OWN temp sibling with a
+///     per-operation unique name and `create_new` (exclusive create), so two
+///     concurrent saves can never write into or delete each other's temp file,
+///     and cleanup only ever removes the temp path this call created.
+///
+/// Baseline is mandatory (CP4 closeout): `expected_original` is not optional.
+/// Every caller must supply the exact baseline its reviewed diff was computed
+/// against — a baseline-free replacement would be an external-modification
+/// bypass, so there is none.
+///
+/// Durability note (CP4 closeout, precise):
+///   * ATOMIC REPLACEMENT: the destination is swapped as one rename; readers
+///     see either the old file or the new file, never a partial file.
+///   * FILE-CONTENT SYNCHRONIZATION: `sync_all()` on the temp file flushes its
+///     data (and metadata) to the device before the swap, so the new bytes are
+///     on stable storage before the old name stops pointing at the old file.
+///   * DIRECTORY-ENTRY DURABILITY: NOT established. Making the rename itself
+///     power-loss durable requires fsyncing the DIRECTORY, which std::fs cannot
+///     do portably on Windows (no directory handle sync). After a sudden power
+///     loss the rename may therefore be lost (the old file returns intact) even
+///     though the new file's contents were synced. Neelima does not claim
+///     guaranteed power-loss durability of the name swap.
+///
+/// TOCTOU note: without exclusive file locking (which would make Neelima hold
+/// locks its workspace may share with agents/other editors), a file can change
+/// between the last baseline recheck and the rename syscall. On Windows
+/// `std::fs::rename` maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which
+/// atomically replaces the destination, so no partial destination is possible;
+/// the residual race window is only the instant between the pre-rename recheck
+/// and that syscall. That race is NOT eliminated; it is bounded and documented.
+/// The read-back verification after the rename is the honesty check for the
+/// caller, not a lock.
+const SAVE_CONFLICT_PREFIX: &str = "CONFLICT::";
+
+/// Per-destination-path serialization for Neelima's OWN saves (CP4 final
+/// concurrency verification).
+///
+/// The baseline recheck and the atomic replacement are separate syscalls: two
+/// saves of the same file could both observe the same baseline and then both
+/// replace the destination, so a save based on stale contents would succeed
+/// silently. One mutex per CANONICAL destination path is held for the whole
+/// read-baseline → replace → verify sequence, so a second save of the same file
+/// waits and then sees the winner's bytes as its baseline (and conflicts).
+///
+/// This does NOT lock the file against external processes (no exclusive file
+/// locking is taken), so the documented compare-to-rename race with outside
+/// writers is unchanged.
+///
+/// The registry stores WEAK references, so it tracks LIVE saves instead of every
+/// file ever saved. An entry is upgraded while it is alive; expired entries are
+/// dropped on the next insertion while the registry mutex is held. The invariant
+/// that prevents split locks: a save takes its `Arc` from this map BEFORE any
+/// baseline work and keeps it until the function returns, so while any save is
+/// in flight its `Weak` always upgrades to the same mutex. Expired entries can
+/// only be removed when no operation holds that path's `Arc`.
+static SAVE_PATH_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+/// Keyed by the canonical destination identity, so different spellings or
+/// symlinked paths to the same file serialize together. `Workspace::resolve`
+/// still runs first: this can never expand what the workspace may write.
+///
+/// The registry guard is always released before the caller waits on the
+/// per-path mutex; no lock is held across the actual save.
+fn save_path_lock(path: &std::path::Path) -> Arc<Mutex<()>> {
+    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let registry = SAVE_PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(live) = entries.get(&identity).and_then(Weak::upgrade) {
+        // Same mutex as every other in-flight save of this path.
+        return live;
+    }
+    // No live lock for this path. Reclaim every expired entry while still
+    // holding the registry mutex; entries with a live `Arc` are kept, so a
+    // concurrent save can never be moved onto a different mutex.
+    entries.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    entries.insert(identity, Arc::downgrade(&lock));
+    lock
+}
+
+#[cfg(test)]
+fn save_lock_entry_is_live(path: &std::path::Path) -> Option<bool> {
+    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let registry = SAVE_PATH_LOCKS.get()?;
+    let entries = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries
+        .get(&identity)
+        .map(|weak| weak.strong_count() > 0)
+}
+
+// Test-only deterministic fault injection for the temp-write path (CP4
+// closeout). Thread-local so parallel tests cannot influence each other; it is
+// compiled out of production builds entirely.
+//   0 = off
+//   1 = fail BEFORE the temp file is created
+//   2 = fail AFTER the temp file exists with partial bytes, so the cleanup path
+//       has a real artifact to remove
+#[cfg(test)]
+thread_local! {
+    static INJECT_TEMP_WRITE_FAILURE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn write_workspace_file(
+    ws: &Workspace,
+    rel_path: &str,
+    content: &str,
+    expected_original: &str,
+) -> Result<Value, String> {
+    let path = ws
+        .resolve(rel_path)
+        .map_err(|_| "Path is outside the selected workspace or invalid".to_string())?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("Could not inspect file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Select a file, not a directory or special file".into());
+    }
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !is_text_source_extension(extension.as_str()) {
+        return Err(format!(
+            "The editor saves text/source files only; .{extension} is not a supported text type."
+        ));
+    }
+    if content.len() > FILE_EDIT_MAX_BYTES {
+        return Err(format!(
+            "Edits are limited to {} KB per save; split the change.",
+            FILE_EDIT_MAX_BYTES / 1024
+        ));
+    }
+    // Serialize Neelima's own saves of this destination for the whole
+    // read-baseline → replace → verify sequence. A concurrent save of the same
+    // file blocks here and, once this one completes, re-reads the WINNER's
+    // bytes, so its stale baseline is refused instead of silently replacing
+    // the first success. External writers are not serialized (see the
+    // compare-to-rename note above). The guard is released on every return path.
+    let destination_lock = save_path_lock(&path);
+    let _save_guard = destination_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let original = std::fs::read(&path).map_err(|error| format!("Could not read file: {error}"))?;
+    // Refuse to rewrite a file that is binary on disk even if the name looks
+    // like text: the editor would replace real bytes with its lossy view.
+    if original.iter().take(8 * 1024).any(|byte| *byte == 0) {
+        return Err("This file is binary on disk; the editor only writes text.".into());
+    }
+    if original == content.as_bytes() {
+        return Err("No changes to save".into());
+    }
+    // Write to a sibling temp file, flush it to disk, and rename — a failed
+    // write cannot leave a half-written source file behind. The pre-save
+    // baseline recheck below happens against the file that is on disk RIGHT
+    // NOW, immediately before the replacement.
+    //
+    // The temp name is UNIQUE PER OPERATION and created with `create_new`, so
+    // two saves of the same file can never collide with (overwrite) or delete
+    // each other's temp file; every cleanup below removes only `temp`.
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("edit");
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{}.neelima-tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let temp_write = || -> std::io::Result<()> {
+        #[cfg(test)]
+        if INJECT_TEMP_WRITE_FAILURE.with(|flag| flag.get()) == 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected temp-create failure (test)",
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(content.as_bytes())?;
+        // A mid-write fault: the temp file exists with partial content and must
+        // be removed by the caller without ever touching the destination.
+        #[cfg(test)]
+        if INJECT_TEMP_WRITE_FAILURE.with(|flag| flag.get()) == 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected temp-write failure (test)",
+            ));
+        }
+        // Durability: the temp file must hold the COMPLETE content before it
+        // is allowed to replace the original. (File-content sync; see the
+        // directory-entry durability note on this function.)
+        file.sync_all()?;
+        Ok(())
+    };
+    if let Err(error) = temp_write() {
+        std::fs::remove_file(&temp).ok();
+        return Err(format!("Could not write file: {error}"));
+    }
+    // The authoritative external-modification check: re-read the destination
+    // AFTER the temp write and immediately BEFORE the rename. Compare with the
+    // exact reviewed baseline (mandatory). A separate frontend check followed
+    // by an unchecked write would be a TOCTOU toy; this check is in the
+    // backend, one syscall away from the atomic replacement.
+    let baseline: &[u8] = expected_original.as_bytes();
+    let unchanged = std::fs::read(&path)
+        .map(|current| current == baseline)
+        .unwrap_or(false);
+    if !unchanged {
+        std::fs::remove_file(&temp).ok();
+        return Err(format!(
+            "{SAVE_CONFLICT_PREFIX}{} changed on disk since it was opened, so applying the review would silently overwrite external changes. Reload the file and review again against the latest contents.",
+            ws.display(&path)
+        ));
+    }
+    // Windows: std::fs::rename = MoveFileExW with MOVEFILE_REPLACE_EXISTING —
+    // an atomic same-volume replacement. It fails (no replacement) when the
+    // destination has the read-only attribute or is locked, so the original is
+    // preserved in those failure cases. Unix: rename(2) atomically replaces.
+    if let Err(error) = std::fs::rename(&temp, &path) {
+        std::fs::remove_file(&temp).ok();
+        return Err(format!("Could not replace file: {error}"));
+    }
+    // Read-back verification: success is reported only when the bytes now on
+    // disk are exactly the intended content. On a mismatch (rename succeeded
+    // but the replacement is not what we wrote — storage fault territory) the
+    // previous contents are restored atomically from memory and the caller
+    // receives an honest failure.
+    let written_back =
+        std::fs::read(&path).map_err(|error| format!("Could not verify the saved file: {error}"));
+    let verification_failed = match &written_back {
+        Ok(bytes) => bytes.as_slice() != content.as_bytes(),
+        Err(_) => true,
+    };
+    if verification_failed {
+        let restore = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(original.as_slice())?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &path)?;
+            Ok(())
+        };
+        let restored = restore().is_ok();
+        std::fs::remove_file(&temp).ok();
+        let detail = match written_back {
+            Ok(_) => "saved bytes differ from the reviewed content".to_string(),
+            Err(error) => error,
+        };
+        return Err(format!(
+            "The save did not verify against the disk ({detail}); {} — do not trust the file until re-opened.",
+            if restored {
+                "the previous contents were restored"
+            } else {
+                "the previous contents could NOT be restored"
+            }
+        ));
+    }
+    Ok(json!({
+        "path": ws.display(&path),
+        "bytes": content.len(),
+        "lines": content.lines().count(),
+    }))
+}
+
+#[tauri::command]
+pub fn ui_file_save(
+    webview: Webview,
+    slot: State<'_, WorkspaceSlot>,
+    path: String,
+    content: String,
+    // CP4 closeout: MANDATORY. This is the exact baseline the reviewed diff
+    // was computed against. There is no baseline-free path: every existing-file
+    // edit must prove it was reviewed against the current on-disk contents.
+    expected_original: String,
+) -> Result<Value, String> {
+    guard(&webview)?;
+    write_workspace_file(&ws_from(&slot)?, &path, &content, &expected_original)
 }
 
 #[tauri::command]
@@ -708,6 +1264,8 @@ pub async fn ui_provider_diagnose(
     let mut page_info_turns: Option<Value> = None;
     let mut page_info_last_len: Option<u64> = None;
     let mut page_info_ms_since_send: Option<u64> = None;
+    let mut page_info_layout: Option<String> = None;
+    let mut page_info_dom: Option<Value> = None;
     let mut matched_markers: Vec<String> = Vec::new();
     if let Some(wv) = app.get_webview(webprov::PROVIDER_LABEL) {
         let js = format!(
@@ -730,6 +1288,8 @@ pub async fn ui_provider_diagnose(
                     page_info_turns = Some(v["value"]["turns"].clone());
                     page_info_last_len = v["value"]["last_assistant_len"].as_u64();
                     page_info_ms_since_send = v["value"]["ms_since_send"].as_u64();
+                    page_info_layout = v["value"]["reply_layout"].as_str().map(str::to_owned);
+                    page_info_dom = Some(v["value"]["reply_dom"].clone());
                     matched_markers = v["value"]["markers"]
                         .as_object()
                         .map(|m| {
@@ -836,6 +1396,8 @@ pub async fn ui_provider_diagnose(
         "turns": page_info_turns,
         "last_assistant_len": page_info_last_len,
         "ms_since_send": page_info_ms_since_send,
+        "reply_layout": page_info_layout,
+        "reply_dom": page_info_dom,
         "matched_markers": matched_markers,
         "last_bridge_error": *state.last_bridge_error.lock().unwrap(),
         "bridge_log_path": hub.log_path().map(|p| p.display().to_string()),
@@ -1560,13 +2122,16 @@ pub fn ui_terminal_create(
     slot: State<'_, WorkspaceSlot>,
 ) -> Result<u32, String> {
     guard(&webview)?;
-    let cwd = slot
-        .0
-        .lock()
-        .unwrap()
-        .clone()
-        .map(|w| w.root().to_path_buf());
-    crate::terminal::create(app, settings.get().shell, cwd)
+    // Hold the slot lock across spawn+registration. A workspace switch either
+    // happens entirely before this terminal starts (new cwd) or entirely after
+    // it is registered (the switch then kills it); it can never register a
+    // session whose cwd belongs to a workspace the UI has already left.
+    let slot_guard = slot.0.lock().unwrap();
+    let ws = slot_guard
+        .as_ref()
+        .ok_or("open a workspace before starting the terminal")?;
+    let cwd = ws.root().to_path_buf();
+    crate::terminal::create(app, settings.get().shell, Some(cwd))
 }
 
 #[tauri::command]
@@ -1977,6 +2542,582 @@ pub fn ui_app_info(webview: Webview, settings: State<'_, SettingsStore>) -> Resu
         "settings_path": settings.path().to_string_lossy(),
         "os": std::env::consts::OS,
     }))
+}
+
+#[cfg(test)]
+mod file_preview_tests {
+    use super::{
+        read_workspace_file_preview, read_workspace_file_text, write_workspace_file,
+        FILE_EDIT_MAX_BYTES,
+    };
+    use crate::workspace::Workspace;
+    use serde_json::Value;
+    use std::fs;
+
+    fn workspace(name: &str) -> Workspace {
+        let path =
+            std::env::temp_dir().join(format!("neelima-preview-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Workspace::open(&path).unwrap()
+    }
+
+    #[test]
+    fn preview_returns_only_relative_path_and_bounded_text() {
+        let ws = workspace("bounded");
+        let file = ws.root().join("notes.txt");
+        fs::write(
+            &file,
+            (0..700)
+                .map(|line| format!("line {line:03}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let preview = read_workspace_file_preview(&ws, "notes.txt", 0).unwrap();
+        assert_eq!(preview["path"], "notes.txt");
+        assert!(!preview["path"]
+            .as_str()
+            .unwrap()
+            .contains(&ws.root().to_string_lossy().to_string()));
+        assert!(preview["content"].as_str().unwrap().len() <= 32 * 1024);
+        assert!(preview["content"].as_str().unwrap().contains("line 000"));
+        assert_eq!(preview["has_more"], true);
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn preview_reads_requested_line_window_and_rejects_unsupported_or_escaping_paths() {
+        let ws = workspace("window");
+        fs::write(ws.root().join("notes.md"), "zero\none\ntwo\n").unwrap();
+        let page = read_workspace_file_preview(&ws, "notes.md", 1).unwrap();
+        assert!(page["content"].as_str().unwrap().contains("one"));
+        assert!(!page["content"].as_str().unwrap().contains("zero"));
+        assert!(read_workspace_file_preview(&ws, "../outside.txt", 0).is_err());
+        fs::write(ws.root().join("archive.pdf"), b"%PDF-1.7\0binary").unwrap();
+        let error = read_workspace_file_preview(&ws, "archive.pdf", 0).unwrap_err();
+        assert!(error.contains("Attach files"));
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn preview_refuses_binary_text_extension_and_directories() {
+        let ws = workspace("binary");
+        fs::write(ws.root().join("bad.txt"), b"not text\0secret").unwrap();
+        assert!(read_workspace_file_preview(&ws, "bad.txt", 0).is_err());
+        fs::create_dir_all(ws.root().join("folder")).unwrap();
+        let error = read_workspace_file_preview(&ws, "folder", 0).unwrap_err();
+        assert!(error.contains("Select a file"));
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn exact_page_boundary_reports_more_only_when_a_next_line_exists() {
+        let ws = workspace("boundary");
+        let exactly = (0..300)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(ws.root().join("exact.txt"), &exactly).unwrap();
+        fs::write(ws.root().join("more.txt"), format!("{exactly}extra\n")).unwrap();
+        assert_eq!(
+            read_workspace_file_preview(&ws, "exact.txt", 0).unwrap()["has_more"],
+            false
+        );
+        assert_eq!(
+            read_workspace_file_preview(&ws, "more.txt", 0).unwrap()["has_more"],
+            true
+        );
+        assert_eq!(
+            read_workspace_file_preview(&ws, "more.txt", 300).unwrap()["has_more"],
+            false
+        );
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// Phase 3M live defect: the reader's AI-facing "[N lines read from line X]"
+    /// trailer was rendered inside the user-facing preview body.
+    #[test]
+    fn preview_body_excludes_the_reader_trailer() {
+        let ws = workspace("trailer");
+        fs::write(ws.root().join("note.md"), "one\ntwo\n").unwrap();
+        fs::write(ws.root().join("with-brackets.md"), "array[0] = 1;\n").unwrap();
+        let page = read_workspace_file_preview(&ws, "note.md", 0).unwrap();
+        let body = page["content"].as_str().unwrap();
+        assert!(
+            !body.contains("lines read from line"),
+            "trailer leaked: {body:?}"
+        );
+        assert_eq!(body, "one\ntwo");
+        assert_eq!(page["lines_read"], 2);
+        let brackets = read_workspace_file_preview(&ws, "with-brackets.md", 0).unwrap();
+        assert!(brackets["content"]
+            .as_str()
+            .unwrap()
+            .contains("array[0] = 1;"));
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn preview_result_is_a_small_json_object() {
+        let ws = workspace("shape");
+        fs::write(ws.root().join("x.rs"), "fn main() {}\n").unwrap();
+        let result: Value = read_workspace_file_preview(&ws, "x.rs", 0).unwrap();
+        assert!(result["content"].as_str().unwrap().contains("fn main"));
+        assert_eq!(result["line_limit"], 300);
+        assert_eq!(result["has_more"], false);
+        assert_eq!(result["start_line"], 1);
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// Phase 3N: the native code view saves through the same confinement the
+    /// agent tools use, and reports a workspace-relative path only.
+    #[test]
+    fn save_writes_text_and_reports_a_relative_path() {
+        let ws = workspace("save-ok");
+        fs::write(ws.root().join("app.py"), "print('old')\n").unwrap();
+        let saved = write_workspace_file(
+            &ws,
+            "app.py",
+            "print('new')\nprint(2)\n",
+            "print('old')\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.root().join("app.py")).unwrap(),
+            "print('new')\nprint(2)\n"
+        );
+        assert_eq!(saved["path"], "app.py");
+        assert_eq!(saved["lines"], 2);
+        assert!(!saved["path"]
+            .as_str()
+            .unwrap()
+            .contains(&ws.root().to_string_lossy().to_string()));
+        // The atomic temp sibling must not survive a successful save.
+        assert!(!ws.root().join(".app.py.neelima-tmp").exists());
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn save_refuses_escapes_directories_binary_and_unsupported_types() {
+        let ws = workspace("save-reject");
+        let outside = ws.root().parent().unwrap().join("outside-save.txt");
+        fs::write(&outside, "sentinel").unwrap();
+        assert!(write_workspace_file(&ws, "../outside-save.txt", "pwned", "sentinel").is_err());
+        assert!(write_workspace_file(&ws, "/etc/passwd", "pwned", "").is_err());
+
+        fs::create_dir_all(ws.root().join("src")).unwrap();
+        assert!(write_workspace_file(&ws, "src", "pwned", "").is_err());
+
+        fs::write(ws.root().join("blob.txt"), b"head\0tail").unwrap();
+        let binary = write_workspace_file(&ws, "blob.txt", "text", "head\0tail").unwrap_err();
+        assert!(binary.contains("binary"), "got: {binary}");
+
+        fs::write(ws.root().join("doc.pdf"), b"%PDF-1.7").unwrap();
+        let pdf = write_workspace_file(&ws, "doc.pdf", "text", "%PDF-1.7").unwrap_err();
+        assert!(pdf.contains("not a supported text type"), "got: {pdf}");
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// The editor must start from exact bytes: a trimmed preview that was
+    /// saved straight back would silently delete the file's trailing newline.
+    #[test]
+    fn exact_text_preserves_trailing_newlines_that_the_preview_trims() {
+        let ws = workspace("exact-text");
+        fs::write(ws.root().join("keep.py"), "a = 1\n\n").unwrap();
+        let exact = read_workspace_file_text(&ws, "keep.py").unwrap();
+        assert_eq!(exact["content"], "a = 1\n\n");
+        let preview = read_workspace_file_preview(&ws, "keep.py", 0).unwrap();
+        assert_ne!(preview["content"], exact["content"]);
+        // Re-saving the exact text is a no-op, so nothing gets rewritten.
+        assert!(write_workspace_file(&ws, "keep.py", "a = 1\n\n", "a = 1\n\n").is_err());
+        assert_eq!(
+            fs::read_to_string(ws.root().join("keep.py")).unwrap(),
+            "a = 1\n\n"
+        );
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn exact_text_refuses_escapes_binary_and_oversized_files() {
+        let ws = workspace("exact-limits");
+        assert!(read_workspace_file_text(&ws, "../escape.txt").is_err());
+        fs::write(ws.root().join("blob.bin"), b"\0\0").unwrap();
+        assert!(read_workspace_file_text(&ws, "blob.bin").is_err());
+        fs::write(ws.root().join("blob.txt"), b"head\0tail").unwrap();
+        assert!(read_workspace_file_text(&ws, "blob.txt").is_err());
+        fs::write(
+            ws.root().join("big.txt"),
+            "x".repeat(FILE_EDIT_MAX_BYTES + 1),
+        )
+        .unwrap();
+        let error = read_workspace_file_text(&ws, "big.txt").unwrap_err();
+        assert!(error.contains("editing limit"), "got: {error}");
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    #[test]
+    fn save_refuses_a_no_op_and_an_oversized_edit() {
+        let ws = workspace("save-limits");
+        fs::write(ws.root().join("same.md"), "unchanged\n").unwrap();
+        assert!(write_workspace_file(&ws, "same.md", "unchanged\n", "unchanged\n").is_err());
+        let huge = "x".repeat(FILE_EDIT_MAX_BYTES + 1);
+        let error = write_workspace_file(&ws, "same.md", &huge, "unchanged\n").unwrap_err();
+        assert!(error.contains("limited to"), "got: {error}");
+        assert_eq!(
+            fs::read_to_string(ws.root().join("same.md")).unwrap(),
+            "unchanged\n"
+        );
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// Checkpoint 4: a save matches the reviewed baseline end to end — the
+    /// destination is replaced atomically and the bytes are read back for
+    /// verification before success is reported.
+    #[test]
+    fn save_with_a_matching_baseline_succeeds_and_verifies_the_written_bytes() {
+        let ws = workspace("save-baseline-ok");
+        fs::write(ws.root().join("conf.md"), "v1\n").unwrap();
+        let saved = write_workspace_file(&ws, "conf.md", "v2-draft\n", "v1\n").unwrap();
+        assert_eq!(fs::read_to_string(ws.root().join("conf.md")).unwrap(), "v2-draft\n");
+        assert_eq!(saved["bytes"], "v2-draft\n".len());
+        assert!(!ws.root().join(".conf.md.neelima-tmp").exists());
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// THE CP4 acceptance case: an external modification between opening the
+    /// file and applying the review must be refused, must keep the external
+    /// version fully intact, must not leave a temp file behind, and must be
+    /// clearable by rebasing the baseline onto the newest disk contents.
+    #[test]
+    fn save_rejects_an_externally_modified_file_and_preserves_both_versions() {
+        let ws = workspace("save-conflict");
+        fs::write(ws.root().join("conf.md"), "v1\n").unwrap();
+        // The editor holds v1 as `original`; an external process moves the
+        // disk content to v2 while the review is open.
+        fs::write(ws.root().join("conf.md"), "v2-external\n").unwrap();
+        let conflict =
+            write_workspace_file(&ws, "conf.md", "v3-draft\n", "v1\n").unwrap_err();
+        assert!(
+            conflict.starts_with(super::SAVE_CONFLICT_PREFIX),
+            "got: {conflict}"
+        );
+        assert!(conflict.contains("changed on disk"), "got: {conflict}");
+        // The external version is untouched, and no temp file survived.
+        assert_eq!(
+            fs::read_to_string(ws.root().join("conf.md")).unwrap(),
+            "v2-external\n"
+        );
+        assert!(!ws.root().join(".conf.md.neelima-tmp").exists());
+        // Rebase: once the user reloads (v2 becomes the baseline) the same
+        // draft saves cleanly.
+        write_workspace_file(&ws, "conf.md", "v3-draft\n", "v2-external\n").unwrap();
+        assert_eq!(fs::read_to_string(ws.root().join("conf.md")).unwrap(), "v3-draft\n");
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// A vanished destination is a hard save error, not a silent no-op: the
+    /// editor's stale document must never resurrect a deleted file.
+    #[test]
+    fn save_rejects_a_missing_destination() {
+        let ws = workspace("save-missing");
+        let error = write_workspace_file(&ws, "gone.md", "v2\n", "v1\n").unwrap_err();
+        assert!(error.contains("Could not inspect"), "got: {error}");
+        assert!(!ws.root().join("gone.md").exists());
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// Windows replacement semantics (verified on Windows): MoveFileEx alias
+    /// rename refuses a read-only destination instead of clobbering it, so a
+    /// genuinely unwritable destination preserves the original and reports a
+    /// replace failure; once writable, the same draft saves and verifies.
+    #[cfg(windows)]
+    #[test]
+    fn save_refuses_a_readonly_destination_and_preserves_the_original() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+        };
+        // windows_sys takes a UTF-16 path buffer; no extra dependency needed.
+        let set_readonly = |path: &std::path::Path, readonly: bool| {
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let attribute = if readonly {
+                FILE_ATTRIBUTE_READONLY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            };
+            unsafe { SetFileAttributesW(wide.as_ptr(), attribute) };
+        };
+        let ws = workspace("save-readonly");
+        let target = ws.root().join("locked.md");
+        fs::write(&target, "original\n").unwrap();
+        set_readonly(&target, true);
+        let denied =
+            write_workspace_file(&ws, "locked.md", "edited\n", "original\n").unwrap_err();
+        assert!(denied.contains("Could not replace"), "got: {denied}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original\n");
+        assert!(!ws.root().join(".locked.md.neelima-tmp").exists());
+        // Restore writability: the retry follows the ordinary success path.
+        set_readonly(&target, false);
+        let saved = write_workspace_file(&ws, "locked.md", "edited\n", "original\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "edited\n");
+        assert_eq!(saved["bytes"], "edited\n".len());
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    fn temp_artifacts(ws: &Workspace) -> Vec<String> {
+        fs::read_dir(ws.root())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".neelima-tmp"))
+            .collect()
+    }
+
+    /// CP4 closeout: controlled temp-file creation and mid-WRITE failures must
+    /// leave the destination byte-identical, leave no temp artifact, and return
+    /// an honest error with no success payload. Failure is injected
+    /// deterministically (thread-local test hook), not by relying on
+    /// environmental conditions.
+    #[test]
+    fn save_temp_write_failure_preserves_the_destination_and_leaves_no_artifact() {
+        for mode in [1u8, 2u8] {
+            let ws = workspace(&format!("save-temp-fail-{mode}"));
+            let target = ws.root().join("keep.md");
+            let original_bytes = b"original\n";
+            fs::write(&target, original_bytes).unwrap();
+            super::INJECT_TEMP_WRITE_FAILURE.with(|flag| flag.set(mode));
+            let result = write_workspace_file(&ws, "keep.md", "edited\n", "original\n");
+            let error = result.expect_err("an injected temp-write failure must not report success");
+            super::INJECT_TEMP_WRITE_FAILURE.with(|flag| flag.set(0));
+            assert!(error.contains("Could not write file"), "mode {mode}: {error}");
+            assert!(
+                !error.contains("bytes") && !error.contains("Saved"),
+                "mode {mode}: a failed temp write must not carry a success-shaped payload: {error}"
+            );
+            // The destination is byte-identical and no temp artifact survives
+            // (mode 2 proved the partial temp file was actually removed).
+            assert_eq!(fs::read(&target).unwrap(), original_bytes, "mode {mode}");
+            assert!(
+                temp_artifacts(&ws).is_empty(),
+                "mode {mode}: temp artifact left: {:?}",
+                temp_artifacts(&ws)
+            );
+            // The destination is still fully usable afterwards (hook cleared).
+            write_workspace_file(&ws, "keep.md", "edited\n", "original\n").unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "edited\n", "mode {mode}");
+            fs::remove_dir_all(ws.root()).ok();
+        }
+    }
+
+    /// CP4 final concurrency verification: concurrent saves of the SAME file
+    /// with the SAME baseline are serialized per canonical destination path.
+    /// EXACTLY ONE may succeed; every other attempt must fail as a baseline
+    /// conflict (never a silent last-writer-wins). Temp files stay per-operation
+    /// and exclusive, so no attempt can overwrite or delete another's; the final
+    /// bytes are exactly the winning draft and no temp artifact remains.
+    #[test]
+    fn concurrent_saves_of_the_same_file_never_corrupt_or_leak_temp_files() {
+        use std::sync::Barrier;
+        let ws = workspace("save-concurrent");
+        let target = ws.root().join("race.md");
+        fs::write(&target, "base\n").unwrap();
+        let drafts: Vec<String> = (0..8).map(|index| format!("draft {index}\n")).collect();
+        // Release every thread at once to maximise real overlap; the serialized
+        // save path makes the OUTCOME deterministic whatever the interleaving.
+        let start = Barrier::new(drafts.len());
+        let results: Vec<Result<Value, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = drafts
+                .iter()
+                .map(|draft| {
+                    let ws = &ws;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        // Every operation reviewed the same baseline.
+                        write_workspace_file(ws, "race.md", draft, "base\n")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let winners: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one save may succeed against the same baseline; results: {results:?}"
+        );
+        for result in &results {
+            if let Err(error) = result {
+                assert!(
+                    error.starts_with(super::SAVE_CONFLICT_PREFIX),
+                    "only baseline conflicts are acceptable losers, got: {error}"
+                );
+            }
+        }
+        let final_text = fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            final_text, drafts[winners[0]],
+            "final file must be exactly the winning reviewed draft"
+        );
+        assert!(temp_artifacts(&ws).is_empty(), "temp artifact left: {:?}", temp_artifacts(&ws));
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// CP4 final concurrency: the losing side of a same-file race must be
+    /// refused, not silently applied. This is the deterministic form of the
+    /// outcome the per-path lock guarantees: after one save has replaced the
+    /// destination, a second save still carrying the old baseline conflicts and
+    /// leaves the winner's bytes untouched.
+    #[test]
+    fn a_stale_save_cannot_overwrite_the_first_successful_save() {
+        let ws = workspace("save-stale");
+        let target = ws.root().join("stale.md");
+        fs::write(&target, "base\n").unwrap();
+        write_workspace_file(&ws, "stale.md", "first\n", "base\n").unwrap();
+        // Exactly the state a concurrently-started second save reaches after
+        // waiting on the lock: its reviewed baseline is now stale.
+        let conflict = write_workspace_file(&ws, "stale.md", "stale\n", "base\n").unwrap_err();
+        assert!(
+            conflict.starts_with(super::SAVE_CONFLICT_PREFIX),
+            "got: {conflict}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "first\n",
+            "the stale draft must never replace the first successful save"
+        );
+        assert!(temp_artifacts(&ws).is_empty());
+        // Rebasing onto the new baseline makes the same draft legitimate.
+        write_workspace_file(&ws, "stale.md", "stale\n", "first\n").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "stale\n");
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// CP4 final lifecycle: the registry stores weak entries, so a completed
+    /// save must not pin a permanent lock allocation; the next insertion
+    /// reclaims expired entries instead of accumulating one per saved file.
+    #[test]
+    fn expired_save_path_locks_are_reclaimed() {
+        let ws = workspace("save-lock-reclaim");
+        let first = ws.root().join("first.md");
+        fs::write(&first, "base\n").unwrap();
+        write_workspace_file(&ws, "first.md", "v2\n", "base\n").unwrap();
+        // The save has returned, so nothing holds this Arc. A surviving entry
+        // may exist, but it must be expired — never live.
+        assert_ne!(
+            super::save_lock_entry_is_live(&first),
+            Some(true),
+            "a completed save must not leave a live registry entry"
+        );
+        // Creating a lock for a NEW path performs the reclamation pass.
+        fs::write(ws.root().join("second.md"), "base\n").unwrap();
+        write_workspace_file(&ws, "second.md", "v2\n", "base\n").unwrap();
+        assert_eq!(
+            super::save_lock_entry_is_live(&first),
+            None,
+            "the expired entry must be reclaimed instead of accumulating"
+        );
+        fs::remove_dir_all(ws.root()).ok();
+    }
+
+    /// CP4 final lifecycle: reclamation must never split simultaneous
+    /// operations onto different mutexes. While one `Arc` is held, repeated
+    /// acquisitions — including one that prunes expired entries — must return
+    /// the SAME lock, so concurrent saves stay serialized.
+    #[test]
+    fn reclamation_never_splits_a_live_lock() {
+        let ws = workspace("save-lock-split");
+        let target = ws.root().join("shared.md");
+        fs::write(&target, "base\n").unwrap();
+        let live = super::save_path_lock(&target);
+        // Another path's lock forces a reclamation pass while `live` is held.
+        let other = ws.root().join("other.md");
+        fs::write(&other, "base\n").unwrap();
+        let other_lock = super::save_path_lock(&other);
+        let same = super::save_path_lock(&target);
+        assert!(
+            std::sync::Arc::ptr_eq(&live, &same),
+            "a live path lock must never be replaced by a different mutex"
+        );
+        assert_eq!(super::save_lock_entry_is_live(&target), Some(true));
+        drop(live);
+        drop(same);
+        drop(other_lock);
+        fs::remove_dir_all(ws.root()).ok();
+    }
+}
+
+#[cfg(test)]
+mod tree_listing_tests {
+    use super::{list_workspace_dir, TREE_ENTRY_LIMIT};
+    use std::fs;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "neelima-tree-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// CP5: a folder larger than the cap must expose a DETERMINISTIC first page
+    /// (sorted before capping), report truncation, and still hide dotfiles.
+    #[test]
+    fn listing_is_sorted_directories_first_and_capped_deterministically() {
+        let root = dir("cap");
+        fs::create_dir_all(root.join("zdir")).unwrap();
+        for index in 0..405 {
+            fs::write(root.join(format!("f{index:03}.txt")), "x").unwrap();
+        }
+        fs::write(root.join(".hidden"), "x").unwrap();
+
+        let listing = list_workspace_dir(&root, "").unwrap();
+        assert_eq!(listing["truncated"], true);
+        assert_eq!(listing["limit"], TREE_ENTRY_LIMIT);
+        assert_eq!(listing["unreadable"], 0);
+        let entries = listing["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), TREE_ENTRY_LIMIT);
+        assert_eq!(entries[0]["name"], "zdir");
+        assert_eq!(entries[0]["dir"], true);
+        assert_eq!(entries[1]["name"], "f000.txt");
+        assert_eq!(entries.last().unwrap()["name"], "f398.txt");
+        assert!(entries.iter().all(|entry| entry["name"] != ".hidden"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn empty_and_uncapped_listings_report_accurate_metadata() {
+        let root = dir("meta");
+        let empty = list_workspace_dir(&root, "").unwrap();
+        assert_eq!(empty["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(empty["truncated"], false);
+
+        fs::write(root.join("b.txt"), "x").unwrap();
+        fs::write(root.join("a.txt"), "x").unwrap();
+        let two = list_workspace_dir(&root, "sub").unwrap();
+        let entries = two["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["name"], "a.txt");
+        assert_eq!(entries[0]["path"], "sub/a.txt");
+        assert_eq!(entries[1]["name"], "b.txt");
+        assert_eq!(two["path"], "sub");
+        assert_eq!(two["truncated"], false);
+        fs::remove_dir_all(root).ok();
+    }
 }
 
 #[cfg(test)]

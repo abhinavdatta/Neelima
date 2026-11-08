@@ -11,23 +11,25 @@ fn read(path: &str) -> String {
 }
 
 /// `ui_*` command names from the invoke_handler block of lib.rs.
-fn registered_ui_commands() -> BTreeSet<String> {
+fn registered_app_commands() -> BTreeSet<String> {
     let src = read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
     let start = src
         .find(".invoke_handler(")
         .expect("lib.rs registers an invoke_handler");
     let block = &src[start..];
     let end = block.find("])").expect("invoke_handler list ends");
-    block[..end]
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-        .filter(|token| {
-            token
-                .strip_prefix("ui::")
-                .map(|name| name.starts_with("ui_"))
-                .unwrap_or(false)
-        })
-        .map(|token| token.trim_start_matches("ui::").to_string())
-        .collect()
+    let mut set = BTreeSet::new();
+    for token in block[..end].split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+    {
+        if let Some(name) = token.strip_prefix("ui::") {
+            if name.starts_with("ui_") || name.starts_with("browser_bridge_") {
+                set.insert(name.to_string());
+            }
+        } else if let Some(name) = token.strip_prefix("browser_bridge::") {
+            set.insert(name.to_string());
+        }
+    }
+    set
 }
 
 /// Command names granted by the `allow-app-commands` permission.
@@ -40,14 +42,14 @@ fn granted_ui_commands() -> BTreeSet<String> {
     let end = block.find(']').expect("commands.allow list ends");
     block[..end]
         .split('"')
-        .filter(|token| token.starts_with("ui_"))
+        .filter(|token| token.starts_with("ui_") || token.starts_with("browser_bridge_"))
         .map(str::to_string)
         .collect()
 }
 
 #[test]
 fn every_registered_ui_command_is_granted() {
-    let registered = registered_ui_commands();
+    let registered = registered_app_commands();
     assert!(
         registered.len() > 40,
         "parsed only {} commands from lib.rs — the parser lost the list",
@@ -64,7 +66,7 @@ fn every_registered_ui_command_is_granted() {
 
 #[test]
 fn no_granted_ui_command_is_stale() {
-    let registered = registered_ui_commands();
+    let registered = registered_app_commands();
     let granted = granted_ui_commands();
     let stale: Vec<_> = granted.difference(&registered).cloned().collect();
     assert!(

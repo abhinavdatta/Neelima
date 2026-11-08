@@ -461,6 +461,14 @@ impl WebProvider {
         text: &str,
         first_of_task: bool,
     ) -> Result<(), ProviderError> {
+        // Phase 3J: bounded, metadata-only trace of each pre-send stage, so a
+        // slow acknowledgement can be attributed to a specific stage instead of
+        // guessed at. No prompt or reply text is carried.
+        let send_started = std::time::Instant::now();
+        self.hub.note(format!(
+            "submit trace rid={}: send_inner start",
+            &request_id[request_id.len().saturating_sub(8)..]
+        ));
         self.state.stream.lock().unwrap().clear();
         if !is_mounted(&self.state, &self.profile_id, &self.adapter.id) {
             mount(&self.app, &self.profile_id, &self.adapter, &self.state)
@@ -482,12 +490,29 @@ impl WebProvider {
         self.wait_ready(20_000).await.map_err(|e| {
             ProviderError::BridgeUnreachable(set_bridge_err(&self.state.last_bridge_error, e))
         })?;
+        self.hub.note(format!(
+            "submit trace: page ready at +{}ms",
+            send_started.elapsed().as_millis()
+        ));
 
         // Ask the page directly what it sees. This single probe drives both the
         // login gate and the composer check (no duplicate RPCs).
+        let info_start = std::time::Instant::now();
         let info = match self.call("page_info", &json!(null)).await {
-            Ok(info) => info,
-            Err(e) => return Err(e),
+            Ok(info) => {
+                self.hub.note(format!(
+                    "submit trace: pre-send page_info resolved in {}ms",
+                    info_start.elapsed().as_millis()
+                ));
+                info
+            }
+            Err(e) => {
+                self.hub.note(format!(
+                    "submit trace: pre-send page_info failed after {}ms",
+                    info_start.elapsed().as_millis()
+                ));
+                return Err(e);
+            }
         };
         let page_login_state = info["login"]["state"].as_str().unwrap_or("unknown");
         let input_found = info["input_found"].as_bool() == Some(true);
@@ -568,21 +593,38 @@ impl WebProvider {
         // Reuse the provider chat for every task in the same stable Neelima
         // conversation. A different conversation starts a new provider chat.
         let already = self.state.chat_started_for.lock().unwrap().clone();
+        let new_chat_start = std::time::Instant::now();
         if should_start_provider_chat(first_of_task, already.as_deref(), conversation_id) {
             if let Err(e) = self.fire("new_chat", &json!(null)) {
                 return Err(ProviderError::PageChanged(format!(
                     "could not start a provider chat: {e}"
                 )));
             }
+            self.hub.note(format!(
+                "submit trace: new_chat fired in {}ms",
+                new_chat_start.elapsed().as_millis()
+            ));
             *self.state.chat_started_for.lock().unwrap() = Some(conversation_id.to_string());
+        } else {
+            self.hub.note(format!(
+                "submit trace: new_chat skipped at +{}ms",
+                new_chat_start.elapsed().as_millis()
+            ));
         }
 
         // Ensure the composer still exists immediately before the send; an SPA
         // navigation between the probe above and the send can invalidate it.
         if page_login_state == "logged_in" || input_found {
+            let recheck_start = std::time::Instant::now();
             let info = if page_login_state == "logged_in" {
                 match self.call("page_info", &json!(null)).await {
-                    Ok(info) => info,
+                    Ok(info) => {
+                        self.hub.note(format!(
+                            "submit trace: send recheck page_info resolved in {}ms",
+                            recheck_start.elapsed().as_millis()
+                        ));
+                        info
+                    }
                     Err(e) => return Err(e),
                 }
             } else {
@@ -603,12 +645,18 @@ impl WebProvider {
         // Snapshot the reply text already on screen. One reused provider chat
         // keeps the previous answer mounted, so "has a reply" alone is not
         // proof that the NEW prompt was answered.
+        let capture_start = std::time::Instant::now();
         let baseline_text = capture_reply_detail(&self.app, &self.hub, 3_000)
             .await
             .ok()
             .flatten()
             .and_then(|v| v["text"].as_str().map(str::to_owned))
             .unwrap_or_default();
+        self.hub.note(format!(
+            "submit trace: reply baseline captured in {}ms len={}",
+            capture_start.elapsed().as_millis(),
+            baseline_text.len()
+        ));
         *self.state.response_baseline_text.lock().unwrap() = baseline_text.clone();
         *self.state.submission_unconfirmed.lock().unwrap() = None;
 
@@ -616,7 +664,20 @@ impl WebProvider {
         // the provider UI confirms that the submitted prompt entered its chat.
         // The page-side path always resolves (~11 s worst case) — this budget is
         // larger, so the RPC is never cancelled mid-submission.
+        self.hub.note(format!(
+            "submit trace: submitting at +{}ms",
+            send_started.elapsed().as_millis()
+        ));
+        let send_rpc_start = std::time::Instant::now();
         self.emit_state(request_id, REQUEST_SUBMITTING, None);
+        // Bind the correlation ID in the page runtime itself before submitting.
+        // Every assistant push from this round must carry this ID; a stale
+        // previous ID would be rejected by the request registry and the reply
+        // would only arrive through the slower read-only backstop.
+        if let Err(e) = self.fire("set_request", &json!({ "request_id": request_id })) {
+            self.hub
+                .note(format!("submit trace: set_request fire failed: {e}"));
+        }
         let result = self
             .call_with_timeout(
                 "send_message",
@@ -624,10 +685,26 @@ impl WebProvider {
                     "text": text,
                     "quiet_ms": self.adapter.quiet_ms,
                     "request_id": request_id,
+                    // Phase 3O checkpoint 3: the page chain clamps every
+                    // pre-click stage to this shared deadline, so it always
+                    // resolves INSIDE the RPC budget and SEND_IN_FLIGHT can
+                    // never outlive the send (the live follow-up submits
+                    // stalled past 25s and latched the busy flag).
+                    "budget_ms": SEND_CALL_TIMEOUT_MS - 2_000,
                 }),
                 SEND_CALL_TIMEOUT_MS,
             )
-            .await?;
+            .await;
+        self.hub.note(format!(
+            "submit trace: send_message rpc done at {}ms submit_confirmed={}",
+            send_rpc_start.elapsed().as_millis(),
+            result
+                .as_ref()
+                .ok()
+                .and_then(|v| v["submission_confirmed"].as_bool())
+                .unwrap_or(false)
+        ));
+        let result = result?;
         classify_send_result(&self.state, &result)?;
         // Metadata-only lifecycle event: identifies the last successful stage
         // without carrying prompt or response text.
@@ -2031,13 +2108,15 @@ mod tests {
         assert!(note.unwrap().contains("did not confirm"));
     }
 
-    /// The send RPC budget must exceed the page-side worst case
-    /// (waitForSendButton 3s + waitSubmission 8s ≈ 11s) or a slow-but-succeeding
-    /// submission is cancelled mid-flight and its late result is discarded.
+    /// The page-side send chain now clamps every stage to the shared
+    /// budget_ms deadline passed to it, which is SEND_CALL_TIMEOUT_MS minus a
+    /// safety margin — so the chain resolves inside the RPC window and its
+    /// late result can no longer be discarded. The old fixed worst case
+    /// (waitForSendButton 3s + waitSubmission 8s ≈ 11s) predates the Phase 3N
+    /// settle guards; under a lingering streaming control the unclamped chain
+    /// could run ~50s.
     #[test]
     fn send_budget_exceeds_page_side_worst_case() {
-        // The page can spend ~11s locating the button and confirming the
-        // submission; the RPC budget must keep margin over that.
         const {
             assert!(SEND_CALL_TIMEOUT_MS > 13_000);
             assert!(CALL_TIMEOUT_MS <= SEND_CALL_TIMEOUT_MS);

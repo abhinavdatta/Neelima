@@ -130,6 +130,18 @@ class node_checkpoints,node_history,node_settings,node_terminal,node_web_chat,no
 |---------|-------------|----------|----------|
 | ![Main UI](docs/screenshots/01-main.png) | ![Folder menu](docs/screenshots/02-folder-menu.png) | ![Terminal panel](docs/screenshots/03-terminal.png) | ![Settings](docs/screenshots/04-settings.png) |
 
+### Phase 3Q-2b: inline preview + resizable split pane
+
+The modal file preview was replaced with a docked, resizable explorer beside an editor pane. Single click previews inline; double click / Enter opens a tab; Space toggles preview; Shift+F10 / right-click opens a five-action menu.
+
+| Inline preview (dark) | Editor tab (dark) | Dirty tab + preview (dark) | Splitter (dark) |
+|-----------------------|-------------------|----------------------------|-----------------|
+| ![Inline preview dark](docs/screenshots/3q2b-dark-01-inline-preview.png) | ![Editor tab dark](docs/screenshots/3q2b-dark-02-editor-tab.png) | ![Dirty tab preview dark](docs/screenshots/3q2b-dark-03-dirty-tab-preview.png) | ![Splitter dark](docs/screenshots/3q2b-dark-04-splitter.png) |
+
+| Inline preview (light) | Editor tab (light) | Dirty tab + preview (light) |
+|------------------------|--------------------|-----------------------------|
+| ![Inline preview light](docs/screenshots/3q2b-light-01-inline-preview.png) | ![Editor tab light](docs/screenshots/3q2b-light-02-editor-tab.png) | ![Dirty tab preview light](docs/screenshots/3q2b-light-03-dirty-tab-preview.png) |
+
 ## Distribution: portable vs installers (our decision)
 
 **Both — portable-first.** Each release ships:
@@ -326,6 +338,17 @@ The original build plan required proving four things before building the app. Th
 4. **DOM automation** — controlled textarea + contenteditable input setting, `MutationObserver` quiet-period completion, extraction tolerant of copy-button noise — all PASS.
 
 Full evidence: [docs/spike-report-windows.md](docs/spike-report-windows.md) and [docs/spike-report-windows-run2.md](docs/spike-report-windows-run2.md).
+
+## Phase 3Q-2b: Workspace restructure — inline preview + resizable split pane
+
+**Status: complete.** The modal file-preview flow is replaced by a selection-driven workspace:
+
+- **Inline preview**: single-click a file to preview it in place, debounced at 120 ms, cached per workspace + path, invalidated on save, verified agent write, refresh and workspace switch.
+- **Resizable split pane**: a 4 px splitter (`role="separator"`) between explorer and editor, draggable with the mouse and resizable with the keyboard (arrows, PageUp/PageDown, Home/End). Width persists in `explorer_width` and clamps so neither pane goes unusable (explorer 220–480 px, editor ≥ 320 px).
+- **File actions menu**: Shift+F10 or right-click opens a five-action menu — Open, Preview, Copy relative path, Copy absolute path, Share with chat — only actions the backend actually supports.
+- **Tabs**: double-click / Enter opens an editor tab; dirty tabs show a `●` marker; previews coexist with open tabs.
+- **Pure modules**: `previewCache.ts`, `splitPane.ts`, `fileMenu.ts` are unit-tested without a DOM; `SplitPane.tsx` is a thin `role="separator"` renderer.
+- **Tests**: UI suite 224/224 (38 new), Rust 350/350, adapters 80/80, `tsc --noEmit`, Vite production build, Tauri debug build all pass.
 
 ## Status & limitations (honest list)
 

@@ -577,6 +577,63 @@ pub fn read_file(ws: &Workspace, args: &Value, cap: usize) -> ToolOutcome {
     }
 }
 
+/// Phase 3O CP2: on-disk verification of a completed write. Two separate
+/// levels, reported honestly and separately:
+/// 1. EXISTENCE/READABILITY — the file can be opened and read back.
+/// 2. CONTENT — what is on disk matches what this call intended to persist.
+/// Only when both pass does the tool call report success; otherwise the call
+/// fails, so the ledger records a failure instead of a false success.
+enum Verify<'a> {
+    /// Expected final bytes of the entire file (plain write / edit).
+    Full(&'a str),
+    /// Expected final tail bytes (chunked `append:true` streams).
+    Tail(&'a str),
+}
+
+fn verify_written_file(path: &std::path::Path, expected: Verify<'_>) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        format!("write not verified — file is missing or unreadable on disk after the write: {e}")
+    })?;
+    match expected {
+        Verify::Full(want) => {
+            let got = std::fs::read_to_string(path).map_err(|e| {
+                format!("write not verified — file cannot be read back as text: {e}")
+            })?;
+            if got.as_bytes() != want.as_bytes() {
+                return Err(format!(
+                    "write not verified — on-disk content does not match what was written ({} on disk, {} expected)",
+                    got.len(),
+                    want.len()
+                ));
+            }
+            Ok(format!("{} bytes, content verified on disk", meta.len()))
+        }
+        Verify::Tail(want) => {
+            let tail_len = (want.len() as u64).min(meta.len()) as usize;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(path).map_err(|e| {
+                format!("write not verified — file cannot be opened for the append check: {e}")
+            })?;
+            f.seek(SeekFrom::End(-(tail_len as i64))).map_err(|e| {
+                format!("write not verified — cannot seek for the append check: {e}")
+            })?;
+            let mut got = vec![0u8; tail_len];
+            f.read_exact(&mut got)
+                .map_err(|e| format!("write not verified — cannot read the appended tail: {e}"))?;
+            if got != &want.as_bytes()[want.len() - tail_len..] {
+                return Err(
+                    "append not verified — the file tail does not match the appended content"
+                        .into(),
+                );
+            }
+            Ok(format!(
+                "{} bytes total, appended tail verified on disk",
+                meta.len()
+            ))
+        }
+    }
+}
+
 pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
     let rel = match get_str(args, "path") {
         Ok(p) => p,
@@ -644,8 +701,18 @@ pub fn write_file(ws: &Workspace, args: &Value) -> ToolOutcome {
             }
         }
     };
+    // Phase 3O CP2: verify the file on disk before reporting success.
+    let verify = if append {
+        Verify::Tail(&content)
+    } else {
+        Verify::Full(&content)
+    };
+    let verified = match verify_written_file(&path, verify) {
+        Ok(v) => v,
+        Err(e) => return err_out(format!("write_file: {e}")),
+    };
     ok_out(format!(
-        "wrote {} bytes to {}",
+        "wrote {} bytes to {} [{verified}]",
         content.len(),
         ws.display(&path)
     ))
@@ -731,7 +798,12 @@ pub fn edit_file(ws: &Workspace, args: &Value) -> ToolOutcome {
     } else {
         Some((ws.display(&path), content.clone(), updated.clone()))
     };
-    ok_out(format!("edited {}", ws.display(&path))).with_diff(diff)
+    // Phase 3O CP2: verify the edited file on disk before reporting success.
+    let verified = match verify_written_file(&path, Verify::Full(&updated)) {
+        Ok(v) => v,
+        Err(e) => return err_out(format!("edit_file: {e}")),
+    };
+    ok_out(format!("edited {} [{verified}]", ws.display(&path))).with_diff(diff)
 }
 
 pub fn list_dir(ws: &Workspace, args: &Value) -> ToolOutcome {
@@ -1761,6 +1833,162 @@ mod tests {
         assert_eq!(
             bridgable, allowlist,
             "ALLOWED_TOOLS must equal the registry's bridgable set"
+        );
+    }
+
+    // ---- Phase 3O CP2: on-disk write verification ----------------------
+
+    #[test]
+    fn successful_write_reports_disk_verification() {
+        let w = ws("cp2-write");
+        let settings = crate::settings::Settings::default();
+        let out = execute(
+            &w,
+            &call(
+                "1",
+                "write_file",
+                json!({"path":"cp2.txt","content":"hello"}),
+            ),
+            &settings,
+        );
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("content verified on disk"),
+            "output must state on-disk verification: {}",
+            out.output
+        );
+    }
+
+    #[test]
+    fn successful_append_verifies_only_the_tail() {
+        let w = ws("cp2-append");
+        assert!(
+            execute(
+                &w,
+                &call(
+                    "1",
+                    "write_file",
+                    json!({"path":"app.log","content":"one\n"})
+                ),
+                &crate::settings::Settings::default(),
+            )
+            .ok
+        );
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "write_file",
+                json!({"path":"app.log","content":"two\n","append":true}),
+            ),
+            &crate::settings::Settings::default(),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("appended tail verified on disk"),
+            "{}",
+            out.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(w.root().join("app.log")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn successful_edit_reports_disk_verification() {
+        let w = ws("cp2-edit");
+        assert!(
+            execute(
+                &w,
+                &call(
+                    "1",
+                    "write_file",
+                    json!({"path":"e.py","content":"value = 1\n"})
+                ),
+                &crate::settings::Settings::default(),
+            )
+            .ok
+        );
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "edit_file",
+                json!({"path":"e.py","old_string":"value = 1","new_string":"value = 2"}),
+            ),
+            &crate::settings::Settings::default(),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("content verified on disk"),
+            "{}",
+            out.output
+        );
+        let read_out = execute(
+            &w,
+            &call("3", "read_file", json!({"path":"e.py"})),
+            &crate::settings::Settings::default(),
+        );
+        assert!(read_out.output.contains("value = 2"));
+    }
+
+    #[test]
+    fn verifier_detects_missing_file_and_content_mismatch() {
+        // Missing file (deleted between write and verify on a real machine).
+        let path = ws("cp2-miss").root().join("gone.txt");
+        assert!(std::fs::write(&path, "abc").is_ok());
+        std::fs::remove_file(&path).unwrap();
+        let err = verify_written_file(&path, Verify::Full("abc")).unwrap_err();
+        assert!(
+            err.contains("missing or unreadable"),
+            "missing file must be reported as unverified, got: {err}"
+        );
+
+        // Content mismatch: tool "succeeded" but the bytes differ on disk.
+        std::fs::write(&path, "xyz").unwrap();
+        let err = verify_written_file(&path, Verify::Full("abc")).unwrap_err();
+        assert!(
+            err.contains("does not match what was written"),
+            "content drift must be reported, got: {err}"
+        );
+
+        // Append tail mismatch.
+        let err = verify_written_file(&path, Verify::Tail("abc")).unwrap_err();
+        assert!(
+            err.contains("tail does not match"),
+            "tail drift must be reported, got: {err}"
+        );
+    }
+
+    #[test]
+    fn crlf_files_survive_edit_verification() {
+        let w = ws("cp2-crlf");
+        assert!(
+            execute(
+                &w,
+                &call(
+                    "1",
+                    "write_file",
+                    json!({"path":"crlf.txt","content":"a\r\nb\r\n"}),
+                ),
+                &crate::settings::Settings::default(),
+            )
+            .ok
+        );
+        let out = execute(
+            &w,
+            &call(
+                "2",
+                "edit_file",
+                json!({"path":"crlf.txt","old_string":"b","new_string":"B"}),
+            ),
+            &crate::settings::Settings::default(),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(w.root().join("crlf.txt")).unwrap(),
+            "a\r\nB\r\n"
         );
     }
 }

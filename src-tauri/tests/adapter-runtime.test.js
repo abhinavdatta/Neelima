@@ -8,6 +8,7 @@ const runtime = readFileSync(join(__dirname, "../src/adapter_runtime.js"), "utf8
 const chatgpt = require("../assets/adapter-chatgpt.json");
 
 function createPage({
+  adapter = chatgpt,
   readyState = "complete",
   href = "https://chatgpt.com/",
   composer = false,
@@ -98,7 +99,7 @@ function createPage({
     disconnect() { observers.delete(this); }
   }
   const window = {
-    __LB_ADAPTER__: chatgpt,
+    __LB_ADAPTER__: adapter,
     __LB_NONCE__: "test-nonce",
     __TAURI_INTERNALS__: {
       invoke(_command, args) {
@@ -221,12 +222,38 @@ function sendReply(page) {
   return page.messages.filter((message) => message.t === "rpc_result" && message.id === "send").map((message) => JSON.parse(message.v).value).at(-1);
 }
 
+// The current runtime's send/reply chain resolves across sequential async
+// stages (idle wait → page settle → text → button → click → submission
+// confirmation → reply watch). Each stage arms its successor timer only after
+// the previous clock sweep has ended: promise continuations are microtasks,
+// which do not run while a synchronous sweep loop is on the stack — and the
+// sweep's final `now = target` jump desynchronizes any timer armed after it.
+// A single runTimers window therefore cannot advance the whole chain. This
+// mirrors the real provider page, which advances stage by stage over real
+// time. `drain()` advances the virtual clock in bounded rounds with a
+// microtask flush between rounds. It never retries a submission and never
+// fabricates state; it only advances the clock and flushes microtasks, and it
+// stops as soon as `stopWhen(page)` holds (or reports false after the cap).
+async function drain(page, stopWhen, { rounds = 12, window = 8000 } = {}) {
+  for (let i = 0; i < rounds; i += 1) {
+    await settle();
+    if (stopWhen(page)) return true;
+    page.runTimers(window);
+  }
+  await settle();
+  return !!stopWhen(page);
+}
+const sendSettled = (page) => page.messages.some((m) => m.t === "rpc_result" && m.id === "send");
+const replyPushed = (page) => page.messages.some((m) => m.t === "assistant_message");
+const clickSeen = (page) => page.messages.some((m) => m.t === "watch_state" && /clicked after /.test(m.note));
+const watchCompleted = (page) => page.messages.some((m) => m.t === "watch_state" && m.note === "completed");
+const providerError = (page) => page.messages.some((m) => m.t === "response_error");
+
 test("an empty composer without a new matching user message is not submission confirmation", async () => {
   let clickCount = 0;
   const page = createPage({ composer: true, onSend: ({ input }) => { clickCount += 1; input.value = ""; } });
   await sendOnMockPage(page);
-  page.runTimers(8000);
-  await settle();
+  await drain(page, sendSettled);
   assert.equal(sendReply(page).error_type, "send_unconfirmed");
   assert.equal(sendReply(page).sent, true);
   assert.equal(clickCount, 1, "unconfirmed prompt is never retried");
@@ -235,6 +262,9 @@ test("an empty composer without a new matching user message is not submission co
 test("submission is confirmed only after an exact matching new user message appears", async () => {
   const page = createPage({ composer: true, onSend: ({ users, notify }) => { users.push({ innerText: "make a file", textContent: "make a file" }); notify(); } });
   await sendOnMockPage(page);
+
+  await drain(page, sendSettled);
+
   assert.equal(sendReply(page).sent, true);
 });
 
@@ -246,6 +276,9 @@ test("ChatGPT send button supports its updated accessible label", async () => {
     onSend: ({ users, notify }) => { users.push({ innerText: "make a file", textContent: "make a file" }); notify(); },
   });
   await sendOnMockPage(page);
+
+  await drain(page, sendSettled);
+
   assert.equal(sendReply(page).sent, true);
 });
 
@@ -258,6 +291,9 @@ test("ChatGPT can use the unique submit button in the composer form", async () =
     onSend: ({ users, notify }) => { users.push({ innerText: "make a file", textContent: "make a file" }); notify(); },
   });
   await sendOnMockPage(page);
+
+  await drain(page, sendSettled);
+
   assert.equal(sendReply(page).sent, true);
 });
 
@@ -266,7 +302,9 @@ test("delayed matching user-message insertion confirms submission", async () => 
   await sendOnMockPage(page);
   page.users.push({ innerText: "make a file", textContent: "make a file" });
   page.notify();
-  await settle();
+
+  await drain(page, sendSettled);
+
   assert.equal(sendReply(page).sent, true);
 });
 
@@ -279,8 +317,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
   await sendOnMockPage(page);
   // Two quiet windows: no stop control was ever observed, so completion needs
   // a second independent confirmation (a stream pause must not complete).
-  page.runTimers(4000);
-  await settle();
+  await drain(page, replyPushed);
   const replies = page.messages.filter((message) => message.t === "assistant_message");
   assert.equal(replies.length, 1);
   assert.equal(replies[0].text, "Done with the requested work.");
@@ -309,8 +346,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 		await sendOnMockPage(page);
 		// Hammer the observer with mutations that carry NO content change.
 		for (let i = 0; i < 20; i += 1) page.notify();
-		page.runTimers(4000);
-		await settle();
+		await drain(page, replyPushed);
 		const replies = page.messages.filter((message) => message.t === "assistant_message");
 		assert.equal(replies.length, 1, "exactly one completion push despite the storm");
 		assert.equal(replies[0].text, "READY");
@@ -323,7 +359,8 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 			notify();
 		} });
 		await sendOnMockPage(page);
-		// Stream continues before the quiet window elapses.
+await drain(page, clickSeen);
+// Stream continues before the quiet window elapses.
 		const node = page.assistantMessages.at(-1);
 		node.innerText = "working on it";
 		node.textContent = "working on it";
@@ -350,8 +387,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 		} });
 		page.assistantMessages.push({ innerText: "stale older answer", textContent: "stale older answer", querySelectorAll() { return []; } });
 		await sendOnMockPage(page);
-		page.runTimers(2000);
-		await settle();
+		await drain(page, sendSettled);
 		assert.equal(page.messages.filter((message) => message.t === "assistant_message").length, 0, "stale reply is not pushed");
 		const waitResult = page.messages.filter((m) => m.t === "rpc_result" && m.id === "send").map((m) => JSON.parse(m.v).value).at(-1);
 		assert.equal(waitResult.sent, true, "submission itself was confirmed");
@@ -364,8 +400,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 			notify();
 		} });
 		await sendOnMockPage(page);
-		page.runTimers(4000);
-		await settle();
+		await drain(page, replyPushed);
 		assert.equal(page.messages.filter((m) => m.t === "assistant_message").length, 1);
 		for (let i = 0; i < 5; i += 1) page.notify();
 		page.runTimers(2000);
@@ -373,17 +408,21 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 		assert.equal(page.messages.filter((m) => m.t === "assistant_message").length, 1, "observer is torn down after completion");
 	});
 
-	test("sibling-anchor fallback detects the reply when assistant selectors go stale", async () => {
+	test("sibling-anchor fallback detects a non-ChatGPT reply when assistant selectors go stale", async () => {
+		// Generic providers may retain the legacy sibling fallback when message
+		// selectors drift. ChatGPT intentionally fails closed without a turn ID.
+		const fallbackAdapter = { ...chatgpt, id: "generic" };
 		// Live root cause #2: provider renames message attributes; S.messages
 		// matches nothing. The reply is detected as the sibling following the
 		// confirmed user turn, so detection survives the rename.
-		const page = createPage({ composer: true, onSend: ({ users, notify }) => {
+		const page = createPage({ adapter: fallbackAdapter, composer: true, onSend: ({ users, notify }) => {
 			const turn = { innerText: "make a file", textContent: "make a file", parentElement: {}, nextElementSibling: null };
 			users.push(turn);
 			notify();
 		} });
 		await sendOnMockPage(page);
-		assert.equal(page.messages.filter((m) => m.t === "assistant_message").length, 0, "no reply node yet");
+await drain(page, sendSettled);
+assert.equal(page.messages.filter((m) => m.t === "assistant_message").length, 0, "no reply node yet");
 		// The provider creates the reply as the next sibling of the user turn.
 		const turn = page.users.at(-1);
 		turn.nextElementSibling = { innerText: "READY", textContent: "READY", querySelectorAll() { return []; } };
@@ -423,8 +462,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 			notify();
 		} });
 		await sendOnMockPage(page);
-		page.runTimers(4000);
-		await settle();
+		await drain(page, watchCompleted);
 		const states = page.messages.filter((m) => m.t === "watch_state");
 		assert.ok(states.length >= 2, "start + completion transitions are reported");
 		assert.ok(states.some((m) => m.note === "generation started"));
@@ -446,8 +484,7 @@ test("a new assistant response is pushed once after a stable quiet snapshot", as
 		notify();
 	} });
 	await sendOnMockPage(page);
-	page.runTimers(4000);
-	await settle();
+	await drain(page, replyPushed);
 	const replies = page.messages.filter((message) => message.t === "assistant_message");
 	assert.equal(replies.length, 1);
 	assert.equal(replies[0].text, "READY", "citation and copy control are stripped");
@@ -459,7 +496,8 @@ test("cancel_response tears down the watch so a late reply is never pushed", asy
 		notify();
 	} });
 	await sendOnMockPage(page);
-	page.window.__LB__.call("cancel_response", JSON.stringify(null), "cancel", "test-nonce");
+await drain(page, sendSettled);
+page.window.__LB__.call("cancel_response", JSON.stringify(null), "cancel", "test-nonce");
 	await settle();
 	const cancelReply = page.messages.find((m) => m.t === "rpc_result" && m.id === "cancel");
 	assert.equal(JSON.parse(cancelReply.v).value.cancelled, true);
@@ -477,7 +515,8 @@ test("a superseding send cancels the previous watch and only the new request pus
 		notify();
 	} });
 	await sendOnMockPage(page);
-	// Second send starts while the first watch is still armed.
+await drain(page, sendSettled);
+// Second send starts while the first watch is still armed.
 	page.window.__LB__.call("send_message", JSON.stringify({ text: "make a file", request_id: "req-second" }), "send2", "test-nonce");
 	await settle();
 	// The reply to the FIRST prompt appears late, then a second reply.
@@ -496,6 +535,7 @@ test("a second concurrent send is refused without a second click", async () => {
 	let clickCount = 0;
 	const page = createPage({ composer: true, onSend: ({ input }) => { clickCount += 1; input.value = ""; } });
 	page.window.__LB__.call("send_message", JSON.stringify({ text: "one" }), "sendA", "test-nonce");
+	await drain(page, () => clickCount === 1);
 	page.window.__LB__.call("send_message", JSON.stringify({ text: "two" }), "sendB", "test-nonce");
 	await settle();
 	const second = page.messages.find((m) => m.t === "rpc_result" && m.id === "sendB");
@@ -511,7 +551,8 @@ test("page_info reports whether a completion watch is active", async () => {
 		notify();
 	} });
 	await sendOnMockPage(page);
-	page.window.__LB__.call("page_info", JSON.stringify(null), "info", "test-nonce");
+await drain(page, sendSettled);
+page.window.__LB__.call("page_info", JSON.stringify(null), "info", "test-nonce");
 	await settle();
 	const info = JSON.parse(page.messages.find((m) => m.t === "rpc_result" && m.id === "info").v).value;
 	assert.equal(info.watch.active, true);
@@ -530,10 +571,14 @@ test("a generation that ends without a new reply reports a provider error, not a
 		notify();
 	} });
 	await sendOnMockPage(page);
+	// The send chain resolves across async stages, so the click (and the stop
+	// control it reveals) happens INSIDE drain, not during the first setImmediate.
+	// Wait for the submission to settle before ending the turn, otherwise the
+	// "stop disappears" state lands before the watch even starts generating.
+	await drain(page, sendSettled);
 	page.setStop(false); // ...then stops without adding an assistant turn
 	page.notify();
-	page.runTimers(4000);
-	await settle();
+	await drain(page, providerError);
 	const errors = page.messages.filter((m) => m.t === "response_error");
 	assert.equal(errors.length, 1, "one error report");
 	assert.equal(errors[0].code, "provider_error");
@@ -558,8 +603,7 @@ test("an unconfirmed click is accepted (not a hard failure) and is never retried
 	  let clickCount = 0;
 	  const page = createPage({ composer: true, onSend: ({ input }) => { clickCount += 1; input.value = ""; } });
 	  await sendOnMockPage(page, "draft a reply");
-	  page.runTimers(8000);
-	  await settle();
+	  await drain(page, sendSettled);
 	  const reply = sendReply(page);
 	  assert.equal(reply.error_type, "send_unconfirmed");
 	  assert.equal(reply.sent, true);
@@ -571,8 +615,7 @@ test("an unconfirmed click is accepted (not a hard failure) and is never retried
 	test("the adapter does not falsely report provider success when submission is unconfirmed", async () => {
 	  const page = createPage({ composer: true, onSend: ({ input }) => { input.value = ""; } });
 	  await sendOnMockPage(page, "do something");
-	  page.runTimers(8000);
-	  await settle();
+	  await drain(page, sendSettled);
 	  const reply = sendReply(page);
 	  assert.notEqual(reply.submission_confirmed, true, "unconfirmed must not be reported as confirmed");
 	  assert.notEqual(page.messages.some((m) => m.t === "assistant_message"), true, "no assistant message was pushed; the adapter does not fabricate success");

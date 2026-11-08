@@ -79,6 +79,34 @@ input box / send button / last assistant message* and click the matching
 element on the page → **Save adapter**. The resulting JSON lands in the
 adapters folder and hot-reloads.
 
+## Attachments and local documents
+
+The adapter contract has **no file-upload field**. Adapters only set text into a
+composer and click send, so Neelima cannot (and does not pretend to) upload a
+binary to a provider's own file control.
+
+What the composer's **+** button does instead:
+
+- **PDF / DOCX / TXT / MD / CSV / JSON**: text is extracted **locally** in the
+  UI process (PDF.js for PDF pages, Mammoth for DOCX, a byte-capped read for
+  text). Page markers such as `[Page 3]` are kept for PDFs. The extracted text
+  is appended to your prompt and therefore travels with the message — Neelima
+  asks for confirmation before any web-provider task does that. The original
+  file is never modified, copied, or uploaded.
+- **Images (PNG/JPEG/GIF/WebP)**: stored as a local selection with a status
+  badge. There is **no OCR and no vision** in this build, so no pixel content
+  is described to the model. Only the filename/size note is included.
+- Limits: 15 MB per file, 30 MB total, 24,000 characters of extracted text per
+  file. Scanned/image-only PDFs yield no text and are reported as such — OCR is
+  not implemented.
+
+**Manual fallback for real uploads:** attach the file inside the embedded
+provider page yourself (the site's own paperclip/file control opens the native
+picker; the page is a real browser view and this is ordinary visible
+interaction), and mention the filename in your prompt. Neelima does not
+automate that control, read the page's file input, or confirm upload success on
+your behalf.
+
 ## Manual relay (first-class fallback)
 
 If no adapter is configured, or the adapter fails (element not found, login

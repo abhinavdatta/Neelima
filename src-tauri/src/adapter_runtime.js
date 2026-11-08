@@ -36,6 +36,12 @@
     try { return window.__TAURI_INTERNALS__.invoke("lb_bridge", { msg: JSON.stringify(obj) }); }
     catch (e) { return Promise.reject(e); }
   }
+  // Phase 3J: metadata-only send-lifecycle milestones (phase "sending"),
+  // reusing the whitelisted watch_state path so a slow acknowledgement can be
+  // attributed from the bridge log. Notes carry no page or prompt text.
+  function sendPhase(note) {
+    post({ t: "watch_state", runtime_id: RUNTIME_ID, phase: "sending", note: note, reply_seen: false, request_id: ACTIVE_REQUEST_ID, nonce: currentNonce() }).catch(function () {});
+  }
   function reply(id, value, error) {
     if (!id) return; // fire-and-forget evals carry no id
     var v = JSON.stringify(error ? { ok: false, error: String((error && error.message) || error) } : { ok: true, value: value === undefined ? null : value });
@@ -68,7 +74,11 @@
     '[data-turn="assistant"]',
     '[data-author="assistant"]',
     '[data-author-role="assistant"]',
-    '[data-testid="assistant-turn"]'
+    '[data-testid="assistant-turn"]',
+    // ChatGPT DIL renderer (observed 2026-10): turn-level search-unit keys
+    // identify assistant turns; markdown is nested content, not a turn.
+    '[data-content-search-unit-key$=":assistant"]',
+    '[data-chatgpt-search-unit-key$=":assistant"]',
   ];
   var USER_MARKERS = [
     '[data-message-author-role="user"]',
@@ -393,8 +403,17 @@
   // parsed reply is model output, not page furniture. Falls back to the node
   // itself, which is what ChatGPT and Claude commonly expose.
   function contentTarget(node) {
+    // A ChatGPT DIL turn can contain an inner sibling with the same turn key
+    // but only assistant markdown has model content (and nested UI chrome).
+    // Prefer the observed markdown body when selecting the turn's extraction root.
+    if (A.id === "chatgpt") {
+      var chatgptBody = null;
+      try { chatgptBody = node.querySelector('[data-markdown-text-style="assistant-message"]'); } catch (e) {}
+      if (chatgptBody) return chatgptBody;
+    }
     var prefs = [
       "[data-message-content]",
+      '[data-markdown-text-style="assistant-message"]',
       "[data-message-author-role='assistant']",
       ".font-claude-message",
       "message-content",
@@ -417,8 +436,146 @@
     return node;
   }
 
+  // Provider pages render fenced code as <pre><code>, but the literal ```
+  // fence characters are never text nodes, so plain innerText captures lose
+  // them. That silently broke the ```tool protocol: the JSON and nonce
+  // survived, the fences did not, and Rust parsed zero tool calls.
+  // serializeAssistantText walks the content node and re-emits each code
+  // block as a proper fenced block, restoring ``` markers. Nodes without
+  // <pre> produce plain innerText exactly as before.
+  function isPreNode(el) {
+    return !!el && el.tagName === "PRE";
+  }
+
+  function preLangOf(pre) {
+    var code = pre.querySelector("code") || pre;
+    var cls = ((code.className || "") + " " + (pre.className || ""));
+    var m = cls.match(/language-([a-zA-Z0-9_+-]+)/);
+    if (m) return m[1];
+    // The rendered info-string often sits in a small header row beside the
+    // code block ("tool", "python", ...) — a short single token that is not
+    // UI furniture. Never descend below the code block itself.
+    var host = pre.parentElement;
+    if (host) {
+      var kids = host.querySelectorAll("pre, div, label, span");
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i] === pre || pre.contains(kids[i])) continue;
+        var t = ((kids[i].innerText || kids[i].textContent || "").trim());
+        if (t && t.length <= 24 && !/\s/.test(t) && !/^(copy|edit|share|download|expand|collapse)/i.test(t)) {
+          return t;
+        }
+      }
+    }
+    return "";
+  }
+
+  function serializedAssistantText(node) {
+    var text = node ? (node.innerText || node.textContent || "") : "";
+    var pre = null;
+    try {
+      pre = node && node.querySelector && node.querySelector("pre");
+    } catch (e) { pre = null; }
+    if (!pre) return stripUiNoise(text);
+    // Fenced content exists: rebuild the message block by block.
+    var out = "";
+    var walk = function (el, insidePreHeader) {
+      var kids = el.childNodes;
+      for (var i = 0; i < kids.length; i++) {
+        var ch = kids[i];
+        if (ch.nodeType === 3) {
+          out += ch.nodeValue || "";
+        } else if (ch.nodeType !== 1) {
+          // comments etc.
+        } else if (isPreNode(ch)) {
+          var lang = preLangOf(ch) || insidePreHeader || "";
+          var codeEl = ch.querySelector("code") || ch;
+          var body = (codeEl.textContent || "").replace(/\n$/, "");
+          out += "```" + lang + "\n" + body + "\n```\n";
+        } else {
+          var hasDeepPre = false;
+          try { hasDeepPre = !!ch.querySelector("pre"); } catch (e) {}
+          if (hasDeepPre) {
+            walk(ch, insidePreHeader);
+          } else {
+            out += (ch.innerText || ch.textContent || "");
+          }
+        }
+      }
+    };
+    walk(node, "");
+    return stripUiNoise(out);
+  }
+
+  // Live evidence (2026-10, chatgpt.com "DIL" renderer): the whole assistant
+  // reply — INCLUDING what the model wrote as fenced ```tool blocks — can be
+  // flattened into ONE <p data-d-component="text"> with small inline
+  // <code data-d-component="code"> spans. There is no <pre>, so preLangOf
+  // never fires, and the literal fence characters exist nowhere in the DOM.
+  // Rust's parser requires both the ```tool opener and the ``` closer, so the
+  // capture must restore BOTH markers. The restorer is deliberately narrow:
+  // only a line that is exactly "tool" immediately followed by text that
+  // parses as a tool-shaped JSON object (string id/tool, optional k, object
+  // args) is wrapped, and the wrapping ends at the JSON's closing brace.
+  // Prose not matching that shape is never touched, and the per-task nonce
+  // check in Rust still guards anything that gets wrapped.
+  function looksLikeToolJson(s) {
+    try {
+      var v = JSON.parse(s);
+      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+      if (typeof v.id !== "string" || !v.id) return false;
+      if (typeof v.tool !== "string" || !v.tool) return false;
+      if (typeof v.k === "undefined" || v.k === null || typeof v.k === "string") { /* ok */ }
+      else return false;
+      if (typeof v.args !== "undefined" && v.args !== null && typeof v.args !== "object") return false;
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function restoreFlattenedToolFences(text) {
+    if (!text || text.indexOf("`") !== -1) return text; // fences already present — the pre path owns those
+    var linesRaw = text.split("\n");
+    var out = [];
+    var i = 0;
+    var wrappedAny = false;
+    while (i < linesRaw.length) {
+      var t = linesRaw[i].trim();
+      if (/^tool$/.test(t) && i + 1 < linesRaw.length) {
+        var body = [];
+        var j = i + 1;
+        var found = false;
+        while (j < linesRaw.length && !found) {
+          // Strip literal escape-furniture tokens some renderers leave in the
+          // flattened text before testing the JSON shape.
+          var ln = linesRaw[j].replace(/<\/?escape>/g, "");
+          body.push(ln);
+          var bt = body.join("\n").trim();
+          if (bt.length > 0 && bt.charAt(bt.length - 1) === "}") {
+            if (looksLikeToolJson(bt)) {
+              out.push("```tool");
+              out.push(bt);
+              out.push("```");
+              wrappedAny = true;
+              found = true;
+              i = j + 1;
+              break;
+            } else {
+              break; // closing brace reached but not tool-shaped: never fabricate
+            }
+          }
+          if (ln.trim() === "") break; // blank line before any closing brace: not a tool block
+          j += 1;
+        }
+        if (found) continue;
+      }
+      out.push(linesRaw[i]);
+      i += 1;
+    }
+    if (!wrappedAny) return text;
+    return out.join("\n");
+  }
+
   function replyText(node) {
-    return stripUiNoise(node.innerText || node.textContent || "");
+    return restoreFlattenedToolFences(serializedAssistantText(node));
   }
 
   // ---- reply candidates across provider layouts ----------------------------
@@ -506,6 +663,17 @@
       if (marker) { out.push(marker); continue; }
       // jsdom (and older engines) have no innerText: fall back to textContent.
       var label = (w.innerText || w.textContent || "");
+      if (A.id === "chatgpt") {
+        // Preserve the known conversation-turn wrapper layout only when both
+        // structural scope and an explicit assistant speaker label are present.
+        // Unanchored hero/suggestion copy remains ineligible.
+        var testId = "";
+        try { testId = String(w.getAttribute("data-testid") || ""); } catch (e) {}
+        if (/^conversation-turn(?:-|$)/i.test(testId) && /^\s*ChatGPT\s+said\b/i.test(label)) {
+          out.push(w);
+        }
+        continue;
+      }
       if (!hasUserMarker(w) && /(chatgpt|claude|gemini|assistant|copilot)\s*said/i.test(label)) {
         out.push(w);
       }
@@ -519,6 +687,12 @@
   function replyLayout() {
     if (S.messages && qAll(S.messages).length) return "adapter";
     if (qAll(ASSISTANT_MARKERS.join(", ")).length) return "role";
+    // Keep diagnostics in sync with the narrow wrapper fallback used by
+    // assistantTurnNodes; arbitrary wrappers and landing-page copy still fail closed.
+    if (A.id === "chatgpt") {
+      if (assistantTurnNodes().length) return "turns";
+      return userTurnNodes().length ? "user-anchor" : "none";
+    }
     if (qAll(TURN_WRAPPERS.join(", ")).length) return "turns";
     if (contentReplyCandidates().length) return "content";
     if (userTurnNodes().length) return "user-anchor";
@@ -620,13 +794,40 @@
     };
   }
 
+  /// Bounded deep outline (metadata only): tag/attr of descendants down to
+  /// `maxDepth` levels, at most `maxNodes` nodes total. Never page text.
+  function domDeep(node, maxDepth, maxNodes) {
+    var out = [];
+    function walk(el, depth) {
+      if (out.length >= maxNodes || depth > maxDepth) return;
+      try {
+        for (var i = 0; i < el.children.length && out.length < maxNodes; i++) {
+          var kid = domOutline(el.children[i], 4);
+          kid.depth = depth;
+          out.push(kid);
+          if (depth < maxDepth) walk(el.children[i], depth + 1);
+        }
+      } catch (e) { /* detached */ }
+    }
+    walk(node, 1);
+    return out;
+  }
+
   function replyDomReport() {
     var blocks = contentReplyCandidates();
     var report = { layout: replyLayout(), blocks: [], chain: [], markers: 0, wrappers: 0 };
     try { report.markers = qAll(ASSISTANT_MARKERS.join(", ")).length; } catch (e) {}
     try { report.wrappers = qAll(TURN_WRAPPERS.join(", ")).length; } catch (e) {}
     var start = Math.max(0, blocks.length - 3);
-    for (var i = start; i < blocks.length; i++) report.blocks.push(domOutline(blocks[i], 8));
+    // Metadata structure of the last content candidates, plus a bounded DEEP
+    // outline of the newest one (2 levels, ≤24 nodes). This is what shows
+    // whether a live layout renders fenced code as <pre> or as something else —
+    // still tags/attr names/counts/text lengths only, never page text.
+    for (var i = start; i < blocks.length; i++) {
+      var o = domOutline(blocks[i], 8);
+      if (i === blocks.length - 1) o.deep = domDeep(blocks[i], 10, 220);
+      report.blocks.push(o);
+    }
     // Ancestor chain of the newest block: shows WHERE the answer lives, which
     // is what a selector needs. Bounded to 8 levels, no text.
     var last = blocks.length ? blocks[blocks.length - 1] : null;
@@ -691,6 +892,12 @@
       // to the content-structure fallback instead of reporting "no reply".
       if (markerText) return { count: nodes.length, text: markerText, has_reply: true };
     }
+    // On ChatGPT, content markup is a reply only when it belongs to a specific
+    // turn-level assistant key. A nested markdown style marker or overlapping
+    // search key by itself is not enough to identify a distinct turn.
+    if (A.id === "chatgpt") return { count: nodes.length, text: "", has_reply: false };
+    // On ChatGPT, generic markdown/sibling content can be landing-page copy or
+    // other UI. Only an identified assistant turn may produce a reply.
     var blocks = contentReplyCandidates();
     if (blocks.length) {
       var blockText = replyText(contentTarget(blocks[blocks.length - 1]));
@@ -1096,6 +1303,10 @@
     var selectors = [
       S.send_button,
       '[data-testid="send-button"]',
+      // ChatGPT's conversation layout renders the submit control as
+      // button#composer-submit-button (the landing page uses send-button).
+      '#composer-submit-button',
+      '[data-testid="composer-submit-button"]',
       'button[aria-label="Send prompt"]',
       'button[aria-label="Send message"]',
       'button[aria-label="Send"]'
@@ -1119,6 +1330,84 @@
       }
     }
     return null;
+  }
+
+  // Resolve once the provider is not generating anymore. ChatGPT keeps the
+  // composer's Send control disabled while a reply is still finalizing, so an
+  // agent's next turn (a protocol reminder right after the reply) could find no
+  // enabled button and abort. Mutation-driven, bounded, never a polling loop.
+  function waitForComposerIdle(timeoutMs) {
+    return new Promise(function (resolve) {
+      if (!stopVisible()) { resolve(true); return; }
+      var observer = null, timer = null, done = false;
+      function finish(idle) {
+        if (done) return;
+        done = true;
+        if (observer) observer.disconnect();
+        if (timer) clearTimeout(timer);
+        resolve(idle);
+      }
+      if (document.body) {
+        observer = new MutationObserver(function () {
+          if (!stopVisible()) finish(true);
+        });
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+      }
+      timer = setTimeout(function () { finish(false); }, timeoutMs);
+    });
+  }
+
+  // A freshly mounted provider webview can fire its first "page ready" before
+  // the real document commits; a click placed on that early DOM is destroyed by
+  // the reload that follows (observed live: page ready 1.1s AFTER the click, the
+  // submission silently vanished). Wait for a settled document before typing.
+  function pageSettle(timeoutMs) {
+    return new Promise(function (resolve) {
+      var done = false, timer = null;
+      function finish() {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        if (typeof document.removeEventListener === "function") document.removeEventListener("load", finish);
+        resolve(true);
+      }
+      // The fallback timer is armed FIRST and in every branch. The rAF path
+      // previously returned without a timer, and rAF is fully suspended when
+      // the provider webview is hidden during an active task (Chromium does
+      // not run animation frames for hidden documents) — so on a follow-up
+      // submission the settle promise never resolved, the send RPC was
+      // cancelled at 25s, and SEND_IN_FLIGHT stayed latched (live: rpc r9
+      // stalled inside pageSettle after "idle after 4ms" for the full wall).
+      timer = setTimeout(finish, timeoutMs);
+      if (document.readyState === "complete" && typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(function () { finish(); });
+        return;
+      }
+      if (typeof document.addEventListener === "function") document.addEventListener("load", finish);
+    });
+  }
+
+  // Real DOM nodes expose isConnected; minimal host stubs may not. An absent
+  // value means "cannot tell", which must not be read as "detached".
+  function stillAttached(node) {
+    return !!node && (node.isConnected === undefined || node.isConnected === true);
+  }
+
+  function editorText(el) {
+    if (!el) return "";
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
+    return el.innerText || el.textContent || "";
+  }
+
+  // Does the composer still hold (at least the head of) the prompt we composed?
+  // Long prompts are compared by their first 200 normalized characters: the
+  // editor may wrap or strip trailing whitespace, but losing the head means the
+  // page re-rendered and a click would submit something else.
+  function editorContains(el, text) {
+    var wanted = normalizedMessage(text);
+    if (!wanted) return false;
+    var current = normalizedMessage(editorText(el));
+    return current.indexOf(wanted.slice(0, 200)) !== -1;
   }
 
   function waitForSendButton(timeoutMs) {
@@ -1272,6 +1561,16 @@
     },
     is_logged_in: function () { return evalLogin().state === "logged_in"; },
 
+    // Explicit correlation binding. Rust calls this immediately before
+    // send_message so every push from this round carries the request ID. It
+    // runs in the same runtime instance that will receive send_message, so it
+    // cannot be missed by an argument-parse or injection-order change.
+    set_request: function (a) {
+      var cfg = parseArg(a);
+      if (cfg && cfg.request_id) ACTIVE_REQUEST_ID = String(cfg.request_id);
+      return { request_id: ACTIVE_REQUEST_ID };
+    },
+
     new_chat: function () {
       var btn = S.new_chat ? q(S.new_chat) : null;
       if (btn) { btn.click(); return { clicked: true }; }
@@ -1290,31 +1589,57 @@
       var failed = function (error) { SEND_IN_FLIGHT = false; throw error; };
       try {
       var cfg = parseArg(a);
+      var sendT0 = Date.now();
+      // Deadline contract (Phase 3O checkpoint 3): the backend passes its own
+      // RPC budget minus a safety margin. Every pre-click stage shares that
+      // deadline instead of stacking full worst cases (~50s), which used to
+      // outlive the RPC budget — the late result was discarded and
+      // SEND_IN_FLIGHT stayed latched, so the next task's cold-start send was
+      // refused with "a prompt is already being submitted".
+      var budgetMs = cfg && Number(cfg.budget_ms) > 0 ? Number(cfg.budget_ms) : 23000;
+      var sendDeadline = sendT0 + budgetMs;
+      var WAIT_SUBMISSION_MS = 8000;
+      function timeLeft() { return sendDeadline - Date.now(); }
+      // A stage never outlives the shared deadline; 0 is a legal (immediate)
+      // budget, and every helper resolves on a 0 timer rather than hanging.
+      function stageBudget(max) { return Math.max(0, Math.min(max, timeLeft())); }
+      // Bind every push from this send to the backend's correlation ID BEFORE
+      // the first phase is posted, so a milestone can never carry the previous
+      // turn's id and be rejected by the request registry.
+      if (cfg.request_id) ACTIVE_REQUEST_ID = String(cfg.request_id);
+      sendPhase("send begin rid=" + (cfg.request_id ? String(cfg.request_id).slice(-8) : "MISSING"));
       var found = findComposer();
       var input = found.element;
       if (!input) return done({ error_type: "page_changed", error: "the provider message composer was not found. Expected a supported editable prompt field (last checked: " + found.selector + "). Open the sign-in window to refresh it, or choose a configured API/local model." });
-      if (!visible(input) || !editable(input)) return done({ error_type: "page_changed", error: "the detected message composer is not visible or editable; refresh the provider window or choose a configured API/local model" });        // Bind every push from this send to the backend's correlation ID.
-      if (cfg.request_id) ACTIVE_REQUEST_ID = String(cfg.request_id);
+      if (!visible(input) || !editable(input)) return done({ error_type: "page_changed", error: "the detected message composer is not visible or editable; refresh the provider window or choose a configured API/local model" });
       LAST_SENT_TEXT = normalizedMessage(cfg.text || "");
       var beforeUsers = userTurnNodes()
         .filter(editedByUser)
         .map(function (node) { return normalizedMessage(node.innerText || node.textContent || ""); });
-      setEditorText(input, String(cfg.text || ""), A.input && A.input.kind);
-      return waitForSendButton(3000).then(function (send) {
-        if (!send) {
-          // Nothing was clicked: the prompt was definitely NOT submitted.
-          return { error_type: "page_changed", error: "the prompt field is available but no enabled supported Send button appeared; refresh the provider page or use a configured API/local model" };
+      var wanted = String(cfg.text || "");
+      // Each submission is fired through exactly one path so a stale-node
+      // recovery cannot forget the response watch or the click accounting.
+      function fire(sendBtn, inputEl) {
+        // The click must only happen when the confirmation window still fits
+        // inside the shared deadline. Clicking with the RPC budget nearly
+        // spent used to lose the submission: the result was discarded by the
+        // cancelled RPC, the prompt had gone out, and the outcome became
+        // unknowable. Nothing has been typed into the conversation yet, so
+        // refusing here is safe and retrying later is legitimate.
+        if (timeLeft() < WAIT_SUBMISSION_MS + 500) {
+          sendPhase("submission budget exhausted before the click after " + (Date.now() - sendT0) + "ms");
+          return Promise.resolve({
+            error_type: "deadline",
+            error: "the prompt was NOT submitted: the submission deadline ran out while the provider page was settling; nothing was clicked, so retrying once the page is idle is safe"
+          });
         }
-        // Re-baseline the response watch at the INSTANT before the click: the
-        // assistant count and texts are captured here so anything that appeared
-        // while the send button was being located counts as pre-existing.
-        // The watch observes document.body, so an SPA container swap after
-        // this point cannot deafen it.
         var baselineAssistants = extractedLast().count;
         LAST_SEND_AT = Date.now();
         var responseWatch = waitResponse(cfg);
-        send.click();
-        return waitSubmission(input, String(cfg.text || ""), beforeUsers, baselineAssistants, 8000).then(function (confirmed) {
+        sendBtn.click();
+        sendPhase("clicked after " + (Date.now() - sendT0) + "ms");
+        return waitSubmission(inputEl, wanted, beforeUsers, baselineAssistants, WAIT_SUBMISSION_MS).then(function (confirmed) {
+          sendPhase("submission confirmed=" + confirmed + " after " + (Date.now() - sendT0) + "ms");
           if (!confirmed) {
             // The click happened but the provider did not expose a matching new
             // user turn in time. The outcome is UNKNOWN, so:
@@ -1331,6 +1656,75 @@
           }
           return { sent: true, submission_confirmed: true };
         });
+      }
+
+      return waitForComposerIdle(stageBudget(15000)).then(function () {
+        sendPhase("idle after " + (Date.now() - sendT0) + "ms");
+        // Nothing has been typed or clicked yet, so waiting here cannot lose a
+        // submission; it only avoids composing into a document about to reload.
+        return pageSettle(stageBudget(5000));
+      }).then(function () {
+        sendPhase("page settled after " + (Date.now() - sendT0) + "ms");
+        // The composer node can be re-rendered while the reply finishes.
+        var again = findComposer();
+        if (again.element) input = again.element;
+        if (!input) {
+          return { error_type: "page_changed", error: "the provider message composer disappeared before the prompt could be composed; refresh the provider window or choose a configured API/local model" };
+        }
+        setEditorText(input, wanted, A.input && A.input.kind);
+        sendPhase("text set " + (Date.now() - sendT0) + "ms");
+        return waitForSendButton(stageBudget(8000));
+      }).then(function (send) {
+        if (!send) {
+          // The SPA can re-render the composer and drop the inserted text; a
+          // second, still-unclicked attempt is safe (nothing was submitted).
+          sendPhase("send button NOT ready, re-applying text after " + (Date.now() - sendT0) + "ms");
+          setEditorText(input, wanted, A.input && A.input.kind);
+          return waitForSendButton(stageBudget(8000));
+        }
+        return send;
+      }).then(function (send) {
+        if (!send) {
+          sendPhase("send button NOT ready after " + (Date.now() - sendT0) + "ms");
+          // Nothing was clicked: the prompt was definitely NOT submitted.
+          return { error_type: "page_changed", error: "the prompt field is available but no enabled supported Send button appeared; refresh the provider page or use a configured API/local model" };
+        }
+        sendPhase("send button ready after " + (Date.now() - sendT0) + "ms");
+        if (!stillAttached(send) || !stillAttached(input)) {
+          // The document swapped the button/composer after they were resolved.
+          // Nothing has been clicked, so re-composing on the fresh nodes is safe;
+          // this is the second half of the cold-start guard.
+          sendPhase("stale nodes before click after " + (Date.now() - sendT0) + "ms");
+          return pageSettle(stageBudget(4000)).then(function () {
+            var fresh = findComposer();
+            if (!stillAttached(fresh.element)) return null;
+            input = fresh.element;
+            setEditorText(input, wanted, A.input && A.input.kind);
+            return waitForSendButton(stageBudget(6000));
+          }).then(function (freshSend) {
+            if (!stillAttached(freshSend)) {
+              sendPhase("no send button on the settled document");
+              return { error_type: "page_changed", error: "the provider page reloaded while the prompt was being prepared and no enabled supported Send button appeared afterwards; the prompt was not sent" };
+            }
+            if (editorText(input).trim() === "" || !editorContains(input, wanted)) {
+              sendPhase("composer text missing after reload");
+              return { error_type: "page_changed", error: "the prompt field lost the composed text before submission; the prompt was not sent" };
+            }
+            return fire(freshSend, input);
+          });
+        }
+        if (editorText(input).trim() === "" || !editorContains(input, wanted)) {
+          // The button exists but the composer no longer holds this prompt
+          // (page re-render). Clicking would submit the wrong thing.
+          sendPhase("composer text missing after " + (Date.now() - sendT0) + "ms");
+          return { error_type: "page_changed", error: "the prompt field lost the composed text before submission; the prompt was not sent" };
+        }
+        // Re-baseline the response watch at the INSTANT before the click: the
+        // assistant count and texts are captured here so anything that appeared
+        // while the send button was being located counts as pre-existing.
+        // The watch observes document.body, so an SPA container swap after
+        // this point cannot deafen it.
+        return fire(send, input);
       }).then(done, failed);
       } catch (e) {
         SEND_IN_FLIGHT = false;

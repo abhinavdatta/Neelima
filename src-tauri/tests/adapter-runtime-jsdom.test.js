@@ -228,6 +228,51 @@ test('submission confirms on composer-cleared + assistant-count signals without 
   window.close();
 });
 
+// Live regression (cold start): a freshly mounted provider webview can commit
+// the real document right after the composer was filled, destroying the send
+// button that was already resolved. The click used to land on that detached
+// node, the submission silently vanished, and the task hung to its deadline.
+// The guard must re-resolve the button on the settled document and click ONCE.
+test('a send button detached by a late document commit is re-resolved and clicked once', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send, main } = buildChat(document);
+  let clicks = 0;
+
+  function submit() {
+    clicks += 1;
+    composer.value = '';
+    main.appendChild(makeTurn(document, 'user', 'cold start prompt'));
+    main.appendChild(makeTurn(document, 'assistant', 'COLD START REPLY'));
+  }
+
+  // The composer receives the prompt first; the reload then swaps the button.
+  composer.addEventListener('input', () => {
+    setTimeout(() => {
+      const fresh = document.createElement('button');
+      fresh.setAttribute('data-testid', 'send-button');
+      Object.defineProperty(fresh, 'getClientRects', { value: () => [{}] });
+      fresh.addEventListener('click', submit);
+      send.replaceWith(fresh);
+    }, 0);
+  });
+  send.addEventListener('click', submit);
+
+  window.__LB__.call('send_message', JSON.stringify({ text: 'cold start prompt', quiet_ms: 150, timeout_ms: 5000 }), 'send-cold', 'jsdom-nonce');
+
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'rpc_result' && m.id === 'send-cold')) break;
+  }
+  const result = posted.find((m) => m.t === 'rpc_result' && m.id === 'send-cold');
+  assert.ok(result, 'send_message resolved');
+  const value = JSON.parse(result.v).value;
+  assert.equal(value.sent, true, 'the prompt is reported as sent');
+  assert.equal(value.submission_confirmed, true, 'the submission is confirmed on the fresh button');
+  assert.equal(clicks, 1, 'exactly one click — a stale node must never double-submit');
+  window.close();
+});
+
 // Live regression: Neelima reuses one provider chat per conversation, so a
 // follow-up prompt is sent into a conversation that ALREADY shows an
 // assistant turn. At the first quiet tick there is no NEW assistant turn yet
@@ -653,6 +698,146 @@ test('a user-only page never reports the prompt as an assistant reply', async ()
   window.close();
 });
 
+// ChatGPT's October DIL page structure from snapshot3k.json: user identity is
+// not present in the saved snapshot, so fixtures keep the already supported
+// user selector; assistant identity and content nesting mirror observed markup.
+function chatgptAssistantTurn(document, suffix, text) {
+  const turn = document.createElement('div');
+  turn.setAttribute('data-content-search-unit-key', `fixture:turn:${suffix}:assistant`);
+  turn.setAttribute('data-chatgpt-search-unit-key', `fixture:turn:${suffix}:assistant`);
+  const group = document.createElement('div');
+  const body = document.createElement('div');
+  body.setAttribute('data-markdown-text-style', 'assistant-message');
+  body.textContent = text;
+  group.appendChild(body);
+  turn.appendChild(group);
+  return turn;
+}
+
+test('ChatGPT DIL turn keys count distinct assistant turns and extract only the nested assistant body', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const main = document.querySelector('main');
+  const user1 = makeTurn(document, 'user', 'first prompt');
+  const user2 = makeTurn(document, 'user', 'second prompt');
+  const firstAssistant = chatgptAssistantTurn(document, '1', 'first answer');
+  const secondAssistant = chatgptAssistantTurn(document, '2', 'second answer');
+  secondAssistant.removeAttribute('data-content-search-unit-key');
+  main.append(user1, firstAssistant, user2, secondAssistant);
+
+  window.__LB__.call('page_info', null, 'info-dil-count', 'jsdom-nonce');
+  const info = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'info-dil-count'));
+  const page = JSON.parse(info.v).value;
+  assert.equal(page.turns.users, 2, 'distinct user turns remain detected');
+  assert.equal(page.turns.assistants, 2, 'turn-level keys identify two assistant turns');
+
+  window.__LB__.call('capture_reply', null, 'cap-dil-turn', 'jsdom-nonce');
+  const captured = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-dil-turn'));
+  const reply = JSON.parse(captured.v).value;
+  assert.equal(reply.assistant_count, 2);
+  assert.equal(reply.text, 'second answer');
+  assert.equal(reply.has_reply, true);
+  assert.equal(reply.layout, 'adapter');
+  window.close();
+});
+
+test('nested assistant search-unit markers still count as one turn', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const outer = document.createElement('div');
+  outer.setAttribute('data-content-search-unit-key', 'fixture:turn:nested-key:assistant');
+  const inner = document.createElement('div');
+  inner.setAttribute('data-chatgpt-search-unit-key', 'fixture:turn:nested-key:assistant');
+  const body = document.createElement('div');
+  body.setAttribute('data-markdown-text-style', 'assistant-message');
+  body.textContent = 'one distinct turn';
+  inner.appendChild(body);
+  outer.appendChild(inner);
+  document.querySelector('main').appendChild(outer);
+
+  window.__LB__.call('page_info', null, 'info-dil-nested-key', 'jsdom-nonce');
+  const result = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'info-dil-nested-key'));
+  assert.equal(JSON.parse(result.v).value.turns.assistants, 1);
+  window.close();
+});
+
+test('the alternate ChatGPT search-unit attribute alone identifies a DIL assistant turn', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const turn = document.createElement('div');
+  turn.setAttribute('data-chatgpt-search-unit-key', 'fixture:turn:alternate:assistant');
+  const body = document.createElement('div');
+  body.setAttribute('data-markdown-text-style', 'assistant-message');
+  body.textContent = 'alternate-key answer';
+  turn.appendChild(body);
+  document.querySelector('main').appendChild(turn);
+
+  window.__LB__.call('capture_reply', null, 'cap-dil-alternate-key', 'jsdom-nonce');
+  const result = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-dil-alternate-key'));
+  const value = JSON.parse(result.v).value;
+  assert.equal(value.assistant_count, 1);
+  assert.equal(value.text, 'alternate-key answer');
+  assert.equal(value.has_reply, true);
+  window.close();
+});
+
+test('nested ChatGPT markdown identity never inflates the turn count', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const main = document.querySelector('main');
+  main.appendChild(chatgptAssistantTurn(document, 'nested', 'one answer'));
+  window.__LB__.call('page_info', null, 'info-dil-nested', 'jsdom-nonce');
+  const res = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'info-dil-nested'));
+  const info = JSON.parse(res.v).value;
+  assert.equal(info.turns.assistants, 1);
+  assert.equal(info.messages_found, true);
+  window.close();
+});
+
+test('ChatGPT user turns without an identified assistant response and landing-page copy stay empty', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const main = document.querySelector('main');
+  main.innerHTML = '<nav>Navigation</nav><div class="markdown">Welcome to ChatGPT</div><div class="prose">Suggested prompt</div><section data-testid="conversation-turn-suggestion">Try asking a question</section>';
+  window.__LB__.call('capture_reply', null, 'cap-dil-landing', 'jsdom-nonce');
+  const landing = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-dil-landing'));
+  const landingValue = JSON.parse(landing.v).value;
+  assert.equal(landingValue.has_reply, false);
+  assert.equal(landingValue.assistant_count, 0);
+  assert.equal(landingValue.text, '');
+  assert.equal(landingValue.layout, 'none', 'navigation, hero and unlabeled turn-like suggestions are not assistant turns');
+
+  main.replaceChildren(makeTurn(document, 'user', 'pending question'));
+  window.__LB__.call('capture_reply', null, 'cap-dil-no-answer', 'jsdom-nonce');
+  const unanswered = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-dil-no-answer'));
+  const unansweredValue = JSON.parse(unanswered.v).value;
+  assert.equal(unansweredValue.user_count, 1);
+  assert.equal(unansweredValue.assistant_count, 0);
+  assert.equal(unansweredValue.has_reply, false);
+  assert.equal(unansweredValue.text, '');
+  window.close();
+});
+
+test('malformed and ambiguous ChatGPT turn identities do not count as assistant replies', async () => {
+  const { window, document, posted } = makeWindow();
+  buildChat(document);
+  const main = document.querySelector('main');
+  for (const key of ['assistant', 'turn:assistant:extra', 'turn:user']) {
+    const node = document.createElement('div');
+    node.setAttribute('data-content-search-unit-key', key);
+    node.setAttribute('data-markdown-text-style', 'assistant-message');
+    node.textContent = 'not a confirmed response';
+    main.appendChild(node);
+  }
+  window.__LB__.call('capture_reply', null, 'cap-dil-malformed', 'jsdom-nonce');
+  const res = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-dil-malformed'));
+  const value = JSON.parse(res.v).value;
+  assert.equal(value.assistant_count, 0);
+  assert.equal(value.has_reply, false);
+  assert.equal(value.text, '');
+  window.close();
+});
+
 test('page_info reports which reply layout matched', async () => {
   const { window, document, posted } = makeWindow();
   buildChat(document);
@@ -667,12 +852,9 @@ test('page_info reports which reply layout matched', async () => {
   window.close();
 });
 
-// ---- attribute-free layout (the live chatgpt.com case) ----------------------
-// A live session reported: layout=user-anchor, assistant turns=2, text empty.
-// The page exposed NO data-message-author-role and NO data-testid
-// conversation-turn wrappers, so every attribute detector found nothing and the
-// sibling heuristic returned an empty container. The answer must be found from
-// content structure instead: the last non-empty content block after the prompt.
+// ---- attribute-free layout (generic provider fallback) ---------------------
+// Content-only fallback remains available to non-ChatGPT adapters. ChatGPT
+// fails closed unless the saved assistant-turn identity is present.
 
 function buildAttributeFreeChat(document, { prompt, answer }) {
   const main = document.createElement('main');
@@ -698,7 +880,7 @@ function buildAttributeFreeChat(document, { prompt, answer }) {
 }
 
 test('an attribute-free page still yields the reply (content blocks, no selectors)', async () => {
-  const { window, document, posted } = makeWindow();
+  const { window, document, posted } = makeWindow({ adapter: { ...chatgpt, id: 'generic' } });
   buildChat(document);
   const page = buildAttributeFreeChat(document, { prompt: 'hello are you working?', answer: '' });
 
@@ -720,7 +902,7 @@ test('an attribute-free page still yields the reply (content blocks, no selector
 });
 
 test('a prompt that renders markdown is never returned as the answer', async () => {
-  const { window, document, posted } = makeWindow();
+  const { window, document, posted } = makeWindow({ adapter: { ...chatgpt, id: 'generic' } });
   const { composer, send } = buildChat(document);
   const main = document.createElement('main');
   document.body.appendChild(main);
@@ -754,5 +936,424 @@ test('a prompt that renders markdown is never returned as the answer', async () 
   window.__LB__.call('capture_reply', null, 'cap-md2', 'jsdom-nonce');
   const after = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'cap-md2'));
   assert.equal(JSON.parse(after.v).value.text, 'DONE', 'the genuine answer is still found');
+  window.close();
+});
+
+test('a rendered code block keeps its ``` fence in the pushed reply (tool protocol survives markdown capture)', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send } = buildChat(document);
+  const main = document.createElement('main');
+  document.body.appendChild(main);
+  const toolJson = '{"id":"1","tool":"write_file","k":"jsdom-nonce","args":{"path":"note.md","content":"hi"}}';
+  send.addEventListener('click', () => {
+    composer.value = '';
+    const user = makeTurn(document, 'user', 'create note.md please');
+    main.appendChild(user);
+    setTimeout(() => {
+      // ChatGPT-style rendering: prose paragraph plus a code block whose
+      // literal fences are NOT text nodes (header row shows the info string).
+      const answer = document.createElement('div');
+      answer.setAttribute('data-message-author-role', 'assistant');
+      const prose = document.createElement('p');
+      prose.textContent = 'On it.';
+      answer.appendChild(prose);
+      const block = document.createElement('div');
+      const header = document.createElement('span');
+      header.textContent = 'tool';
+      block.appendChild(header);
+      const pre = document.createElement('pre');
+      const code = document.createElement('code');
+      code.className = 'language-tool';
+      code.textContent = toolJson;
+      pre.appendChild(code);
+      block.appendChild(pre);
+      answer.appendChild(block);
+      main.appendChild(answer);
+    }, 200);
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'create note.md please', quiet_ms: 150, timeout_ms: 4000, request_id: 'task-fence.aaaaaaaa' }),
+    'send-fence',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3500;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  await sleep(200);
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'exactly one completion push');
+  assert.ok(
+    pushes[0].text.includes('```tool\n' + toolJson + '\n```'),
+    'the captured reply carries the literal fenced tool block; got: ' + JSON.stringify(pushes[0].text)
+  );
+  window.close();
+});
+
+test('a flattened DIL reply (no <pre> anywhere) still yields a fenced ```tool block', async () => {
+  const { window, document, posted } = makeWindow({ adapter: { ...chatgpt, selectors: { ...chatgpt.selectors, messages: '[data-dil-assistant-turn]' } } });
+  const { composer, send } = buildChat(document);
+  const main = document.createElement('main');
+  document.body.appendChild(main);
+  // Live chatgpt.com structure (2026-10 DIL renderer), metadata-accurate:
+  // MarkdownRoot > group > prose container > PortalBoundary/Renderer >
+  // DilRenderer > ONE <p data-d-component=text> holding the ENTIRE reply as
+  // text with tiny inline <code data-d-component=code> spans. No <pre>, no
+  // fence characters anywhere in the DOM.
+  const toolJson = '{"id":"1","tool":"write_file","k":"jsdom-nonce","args":{"path":"note.md","content":"hi"}}';
+  send.addEventListener('click', () => {
+    composer.value = '';
+    const user = makeTurn(document, 'user', 'create note.md please');
+    main.appendChild(user);
+    setTimeout(() => {
+      const root = document.createElement('div');
+      root.setAttribute('data-content-search-unit-key', 'fixture:turn:reply:assistant');
+      root.setAttribute('data-markdown-text-style', 'assistant-message');
+      const group = document.createElement('div');
+      const portal = document.createElement('div');
+      const dil = document.createElement('div');
+      const p = document.createElement('p');
+      p.setAttribute('data-d-component', 'text');
+      p.textContent = 'tool\n' + toolJson + '\n\nI followed the requested formatting.';
+      const c1 = document.createElement('code');
+      c1.setAttribute('data-d-component', 'code');
+      c1.textContent = 'read_file';
+      const c2 = document.createElement('code');
+      c2.setAttribute('data-d-component', 'code');
+      c2.textContent = 'write_file';
+      p.appendChild(c1);
+      p.appendChild(c2);
+      dil.appendChild(p);
+      portal.appendChild(dil);
+      group.appendChild(portal);
+      root.appendChild(group);
+      const turn = document.createElement('div');
+      turn.setAttribute('data-content-search-unit-key', 'fixture:turn:reply:assistant');
+      turn.appendChild(root);
+      main.appendChild(turn);
+    }, 200);
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'create note.md please', quiet_ms: 150, timeout_ms: 4000, request_id: 'task-dil.bbbbbbbb' }),
+    'send-dil',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3500;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  await sleep(200);
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'exactly one completion push');
+  assert.ok(
+    pushes[0].text.includes('```tool\n' + toolJson + '\n```'),
+    'the flattened reply is re-fenced for the parser; got: ' + JSON.stringify(pushes[0].text)
+  );
+  assert.ok(
+    pushes[0].text.includes('I followed the requested formatting.'),
+    'the prose survives outside the block'
+  );
+  window.close();
+});
+
+test('flattened prose that merely mentions tools is never re-fenced', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send } = buildChat(document);
+  const main = document.createElement('main');
+  document.body.appendChild(main);
+  send.addEventListener('click', () => {
+    composer.value = '';
+    const user = makeTurn(document, 'user', 'what can you do?');
+    main.appendChild(user);
+    setTimeout(() => {
+      const turn = document.createElement('div');
+      turn.setAttribute('data-content-search-unit-key', 'fixture:turn:reply:assistant');
+      const answer = document.createElement('div');
+      answer.className = 'markdown prose';
+      answer.textContent = 'tool\nnot valid json; and JSON without the shape: {"a":1}\nmore prose';
+      turn.appendChild(answer);
+      main.appendChild(turn);
+    }, 200);
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'what can you do?', quiet_ms: 150, timeout_ms: 4000, request_id: 'task-dil-no.cccccccc' }),
+    'send-dil-no',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3500;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  await sleep(200);
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'exactly one completion push');
+  assert.ok(
+    !pushes[0].text.includes('```tool'),
+    'non-tool-shaped flattened text is left alone; got: ' + JSON.stringify(pushes[0].text)
+  );
+  window.close();
+});
+
+test('a tool-shaped JSON knob without the tool-opener line is never re-fenced', async () => {
+  // A reply that merely CONTAINS the schema-shaped JSON in prose (no `tool`
+  // line immediately before it) must stay prose: the opener line is part of
+  // the fence contract, so wrapping bare JSON would fabricate tool calls.
+  const { window, document, posted } = makeWindow();
+  const { composer, send } = buildChat(document);
+  const main = document.createElement('main');
+  document.body.appendChild(main);
+  send.addEventListener('click', () => {
+    composer.value = '';
+    const user = makeTurn(document, 'user', 'show me the tool json format');
+    main.appendChild(user);
+    setTimeout(() => {
+      const turn = document.createElement('div');
+      turn.setAttribute('data-content-search-unit-key', 'fixture:turn:reply:assistant');
+      const answer = document.createElement('div');
+      answer.className = 'markdown prose';
+      answer.textContent = 'Here is the format: {"id":"1","tool":"write_file","k":"jsdom-nonce","args":{"path":"x.md","content":"hi"}} — use it in a ```tool fencing block.';
+      turn.appendChild(answer);
+      main.appendChild(turn);
+    }, 200);
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'show me the tool json format', quiet_ms: 150, timeout_ms: 4000, request_id: 'task-dil-no2.dddddddd' }),
+    'send-dil-no2',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3500;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  await sleep(200);
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'exactly one completion push');
+  assert.ok(
+    !pushes[0].text.includes('```tool\n'),
+    'bare tool-shaped JSON is not turned into a tool block; got: ' + JSON.stringify(pushes[0].text)
+  );
+  window.close();
+});
+
+test('a reply that already contains backticks is owned by the pre path, never double-wrapped', async () => {
+  // Flattened-DIL replies cannot contain literal backticks by construction,
+  // but if any backtick IS present the restorer must no-op entirely: the
+  // <pre> fence reconstruction already produced real fences, and re-wrapping
+  // on top could nest or duplicate ```tool blocks around ordinary examples.
+  const { window, document, posted } = makeWindow();
+  const { composer, send } = buildChat(document);
+  const main = document.createElement('main');
+  document.body.appendChild(main);
+  const toolJson = '{"id":"1","tool":"write_file","k":"jsdom-nonce","args":{"path":"note.md","content":"hi"}}';
+  send.addEventListener('click', () => {
+    composer.value = '';
+    const user = makeTurn(document, 'user', 'explain the tool format');
+    main.appendChild(user);
+    setTimeout(() => {
+      // Paragraph carrying one real ```tool fence (from the pre path) plus a
+      // SECOND unfolded copy of the JSON after a prose tool line: exactly the
+      // shape a careless double-wrap would corrupt.
+      const turn = document.createElement('div');
+      turn.setAttribute('data-content-search-unit-key', 'fixture:turn:reply:assistant');
+      const answer = document.createElement('div');
+      answer.className = 'markdown prose';
+      answer.textContent = '```tool\n' + toolJson + '\n```\nAnd as text it would look like: tool\n' + toolJson;
+      turn.appendChild(answer);
+      main.appendChild(turn);
+    }, 200);
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'explain the tool format', quiet_ms: 150, timeout_ms: 4000, request_id: 'task-dil-back.eeeeeeee' }),
+    'send-dil-back',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3500;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  await sleep(200);
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'exactly one completion push');
+  const count = (pushes[0].text.match(/```tool/g) || []).length;
+  assert.equal(count, 1, 'exactly one tool fence, the one that was already fenced; got: ' + JSON.stringify(pushes[0].text));
+  window.close();
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3O checkpoint 3: submission-budget (deadline) contract.
+// Live failure reproduced here: a follow-up send after a completed reply hit
+// Rust's 25s RPC wall while the page chain was still in its settle stages
+// (a lingering streaming/stop control stretched waitForComposerIdle), the
+// late result was discarded, and SEND_IN_FLIGHT stayed latched — the next
+// task's cold start was instantly refused with "a prompt is already being
+// submitted". Regressions must prove: (a) the chain resolves inside a small
+// budget with a truthful "not sent" error, (b) nothing was clicked, and
+// (c) the latch is gone so the very next send succeeds.
+
+test('a lingering stop control cannot push the send chain past its budget; the latch clears for the next send', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send, main } = buildChat(document);
+  // The idle wait resolves only when the streaming control is gone. Keep it
+  // "generating" long enough that the old unclamped chain would run 15s+.
+  const stop = rects(document.createElement('button'));
+  stop.setAttribute('data-testid', 'stop-button');
+  document.body.appendChild(stop);
+  setTimeout(() => stop.remove(), 600);
+
+  const t0 = Date.now();
+  window.__LB__.call(
+    'send_message',
+    // Old behaviour: waitForComposerIdle(15000) alone exceeded this budget,
+    // the RPC was cancelled, and SEND_IN_FLIGHT latched.
+    JSON.stringify({ text: 'follow up prompt', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-dl.aaaaaaaa', budget_ms: 1500 }),
+    'send-deadline',
+    'jsdom-nonce'
+  );
+  const result = await rpc(() => posted.find((x) => x.t === 'rpc_result' && x.id === 'send-deadline'));
+  const elapsed = Date.now() - t0;
+  assert.ok(result, 'the send chain resolved INSIDE the small budget (no mid-flight RPC cancel)');
+  assert.ok(elapsed < 3500, 'resolves well under the unclamped ~50s worst case; took ' + elapsed + 'ms');
+  const value = JSON.parse(result.v).value;
+  assert.equal(value.error_type, 'deadline');
+  assert.ok(value.error.includes('NOT submitted'), 'the error states the prompt was not sent: ' + value.error);
+
+  // Nothing was clicked: no user turn, no reply watch armed, no charger.
+  assert.equal(main.querySelectorAll('[data-message-author-role="user"]').length, 0);
+  assert.equal(posted.filter((m) => m.t === 'assistant_message').length, 0);
+
+  // (b) the latch is gone: an ordinary send right after works end to end.
+  // Give the second send a live page (click produces the user turn + reply)
+  // so it settles quickly instead of waiting out waitSubmission.
+  send.addEventListener('click', () => {
+    composer.value = '';
+    main.appendChild(makeTurn(document, 'user', 'next prompt'));
+    main.appendChild(makeTurn(document, 'assistant', 'done'));
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'next prompt', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-dl.bbbbbbbb', budget_ms: 12000 }),
+    'send-after-deadline',
+    'jsdom-nonce'
+  );
+  await sleep(100);
+  const pushed = posted.find((m) => m.t === 'assistant_message');
+  const settled2 = await rpc(() => posted.find((m) => m.t === 'rpc_result' && m.id === 'send-after-deadline'));
+  assert.ok(settled2 || pushed, 'the second send is accepted and settles, not refused as busy');
+  if (pushed) assert.equal(pushed.request_id, 'task-dl.bbbbbbbb');
+  window.close();
+});
+
+test('the click gate refuses only when the confirm window cannot fit, and keeps honest success otherwise', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send, main } = buildChat(document);
+  send.addEventListener('click', () => {
+    composer.value = '';
+    main.appendChild(makeTurn(document, 'user', 'hello there'));
+    main.appendChild(makeTurn(document, 'assistant', 'hello!'));
+  });
+  // A meaty budget (12s > the 8.5s confirm window + settle stages) with a
+  // normal page: the click still happens and the reply push carries the bound
+  // request id.
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'hello there', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-g.aaaaaaaa', budget_ms: 12000 }),
+    'send-ok',
+    'jsdom-nonce'
+  );
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (posted.some((m) => m.t === 'assistant_message')) break;
+  }
+  const pushes = posted.filter((m) => m.t === 'assistant_message');
+  assert.equal(pushes.length, 1, 'healthy sends still push the reply');
+  assert.equal(pushes[0].request_id, 'task-g.aaaaaaaa');
+
+  // A budget that expires before the click: refuse truthfully, no user turn.
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'late prompt', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-g.bbbbbbbb', budget_ms: 1 }),
+    'send-late',
+    'jsdom-nonce'
+  );
+  const lateResult = await rpc(() => posted.find((x) => x.t === 'rpc_result' && x.id === 'send-late'));
+  assert.ok(lateResult, 'a 1ms budget still resolves instead of hanging');
+  const lateValue = JSON.parse(lateResult.v).value;
+  if (lateValue.error_type === 'deadline') {
+    assert.ok(lateValue.error.includes('NOT submitted'));
+    const users = main.querySelectorAll('[data-message-author-role="user"]');
+    assert.ok(![...users].some((u) => u.textContent === 'late prompt'), 'the late prompt was never composed into a user turn');
+  } else {
+    // Worst case timing race resolved the other way; either report is truthful.
+    assert.ok(lateValue.sent || lateValue.error_type === 'page_changed' || lateValue.error_type === 'busy', JSON.stringify(lateValue));
+  }
+  window.close();
+});
+
+// Live follow-up submission reproduced here (rpc r9, 25s wall): the chain
+// stalled INSIDE pageSettle — its readyState=="complete" branch resolved via
+// requestAnimationFrame WITHOUT arming the fallback timer, and Chromium fully
+// suspends rAF while the active task's provider webview is hidden. The settle
+// promise therefore never resolved, the send RPC was cancelled at 25s, and
+// SEND_IN_FLIGHT latched, refusing the next task's cold start with "a prompt
+// is already being submitted".
+test('a hidden provider page with suspended rAF cannot stall the send chain in pageSettle', async () => {
+  const { window, document, posted } = makeWindow();
+  const { composer, send, main } = buildChat(document);
+  // Nobody ever runs the animation frame callback: what a hidden WebView2
+  // document effectively does to rAF.
+  window.requestAnimationFrame = function () { return 42; };
+  send.addEventListener('click', () => {
+    composer.value = '';
+    main.appendChild(makeTurn(document, 'user', 'settle probe'));
+    main.appendChild(makeTurn(document, 'assistant', 'SETTLE OK'));
+  });
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'settle probe', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-ps.aaaaaaaa', budget_ms: 12000 }),
+    'send-settle',
+    'jsdom-nonce'
+  );
+  // Old behaviour: NOTHING ever resolved (no push, no rpc result, SEND_IN_FLIGHT
+  // latched). The fallback settle timer must fire and the submission proceed.
+  const deadline = Date.now() + 9000;
+  let hit = null;
+  while (Date.now() < deadline) {
+    await sleep(100);
+    hit = posted.find((m) => m.t === 'assistant_message' || (m.t === 'rpc_result' && m.id === 'send-settle'));
+    if (hit) break;
+  }
+  assert.ok(hit, 'the chain resolved despite a dead rAF (settle timer armed in every branch)');
+  if (hit.t === 'assistant_message') {
+    assert.equal(hit.request_id, 'task-ps.aaaaaaaa');
+  } else {
+    const v = JSON.parse(hit.v).value;
+    assert.ok(v.sent || v.error, 'the send settled with an honest outcome: ' + JSON.stringify(v));
+  }
+  // And the latch is probeable: a second send is accepted, never refused as busy.
+  window.__LB__.call(
+    'send_message',
+    JSON.stringify({ text: 'settle probe', quiet_ms: 100, timeout_ms: 4000, request_id: 'task-ps.bbbbbbbb', budget_ms: 12000 }),
+    'send-settle2',
+    'jsdom-nonce'
+  );
+  const r2 = await rpc(() => posted.find((x) => x.t === 'rpc_result' && x.id === 'send-settle2'));
+  const pushed2 = posted.some((m) => m.t === 'assistant_message');
+  // Either resolution is fine; what must NOT happen is a busy refusal.
+  if (r2) {
+    const v2 = JSON.parse(r2.v).value;
+    assert.notEqual(v2.error_type, 'busy', 'the latch must not survive the settle fix');
+  }
+  assert.ok(r2 || pushed2, 'the second send proceeds');
   window.close();
 });

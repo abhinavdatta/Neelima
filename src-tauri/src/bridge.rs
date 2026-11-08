@@ -700,14 +700,16 @@ mod tests {
         let n2 = hub.current_nonce();
         assert_ne!(n1, n2, "nonce rotated on mount");
         assert_eq!(n2.len(), 33, "n + 32 hex chars");
-        // resolve with wrong nonce must NOT resolve
-        let (_, nonce, _rx) = hub.begin();
+        // resolve with wrong nonce must NOT resolve. Use the id `begin`
+        // actually allocated: rpc ids come from a process-global counter, so
+        // hardcoding "r1" only works when no other test has begun an RPC first.
+        let (id, nonce, _rx) = hub.begin();
         assert!(
-            !hub.resolve("r1", "forged", Value::Null),
+            !hub.resolve(&id, "forged", Value::Null),
             "foreign page without nonce cannot resolve"
         );
         assert!(
-            hub.resolve("r1", &nonce, Value::Null),
+            hub.resolve(&id, &nonce, Value::Null),
             "correct nonce resolves"
         );
         // Allowed types list contains exactly the page-safe set.

@@ -12,6 +12,9 @@ commands.allow = [
   "ui_workspace_rename",
   "ui_workspace_open_in_explorer",
   "ui_tree",
+  "ui_file_preview",
+  "ui_file_text",
+  "ui_file_save",
   "ui_settings_get",
   "ui_settings_set",
   "ui_adapters_list",
@@ -63,6 +66,7 @@ commands.allow = [
   "ui_provider_diagnose",
   "ui_request_log",
   "browser_bridge_propose",
+  "browser_bridge_decide",
 ]
 
 [[permission]]

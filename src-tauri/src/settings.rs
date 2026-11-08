@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_HOTKEY: &str = "CmdOrCtrl+Alt+Shift+X";
 pub const DEFAULT_RESULT_CAP: usize = 30 * 1024;
 pub const DEFAULT_MAX_ITERATIONS: u32 = 25;
+/// Phase 3Q-2b: remembered Files explorer width (CSS pixels).
+pub const DEFAULT_EXPLORER_WIDTH: u32 = 272;
+/// Hard bounds for a persisted width. The UI clamps to the window (220–480);
+/// these only stop a hand-edited file from collapsing a pane to nothing.
+pub const MIN_EXPLORER_WIDTH: u32 = 160;
+pub const MAX_EXPLORER_WIDTH: u32 = 1200;
 /// Step 3: project-context token budgets are bounded at save time so a
 /// hand-edited settings file cannot ask for an unbounded prompt.
 pub const MIN_CONTEXT_TOKENS: usize = 256;
@@ -143,6 +149,10 @@ pub struct Settings {
     pub shell: Option<String>,
     /// Global emergency-stop hotkey. Kills running commands and halts the loop.
     pub hotkey: String,
+    /// Phase 3Q-2b: width of the Files explorer split, in CSS pixels. Stored so
+    /// the workspace reopens at the size the user chose. `#[serde(default)]` on
+    /// Settings makes an older settings.json (without this field) load cleanly.
+    pub explorer_width: u32,
     pub workspaces: Vec<WorkspaceEntry>,
     pub active_workspace_id: Option<String>,
     pub providers: Providers,
@@ -169,6 +179,7 @@ impl Default for Settings {
             command_timeout_secs: 120,
             shell: None,
             hotkey: DEFAULT_HOTKEY.into(),
+            explorer_width: DEFAULT_EXPLORER_WIDTH,
             workspaces: Vec::new(),
             active_workspace_id: None,
             providers: Providers::default(),
@@ -277,6 +288,12 @@ fn validate_settings(next: &Settings) -> Result<(), String> {
     }
     if next.result_cap_bytes < 1024 || next.result_cap_bytes > 1024 * 1024 {
         return Err("result_cap_bytes must be 1KB..1MB".into());
+    }
+    // Phase 3Q-2b: a persisted split width must stay a usable pane size.
+    if !(MIN_EXPLORER_WIDTH..=MAX_EXPLORER_WIDTH).contains(&next.explorer_width) {
+        return Err(format!(
+            "explorer_width must be {MIN_EXPLORER_WIDTH}..={MAX_EXPLORER_WIDTH} pixels"
+        ));
     }
     for (name, provider) in [
         ("Ollama", next.providers.ollama.as_ref()),
@@ -537,6 +554,61 @@ mod tests {
 
         assert!(store.set(next).is_err());
         assert_eq!(store.get().max_iterations, DEFAULT_MAX_ITERATIONS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_without_explorer_width_still_load() {
+        // A settings.json written before Phase 3Q-2b has no explorer_width.
+        // `#[serde(default)]` must fill the documented default rather than
+        // failing the load and silently resetting the user's configuration.
+        let legacy = serde_json::json!({
+            "theme": "dark",
+            "permission_mode": "ask_all",
+            "max_iterations": 25,
+            "result_cap_bytes": DEFAULT_RESULT_CAP,
+            "command_timeout_secs": 120,
+            "hotkey": DEFAULT_HOTKEY,
+            "workspaces": [],
+            "update_check_opt_in": false
+        });
+        let parsed: Settings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.explorer_width, DEFAULT_EXPLORER_WIDTH);
+
+        // A remembered width round-trips through serialization for the UI.
+        let saved = Settings {
+            explorer_width: 331,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&saved).unwrap();
+        assert_eq!(json["explorer_width"], 331);
+    }
+
+    #[test]
+    fn explorer_width_is_validated() {
+        let dir = std::env::temp_dir().join(format!("neelima-settings-width-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+
+        let ok = Settings {
+            explorer_width: 220,
+            ..Default::default()
+        };
+        assert!(store.set(ok).is_ok());
+
+        let too_narrow = Settings {
+            explorer_width: MIN_EXPLORER_WIDTH - 1,
+            ..Default::default()
+        };
+        assert!(store.set(too_narrow).is_err());
+        // A rejected save must not publish the bad value in memory.
+        assert_eq!(store.get().explorer_width, 220);
+
+        let too_wide = Settings {
+            explorer_width: MAX_EXPLORER_WIDTH + 1,
+            ..Default::default()
+        };
+        assert!(store.set(too_wide).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

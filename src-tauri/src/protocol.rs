@@ -407,12 +407,14 @@ fn validate_call_id(id: &str) -> Result<(), String> {
 }
 
 fn detect_done(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"(?im)^\s*(?:DONE|done)\s*[:：]\s*(.+)$").unwrap();
-    re.captures(text).map(|c| {
-        c.get(1)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_default()
-    })
+    // B4/3I: the terminal anchor is still a line that STARTS with "DONE:" —
+    // gate strength unchanged. Only how much we capture grows: the whole
+    // rest of the message, so a preamble-instructed no-tool reply can lead
+    // with DONE and still carry its complete multi-line answer (or a fenced
+    // code block) as the user-visible summary instead of one truncated line.
+    let re = regex::Regex::new(r"(?im)^\s*(?:DONE|done)\s*[:：][ \t]*").unwrap();
+    let m = re.find(text)?;
+    Some(text[m.end()..].trim().to_string())
 }
 
 pub fn truncate(s: &str, max: usize) -> &str {
@@ -475,6 +477,7 @@ pub fn preamble(
 - You will receive results as ```result blocks with matching ids. Send your next batch only after results arrive.
 - Neelima calls are handled by this text protocol; they do not appear as provider-native tools. When workspace work is needed, emit the requested ```tool block instead of claiming the tools are unavailable.
 - When the task is complete, reply exactly "DONE: <one-line summary>" and nothing else.
+- No-tool answers: if you can complete the request WITHOUT any tools, do it immediately in ONE reply — its FIRST line must be "DONE:" followed by the complete answer (multi-line and code fences allowed), ending the task without a reminder round. Plain prose without a leading DONE line is not final.
 - If a call fails, read the error and fix the call. Never invent results.
 
 TOOLS
@@ -603,6 +606,40 @@ mod tests {
         assert_eq!(v["id"], "7");
         assert_eq!(v["ok"], true);
         assert_eq!(v["output"], "hello\nworld");
+    }
+
+    /// Phase 3I: a no-tool reply that leads with DONE carries its complete
+    /// multi-line answer. Single-line DONE still works; a mid-text DONE with
+    /// trailing prose is now fully captured instead of one truncated line.
+    #[test]
+    fn done_captures_multiline_answer() {
+        let reply = "Let me answer without tools.\nDONE: Here is the answer\nLine two of the answer\n\n```rust\nfn main() {}\n```";
+        match parse_reply(reply, None) {
+            Parsed::Done(summary) => {
+                assert!(summary.starts_with("Here is the answer"));
+                assert!(summary.contains("Line two of the answer"));
+                assert!(summary.contains("```rust"));
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    /// Phase 3I fallback invariant: plain prose WITHOUT a leading DONE line
+    /// still gets the reminder round (Parsed::Neither), never false-final.
+    #[test]
+    fn prose_without_done_is_not_final() {
+        let reply = "Here is the complete answer for you.";
+        assert!(matches!(parse_reply(reply, None), Parsed::Neither));
+    }
+
+    /// Tool blocks still win over a DONE line (multi-step tasks unaffected).
+    #[test]
+    fn done_with_tool_block_is_calls_not_done() {
+        let reply = "Refactor first.\nDONE: after this\n```tool\n{\"id\":\"1\",\"tool\":\"read_file\",\"args\":{\"path\":\"src/main.rs\"}}\n```";
+        match parse_reply(reply, None) {
+            Parsed::Calls(calls) => assert_eq!(calls.len(), 1),
+            other => panic!("expected calls, got {other:?}"),
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::workspace::Workspace;
 pub struct RunOutcome {
     pub ok: bool,
     pub output: String,
+    pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub killed: bool,
 }
@@ -46,6 +47,7 @@ pub async fn run_command_streaming(
                 return RunOutcome {
                     ok: false,
                     output: format!("run_command: {e}"),
+                    exit_code: None,
                     timed_out: false,
                     killed: false,
                 }
@@ -61,6 +63,7 @@ pub async fn run_command_streaming(
         return RunOutcome {
             ok: false,
             output: "run_command: missing command".into(),
+            exit_code: None,
             timed_out: false,
             killed: false,
         };
@@ -70,7 +73,21 @@ pub async fn run_command_streaming(
     #[cfg(windows)]
     let mut cmd = {
         let mut c = hidden_tokio("cmd");
-        c.args(["/C", command]);
+        // cmd.exe has its own quote rules: it does NOT treat `\"` as an
+        // escaped quote the way the MSVCRT argument convention does. Rust's
+        // automatic arg quoting therefore wrapped the whole line in an extra
+        // quote layer, and a command like `node -e "console.log('x')"` reached
+        // node with a literal leading `"` (live Phase 3F failure: the arg came
+        // through as an unterminated string). `raw_arg` writes `/C` and the
+        // command text onto the command line EXACTLY as authored, so cmd.exe
+        // sees the quotes the same way it would if the user typed the command
+        // at its own prompt. Shell semantics, cwd confinement, the deny/
+        // allowlist guard, approval mapping and cancellation are unchanged:
+        // they all run on the same string long before this spawn.
+        use std::os::windows::process::CommandExt;
+        let s = c.as_std_mut();
+        s.raw_arg("/C");
+        s.raw_arg(command);
         c
     };
     #[cfg(not(windows))]
@@ -107,6 +124,7 @@ pub async fn run_command_streaming(
             return RunOutcome {
                 ok: false,
                 output: format!("run_command: failed to spawn: {e}"),
+                exit_code: None,
                 timed_out: false,
                 killed: false,
             }
@@ -151,19 +169,20 @@ pub async fn run_command_streaming(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut timed_out = false;
     let mut killed = false;
+    let exit_code: Option<i32>;
 
     loop {
         tokio::select! {
             _ = cancel.notified() => {
                 kill_tree(&child.id().unwrap_or(0)).await;
                 killed = true;
-                let _ = child.wait().await;
+                exit_code = child.wait().await.ok().and_then(|status| status.code());
                 break;
             }
             _ = tokio::time::sleep_until(deadline) => {
                 kill_tree(&child.id().unwrap_or(0)).await;
                 timed_out = true;
-                let _ = child.wait().await;
+                exit_code = child.wait().await.ok().and_then(|status| status.code());
                 break;
             }
             item = chunk_rx.recv() => {
@@ -196,9 +215,9 @@ pub async fn run_command_streaming(
                                 if out.is_empty() {
                                     out = if code == 0 { "(no output, exit 0)".into() } else { format!("(no output, exit {code})") };
                                 }
-                                return RunOutcome { ok: code == 0, output: format!("{out}\n[exit code: {code}]"), timed_out: false, killed: false };
+                                return RunOutcome { ok: code == 0, output: format!("{out}\n[exit code: {code}]"), exit_code: Some(code), timed_out: false, killed: false };
                             }
-                            Err(e) => return RunOutcome { ok: false, output: format!("run_command: wait failed: {e}"), timed_out: false, killed: false },
+                            Err(e) => return RunOutcome { ok: false, output: format!("run_command: wait failed: {e}"), exit_code: None, timed_out: false, killed: false },
                         }
                     }
                 }
@@ -234,6 +253,7 @@ pub async fn run_command_streaming(
     RunOutcome {
         ok: !killed && !timed_out,
         output: out,
+        exit_code,
         timed_out,
         killed,
     }
@@ -272,6 +292,171 @@ pub fn is_process_group_leader_note() -> &'static str {
 /// model output (`args.timeout`), so it is untrusted input: a value near
 /// `u64::MAX` used to overflow `Instant + Duration` and panic the agent task.
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 3600;
+
+/// Windows regression tests for the quote-contract fix (Phase 3F live defect:
+/// `cmd /C` received the command wrapped in MSVCRT-style quotes, which cmd.exe
+/// mis-parses; `raw_arg` hands it the line unmodified).
+#[cfg(all(test, windows))]
+mod windows_quote_tests {
+    use super::*;
+
+    fn tmp_ws() -> (std::path::PathBuf, Workspace) {
+        let dir = std::env::temp_dir().join(format!(
+            "neelima-exec-wqt-{}",
+            uuid::Uuid::new_v4().simple().to_string()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::open(&dir).unwrap();
+        (dir, ws)
+    }
+
+    async fn run(ws: &Workspace, command: &str, timeout: u64) -> RunOutcome {
+        let cancel = Arc::new(Notify::new());
+        run_command_streaming(ws, None, command, timeout, 4096, cancel, |_| {}).await
+    }
+
+    /// Embedded double quotes and quoted semicolons must reach the program
+    /// intact: under the old quoting the `-e` script arrived as an unterminated
+    /// string (SyntaxError, exit 1).
+    #[tokio::test]
+    async fn quoted_script_with_semicolons_reaches_the_program_intact() {
+        let (dir, ws) = tmp_ws();
+        let out = run(
+            &ws,
+            "node -e \"console.log('QT-ONE'); console.log('QT-TWO'); process.exit(0)\"",
+            20,
+        )
+        .await;
+        assert!(out.ok, "quoting fix regressed: {}", out.output);
+        assert!(out.output.contains("QT-ONE"), "{}", out.output);
+        assert!(out.output.contains("QT-TWO"), "{}", out.output);
+        assert!(out.output.contains("[exit code: 0]"), "{}", out.output);
+        assert_eq!(out.exit_code, Some(0), "the numeric code is retained");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Spaces and Unicode inside quoted arguments survive the line as-is.
+    #[tokio::test]
+    async fn quoted_unicode_and_spaces_survive_the_command_line() {
+        let (dir, ws) = tmp_ws();
+        let out = run(
+            &ws,
+            "node -e \"console.log('ünïcode 塩 two words'); process.exit(0)\"",
+            20,
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.contains("ünïcode 塩 two words"),
+            "{}",
+            out.output
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An intentional nonzero exit must still be reported truthfully.
+    #[tokio::test]
+    async fn an_intentional_nonzero_exit_is_reported_truthfully() {
+        let (dir, ws) = tmp_ws();
+        let out = run(&ws, "node -e \"console.log('BYE'); process.exit(7)\"", 20).await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("BYE"), "{}", out.output);
+        assert!(out.output.contains("[exit code: 7]"), "{}", out.output);
+        assert_eq!(out.exit_code, Some(7), "a nonzero code is retained as data");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A malformed program fails through cmd's own error path with a recorded
+    /// exit status (truthful), not as a success or a parse garbage.
+    #[tokio::test]
+    async fn a_malformed_program_is_refused_with_a_recorded_status() {
+        let (dir, ws) = tmp_ws();
+        let out = run(&ws, "definitely-not-a-real-program-xyz9x7 --flag one", 20).await;
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("[exit code: 1]"), "{}", out.output);
+        assert_eq!(out.exit_code, Some(1), "the shell's failure code is retained");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Cancellation of a bounded long-running command still kills the tree and
+    /// reports the kill, not a success.
+    #[tokio::test]
+    async fn cancelling_a_long_command_kills_the_tree_and_reports_truthfully() {
+        let (dir, ws) = tmp_ws();
+        let cancel = Arc::new(Notify::new());
+        let cancel2 = cancel.clone();
+        let run = tokio::spawn(async move {
+            run_command_streaming(&ws, None, "ping -n 12 127.0.0.1", 30, 4096, cancel2, |_| {})
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cancel.notify_one();
+        let out = run.await.unwrap();
+        assert!(out.killed, "{}", out.output);
+        assert!(!out.ok, "{}", out.output);
+        assert!(out.output.contains("process tree killed"), "{}", out.output);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Basic execution contract (Phase 3G acceptance 1): the simplest
+    /// quote-free invocation still works and reports a real version line.
+    #[tokio::test]
+    async fn the_simplest_invocation_node_version_still_works() {
+        let (dir, ws) = tmp_ws();
+        let out = run(&ws, "node --version", 20).await;
+        assert!(out.ok, "{}", out.output);
+        let first = out.output.lines().next().unwrap_or("");
+        assert!(
+            first.starts_with('v') && first[1..].chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "unexpected node version line: {first}"
+        );
+        assert!(out.output.contains("[exit code: 0]"), "{}", out.output);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Phase 3G acceptance 7+9: the child receives EXACT argument values —
+    /// metacharacters (`&&`, `&`, `") arrive as ORDINARY DATA inside the
+    /// same argument, no extra argument is invented, and nothing is executed
+    /// twice. The fixture script prints the child's own argv verbatim, so
+    /// this validates what the child got, not merely that the exit was 0.
+    #[tokio::test]
+    async fn the_child_receives_argument_values_verbatim_with_metacharacters_as_data() {
+        let (dir, ws) = tmp_ws();
+        // Prints each argv element from index 2 as `<index>:<value>`.
+        std::fs::write(
+            dir.join("argecho.js"),
+            "process.argv.slice(2).forEach((a,i)=>console.log(i+':'+a));",
+        )
+        .unwrap();
+        let out = run(
+            &ws,
+            "node argecho.js \"two words\" 'sq-arg' \"amp && grave\" \"win\\path\" --x=plain",
+            20,
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        // Exact values the child saw, in order:
+        assert!(out.output.contains("0:two words"), "{}", out.output);
+        assert!(out.output.contains("1:'sq-arg'"), "{}", out.output); // cmd keeps single quotes literal
+        assert!(out.output.contains("2:amp && grave"), "{}", out.output); // metachars stayed DATA
+        assert!(out.output.contains("3:win\\path"), "{}", out.output); // backslash preserved
+        assert!(out.output.contains("4:--x=plain"), "{}", out.output);
+        // Proof there was no accidental second command: exactly 5 argv lines
+        // arrived — nothing `&&`-chopped the line into extra echoes — and
+        // every marked value above is one of them.
+        let indexed = out
+            .output
+            .lines()
+            .filter(|l| l.chars().next().map_or(false, |c| c.is_ascii_digit()))
+            .count();
+        assert_eq!(
+            indexed, 5,
+            "the `&&` must stay argument data: {}",
+            out.output
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
 
 /// Clamp an untrusted command timeout into a safe window.
 /// Returns the value to use and `None` when the input was adjusted.

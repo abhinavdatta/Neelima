@@ -11,7 +11,23 @@ export const cmd = {
   workspaceRemove: (id: string) => invoke<{ removed: string; path: string }>("ui_workspace_remove", { id }),
   workspaceRename: (id: string, name: string) => invoke<{ id: string; name: string }>("ui_workspace_rename", { id, name }),
   workspaceOpenInExplorer: (id?: string) => invoke<void>("ui_workspace_open_in_explorer", { id: id ?? null }),
-  tree: (path: string) => invoke<{ path: string; entries: { name: string; dir: boolean; path: string }[] }>("ui_tree", { path }),
+  // CP5: the listing reports whether it was capped (and how many entries could
+  // not be read) so the explorer can state the truth instead of implying the
+  // folder is complete.
+  tree: (path: string) => invoke<{ path: string; entries: { name: string; dir: boolean; path: string }[]; truncated?: boolean; limit?: number; unreadable?: number }>("ui_tree", { path }),
+  filePreview: (path: string, offset = 0) => invoke<{ path: string; content: string; offset: number; line_limit: number; size_bytes: number; has_more: boolean }>("ui_file_preview", { path, offset }),
+  fileText: (path: string) => invoke<{ path: string; content: string; bytes: number }>("ui_file_text", { path }),
+  // Checkpoint 4: `expectedOriginal` is the exact baseline the reviewed diff
+  // was computed against; the Rust command re-verifies it against the disk
+  // right before the atomic replacement and rejects with "CONFLICT::…" when
+  // the file changed externally. It is REQUIRED (CP4 closeout): there is no
+  // baseline-free save path, on either side of the boundary.
+  fileSave: (path: string, content: string, expectedOriginal: string) =>
+    invoke<{ path: string; bytes: number; lines: number }>("ui_file_save", {
+      path,
+      content,
+      expectedOriginal,
+    }),
   settingsGet: () => invoke<Settings>("ui_settings_get"),
   settingsSet: (s: Settings) => invoke<Settings>("ui_settings_set", { next: s }),
   adaptersList: () => invoke<Adapter[]>("ui_adapters_list"),

@@ -2,6 +2,8 @@
 import { useState, useEffect } from "preact/hooks";
 import type { AgentState, PendingCall, Settings, TaskMeta, TranscriptEntry, Adapter, WorkspaceEntry } from "./types";
 import type { ProviderRequestStatus } from "./providerStatus";
+import type { AgentChange } from "./agentChanges";
+import type { EditorContextItem } from "./editorContext";
 
 export type View = "chat" | "provider" | "automations" | "marketplace" | "search" | "task" | "files";
 
@@ -32,7 +34,12 @@ export interface State {
   openTask: TaskMeta | null;
   toasts: Toast[];
   terminalOpen: boolean;
-  diffEntry: { taskId: string; entryId: number } | null;
+  diffEntry: {
+    taskId: string;
+    entryId: number;
+    /** In-app preview (agent proposal or a native editor save). */
+    preview?: { path: string; old: string; new: string; apply?: () => Promise<void> };
+  } | null;
   providerSelected: string; // provider id for the composer chip
   providerModels: string[];
   searchResults: TaskMeta[];
@@ -56,6 +63,26 @@ export interface State {
   /// actually received (no prompt or reply text). Included in diagnostics.
   providerEvents: Array<{ state: string; at: number; requestId: string | null }>;
   bridgeApproval: { request_id: string; tool: string; args: any; site: string; risk: string } | null;
+  /// Multi-tab native editor documents. `editorWorkspaceTag` records which
+  /// workspace the stored drafts belong to: when the active workspace changes
+  /// the documents are dropped (stale drafts would save into the wrong tree).
+  editorDocs: import("./editorTabs").DocRec[];
+  editorActivePath: string;
+  editorWorkspaceTag: string | null;
+  /// CP9: explicit, one-shot editor context attached to the next prompt. The
+  /// workspace is stored on every item; only the current workspace's items are
+  /// displayed or sent. Cleared on task reset and after an accepted prompt.
+  editorContexts: EditorContextItem[];
+  /// Verified agent writes (CP6). Bounded, deduped by task/call/path; the
+  /// workspace tag is part of every entry so another tree's change is ignored.
+  agentChanges: AgentChange[];
+  /// Change keys already reconciled by the explorer (CP10). This lives in the
+  /// session store, not in FileTree, so switching away from Files does not
+  /// forget which changes still need their row marker / clean-tab reload.
+  agentHandledKeys: string[];
+  /// Increments once per accepted change, so the explorer reconciles on real
+  /// events instead of polling.
+  agentChangeTick: number;
 }
 
 const initial: State = {
@@ -99,6 +126,13 @@ const initial: State = {
   providerLoginReason: null,
   providerEvents: [],
   bridgeApproval: null,
+  editorDocs: [],
+  editorActivePath: "",
+  editorWorkspaceTag: null,
+  editorContexts: [],
+  agentChanges: [],
+  agentHandledKeys: [],
+  agentChangeTick: 0,
 };
 
 let state: State = initial;
@@ -134,7 +168,7 @@ export function toast(level: Toast["level"], text: string) {
 export function resetTask() {
   setState({
     entries: [], taskId: null, taskStartPending: false, taskStartRequestId: null, activeTaskSkills: [], agentState: "idle", agentText: null, streamText: "", pendingCalls: [],
-    relayOutbound: null, commandChunks: {}, openTask: null, taskStartedAt: null, view: "chat", composerText: "",
+    relayOutbound: null, commandChunks: {}, openTask: null, taskStartedAt: null, view: "chat", composerText: "", editorContexts: [],
     providerRequest: null, providerEventNote: null, providerEvents: [],
   });
 }

@@ -1,13 +1,17 @@
 // Diff viewer: CodeMirror 6 @codemirror/merge, lazily imported on first open.
-import { useEffect, useRef } from "preact/hooks";
-import { setState, useStore } from "../store";
+// Also the confirmation surface for a native editor save: when the entry
+// carries `apply`, the user must read the diff and press Apply before any byte
+// is written, exactly like an agent-proposed edit.
+import { useEffect, useRef, useState } from "preact/hooks";
+import { setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
-import { Icon } from "./Icon";
+import { Button, IconButton } from "./ui";
 
 export function DiffModal() {
   const s = useStore();
   const hostRef = useRef<HTMLDivElement>(null);
   const loaded = useRef(false);
+  const [applying, setApplying] = useState(false);
 
   useEffect(() => {
     const d = s.diffEntry;
@@ -16,8 +20,8 @@ export function DiffModal() {
       let doc: { path: string; old: string; new: string } | null = null;
       if (d.entryId >= 0 && d.taskId) {
         doc = await cmd.diffGet(d.taskId, d.entryId).catch(() => null);
-      } else if ((d as any).preview) {
-        doc = (d as any).preview;
+      } else if (d.preview) {
+        doc = d.preview;
       }
       if (!doc || !hostRef.current) return;
       hostRef.current.innerHTML = "";
@@ -36,15 +40,41 @@ export function DiffModal() {
     })();
   }, [s.diffEntry]);
 
+  useEffect(() => setApplying(false), [s.diffEntry]);
+
   if (!s.diffEntry) return null;
+  const preview = s.diffEntry.preview;
+  const close = () => setState({ diffEntry: null });
+  const apply = async () => {
+    if (!preview?.apply || applying) return;
+    setApplying(true);
+    try {
+      await preview.apply();
+      close();
+    } catch (error) {
+      toast("error", String(error));
+      setApplying(false);
+    }
+  };
   return (
-    <div class="modal-backdrop" onClick={() => setState({ diffEntry: null })}>
+    <div class="modal-backdrop" onClick={close}>
       <div class="modal diff-modal" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
-          <h2>Proposed change</h2>
-          <button class="ghost icon-button" aria-label="Close diff" onClick={() => setState({ diffEntry: null })}><Icon name="close" size={16} /></button>
+          <h2>{preview ? "Review change" : "Proposed change"}</h2>
+          <IconButton icon="close" label="Close diff" onClick={close} />
         </div>
         <div class="diff-host" ref={hostRef} />
+        {preview ? (
+          <footer class="diff-actions">
+            <span class="diff-path" title={preview.path}>{preview.path}</span>
+            <Button variant="secondary" onClick={close} disabled={applying}>Cancel</Button>
+            {preview.apply ? (
+              <Button variant="primary" onClick={() => void apply()} disabled={applying}>
+                {applying ? "Saving…" : "Apply change"}
+              </Button>
+            ) : null}
+          </footer>
+        ) : null}
       </div>
     </div>
   );

@@ -1,10 +1,11 @@
 // App shell: wires the event channel, restores the active workspace, and renders
 // the rail / floating panel / home / composer layout.
-import { useEffect } from "preact/hooks";
+import { useEffect, useRef } from "preact/hooks";
 import { listen } from "./tauri";
 import { cmd } from "./tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getState, setState, toast, useStore, resetTask } from "./store";
+import { clearedTaskView, workspaceSwitchClearsTask } from "./workspaceSwitch";
 import Sidebar from "./components/Sidebar";
 import FileTree from "./components/FileTree";
 import TitleBar, { WindowMoveStrip } from "./components/TitleBar";
@@ -20,6 +21,8 @@ import DiffModal from "./components/DiffModal";
 import { Icon } from "./components/Icon";
 import { DEFAULT_CUSTOM_THEME, parseCustomTheme, THEME_TOKENS } from "./theme";
 import { describePushRejection, reduceProviderRequestEvent, reduceStreamEvent } from "./providerStatus";
+import { shouldAcceptApprovalEvent } from "./approvalLifecycle";
+import { appendAgentChange, parseFileChanged } from "./agentChanges";
 import { noteSecretClick } from "./easterEggs";
 import "./styles.css";
 
@@ -27,6 +30,24 @@ let earlyTaskEvents: any[] = [];
 
 export function App() {
   const s = useStore();
+  const editorContextWorkspace = useRef<string | null>(null);
+
+  // CP9: explicit editor context belongs to the workspace it was captured in.
+  // Filtering at render/send already prevents a leak; clearing on a workspace
+  // change also makes the lifecycle honest and keeps the store from holding
+  // another tree's file text indefinitely.
+  // CP10: the chat's task view is bound to its workspace too — Rust refuses to
+  // switch while a task runs and refuses to continue another tree's task, so a
+  // finished transcript must not stay visible under the new workspace name.
+  useEffect(() => {
+    const previous = editorContextWorkspace.current;
+    if (!workspaceSwitchClearsTask(previous, s.activeWorkspacePath)) {
+      editorContextWorkspace.current = s.activeWorkspacePath;
+      return;
+    }
+    editorContextWorkspace.current = s.activeWorkspacePath;
+    setState({ editorContexts: [], ...clearedTaskView() });
+  }, [s.activeWorkspacePath]);
 
   useEffect(() => {
     const requested = s.settings?.theme ?? "dark";
@@ -217,6 +238,13 @@ function handleEvent(p: any) {
     if (!st.taskId) {
       // Buffer events until the task-start request ID confirms which task is
       // ours. This prevents late events from an older task being adopted.
+      // Contract for any caller of raw ui_task_start (the composer path):
+      // set taskStartPending + taskStartRequestId BEFORE invoking, so the
+      // emitted task-started event matches here. A caller that skips this
+      // store step keeps taskId null, and its approval-request events are
+      // dropped on this floor — the approval card never renders. Diagnostics
+      // harnesses must either honour this handshake or track the returned
+      // task id themselves before the first task-scoped event fires.
       if (st.taskStartPending && st.view !== "task") {
         earlyTaskEvents.push(p);
         if (earlyTaskEvents.length > 128) earlyTaskEvents.shift();
@@ -273,9 +301,39 @@ function handleEvent(p: any) {
       if (p.entry) setState((s2) => s2.entries.some((entry) => entry.id === p.entry.id && entry.ts === p.entry.ts)
         ? {} : { entries: [...s2.entries, p.entry], ...(p.entry.kind === "assistant" ? { streamText: "" } : {}) });
       break;
-    case "approval-request":
-      setState({ pendingCalls: p.pending_calls ?? [] });
+    case "approval-request": {
+      // Late-response guard (Checkpoint 5): Rust bundles agent-state
+      // `awaiting_approval` with a live queue, so a queue that arrives outside
+      // that bundle after the task moved on can only be a late response for an
+      // expired/cancelled request. Refuse to recreate a card for it; the pure
+      // rule lives in approvalLifecycle.ts (unit-tested).
+      const incoming = { pendingCalls: p.pending_calls ?? [], state: p.state ?? null };
+      if (shouldAcceptApprovalEvent(incoming, st)) {
+        setState({ pendingCalls: incoming.pendingCalls });
+      } else {
+        toast(
+          "warn",
+          "Ignored a late approval queue: the underlying request can no longer be decided. Nothing was auto-approved.",
+        );
+      }
       break;
+    }
+    case "file-changed": {
+      // CP6: emitted only after a REAL tool success whose disk read-back
+      // passed. Accept it only for the workspace currently open; a late event
+      // from another tree can never mark or refresh this one, and the bounded
+      // dedupe prevents a replayed event from refreshing twice.
+      const change = parseFileChanged(p);
+      if (!change) break;
+      if (!st.activeWorkspacePath || change.workspace !== st.activeWorkspacePath) break;
+      setState((s2) => {
+        const next = appendAgentChange(s2.agentChanges, change);
+        return next === s2.agentChanges
+          ? {}
+          : { agentChanges: next, agentChangeTick: s2.agentChangeTick + 1 };
+      });
+      break;
+    }
     case "command-output": {
       const key = p.call_id;
       setState((s2) => ({ commandChunks: { ...s2.commandChunks, [key]: (s2.commandChunks[key] ?? "") + p.chunk } }));

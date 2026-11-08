@@ -15,7 +15,9 @@ function TaskItem({ t }: { t: TaskMeta }) {
   const open = async () => {
     try {
       const entries = await cmd.historyOpen(t.id);
-      setState({ entries, openTask: t, view: "chat", pendingCalls: [], taskId: null });
+      // Live command chunks belong to the previous session and are not part of
+      // this persisted task's transcript; never show them as its output.
+      setState({ entries, openTask: t, view: "chat", pendingCalls: [], taskId: null, commandChunks: {} });
     } catch (e) { toast("error", String(e)); }
   };
 

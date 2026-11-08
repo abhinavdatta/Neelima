@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { getState, resetTask, setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
-import { addWorkspace } from "./Sidebar";
 import { Icon } from "./Icon";
 import type { ContextPreview } from "../contextPreview";
 import { ContextPicker } from "./ContextPicker";
+import { extractAttachmentText, validateAttachment, type AttachmentFile } from "../attachments";
+import { isAgentRunning } from "../agentState";
+import type { DocRec } from "../editorTabs";
+import { docDir, docDirty, docName } from "../editorTabs";
+import {
+  MAX_EDITOR_CONTEXT_ITEMS, addEditorContext, buildEditorContext, contextsForWorkspace,
+  editorContextDetail, formatEditorContext, removeEditorContext,
+} from "../editorContext";
+
+type LocalAttachment = { id: string; file: File; status: string; promptText: string };
 
 const MODE_LABEL: Record<string, string> = {
   ask_all: "Ask every time",
@@ -22,7 +31,7 @@ const PROMPTS: Record<string, string> = {
 export function Composer() {
   const s = useStore();
   const ref = useRef<HTMLTextAreaElement>(null);
-  const [menu, setMenu] = useState<null | "provider" | "mode">(null);
+  const [menu, setMenu] = useState<null | "provider" | "mode" | "editor">(null);
   const [skills, setSkills] = useState<any[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [skillBudget, setSkillBudget] = useState(8192);
@@ -32,11 +41,57 @@ export function Composer() {
   const [contextExclude, setContextExclude] = useState<string[]>([]);
   const [contextPreview, setContextPreview] = useState<ContextPreview | null>(null);
   const [contextScanning, setContextScanning] = useState(false);
-  const taskBusy = s.taskStartPending || (s.agentState !== "idle" && s.agentState !== "done" && s.agentState !== "error" && s.agentState !== "cancelled");
+  const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const taskBusy = s.taskStartPending || isAgentRunning(s.agentState);
   const continuationTaskId = s.openTask?.id ?? (!taskBusy ? s.taskId : null);
   const continuationLabel = s.openTask?.title ?? (continuationTaskId ? "this conversation" : null);
   const readOnly = false;
-  const hasText = !!s.composerText.trim();
+  // CP9: only the current workspace's explicit editor context is visible and
+  // sendable. This filter is the last line of defence if a workspace switch
+  // races the store's cleanup effect.
+  const editorContexts = contextsForWorkspace(s.editorContexts ?? [], s.activeWorkspacePath);
+  // Automatic project context must not re-read those exact paths from disk:
+  // the user explicitly chose the live draft/range, and a stale disk copy
+  // would be a second, contradictory version of the same file.
+  const previewExclude = Array.from(new Set([...contextExclude, ...editorContexts.map((item) => item.path)]));
+  const hasText = !!s.composerText.trim() || editorContexts.length > 0 ||
+    attachments.some((attachment) => attachment.status.startsWith("Ready"));
+
+  const addAttachments = async (files: FileList | null) => {
+    if (!files?.length) return;
+    const chosen = Array.from(files);
+    const existingBytes = attachments.reduce((total, item) => total + item.file.size, 0);
+    let reservedBytes = existingBytes;
+    const next: LocalAttachment[] = [];
+    for (const file of chosen) {
+      const validation = validateAttachment(file, reservedBytes);
+      if (!validation.kind) { toast("warn", `${file.name}: ${validation.error}`); continue; }
+      const isImage = validation.kind === "image";
+      reservedBytes += file.size;
+      const item: LocalAttachment = { id: `${Date.now()}-${next.length}-${file.name}`, file, status: isImage ? "Checking local image…" : "Extracting locally…", promptText: "" };
+      next.push(item);
+      setAttachments((current) => [...current, item]);
+      if (isImage) {
+        setAttachments((current) => current.map((attachment) => attachment.id === item.id
+          ? { ...attachment, status: "Ready · local image only; no OCR/vision", promptText: `[Image attachment: ${file.name} (${file.type}, ${file.size} bytes). Image is preserved locally but its pixels are not included in this text prompt.]` }
+          : attachment));
+      } else {
+        try {
+          const extracted = await extractAttachmentText(file as AttachmentFile);
+          const text = extracted.trim();
+          const status = text ? "Ready · text extracted locally" : "Ready · no embedded text found (scanned/OCR PDF not supported)";
+          setAttachments((current) => current.map((attachment) => attachment.id === item.id
+            ? { ...attachment, status, promptText: text ? `[Local attachment: ${file.name}]\n${text}\n[/Local attachment]` : `[Attachment: ${file.name}; no text could be extracted locally. OCR is not available.]` }
+            : attachment));
+        } catch (error) {
+          const status = `Extraction failed: ${String(error).slice(0, 240)}`;
+          setAttachments((current) => current.map((attachment) => attachment.id === item.id ? { ...attachment, status, promptText: `[Attachment ${file.name} could not be extracted locally: ${status}]` } : attachment));
+        }
+      }
+    }
+  };
+  const removeAttachment = (id: string) => setAttachments((current) => current.filter((attachment) => attachment.id !== id));
 
   useEffect(() => { void cmd.skillsList().then(setSkills).catch(() => setSkills([])); }, []);
 
@@ -53,19 +108,50 @@ export function Composer() {
     let cancelled = false;
     setContextScanning(true);
     const timer = setTimeout(() => {
-      cmd.contextPreview(text, s.providerSelected, contextExclude, continuationTaskId)
+      cmd.contextPreview(text, s.providerSelected, previewExclude, continuationTaskId)
         .then((preview) => { if (!cancelled) { setContextPreview(preview); setContextScanning(false); } })
         .catch(() => { if (!cancelled) { setContextPreview(null); setContextScanning(false); } });
     }, 450);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [s.composerText, s.activeWorkspacePath, s.providerSelected, contextEnabled, contextExclude.join("|"), continuationTaskId]);
+  }, [s.composerText, s.activeWorkspacePath, s.providerSelected, contextEnabled, previewExclude.join("|"), continuationTaskId]);
+
+  const addEditorDoc = (doc: DocRec) => {
+    const current = getState();
+    if (!current.activeWorkspacePath) {
+      toast("warn", "Choose a project folder before sharing editor context.");
+      return;
+    }
+    const built = buildEditorContext({
+      workspace: current.activeWorkspacePath,
+      path: doc.path,
+      draft: doc.draft,
+      original: doc.original,
+    });
+    if ("error" in built) { toast("warn", built.error); return; }
+    const result = addEditorContext(current.editorContexts ?? [], built.item);
+    if (result.error) { toast("warn", result.error); return; }
+    setState({ editorContexts: result.items });
+    setMenu(null);
+    toast("info", `${result.replaced ? "Updated" : "Added"} ${doc.path} to this prompt's editor context. Review or remove it before sending.`);
+  };
+  const removeEditorAttachment = (key: string) => {
+    setState((current) => ({ editorContexts: removeEditorContext(current.editorContexts ?? [], key) }));
+  };
 
   const send = async () => {
-    const text = getState().composerText.trim();
-    if (!text) return;
     const current = getState();
+    const currentText = current.composerText.trim();
+    const selectedAttachments = attachments.filter((attachment) => attachment.status.startsWith("Ready"));
+    const selectedEditorContexts = contextsForWorkspace(current.editorContexts ?? [], current.activeWorkspacePath);
+    const text = currentText;
+    if (!text && selectedAttachments.length === 0 && selectedEditorContexts.length === 0) return;
+    const editorBlock = formatEditorContext(selectedEditorContexts);
+    const message = [text, editorBlock, ...selectedAttachments.map((attachment) => attachment.promptText)].filter(Boolean).join("\n\n");
+    // Capture before resetTask(): a failed start must restore the same
+    // explicit attachments, not silently drop them with the prompt text.
+    const retainedEditorContexts = current.editorContexts ?? [];
     if (current.taskStartPending) return;
-    if (current.agentState !== "idle" && current.agentState !== "done" && current.agentState !== "error" && current.agentState !== "cancelled") {
+    if (isAgentRunning(current.agentState)) {
       toast("warn", "A task is already running.");
       return;
     }
@@ -75,18 +161,25 @@ export function Composer() {
     }
     if (selectedSkills.length && current.providerSelected.startsWith("web:") &&
         !window.confirm("Selected SKILL.md contents will be included in the first task message sent to the selected web AI provider. Continue?")) return;
-    const currentBusy = current.taskStartPending || (current.agentState !== "idle" && current.agentState !== "done" && current.agentState !== "error" && current.agentState !== "cancelled");
+    if (selectedAttachments.length && current.providerSelected.startsWith("web:") &&
+        !window.confirm("Extracted document text and image filenames/status notes will be sent to the selected web provider as part of your prompt. Original files stay local; image pixels are not uploaded. Continue?")) return;
+    if (selectedEditorContexts.length && current.providerSelected.startsWith("web:") &&
+        !window.confirm("The shared editor context (including any unsaved changes) will be sent to the selected web provider as part of your prompt. Original files stay local. Continue?")) return;
+    const currentBusy = current.taskStartPending || isAgentRunning(current.agentState);
     const sourceTaskId = current.openTask?.id ?? (!currentBusy ? current.taskId : null);
     if (!sourceTaskId) resetTask();
     setState({ activeTaskSkills: selectedSkills.map((key) => skills.find((skill) => `${skill.location}:${skill.id}` === key)?.name ?? key) });
     // Preserve the prompt while the backend starts. A failed start must not eat user input.
     const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    const context = { enabled: contextEnabled, exclude: contextExclude };
-    setState({ composerText: text, taskStartPending: true, taskStartRequestId: requestId });
+    const context = {
+      enabled: contextEnabled,
+      exclude: Array.from(new Set([...contextExclude, ...selectedEditorContexts.map((item) => item.path)])),
+    };
+    setState({ composerText: message, taskStartPending: true, taskStartRequestId: requestId });
     try {
       const taskId = sourceTaskId
-        ? await cmd.taskContinue(sourceTaskId, current.providerSelected, text, requestId, context)
-        : await cmd.taskStart(text, current.providerSelected, requestId, selectedSkills, skillBudget, context);
+        ? await cmd.taskContinue(sourceTaskId, current.providerSelected, message, requestId, context)
+        : await cmd.taskStart(message, current.providerSelected, requestId, selectedSkills, skillBudget, context);
       setState((s2) => ({
         taskId,
         openTask: null,
@@ -94,6 +187,7 @@ export function Composer() {
         taskStartRequestId: null,
         view: "chat",
         composerText: "",
+        editorContexts: [],
         // The invoke can resolve before the first agent-state event arrives.
         // Keep the composer locked for the accepted task during that gap.
         agentState: s2.agentState === "idle" ? "waiting_for_ai" : s2.agentState,
@@ -103,8 +197,19 @@ export function Composer() {
       // preference. The transcript entry is the authoritative included list.
       setContextExclude([]);
       setContextPreview(null);
+      setAttachments([]);
     } catch (e) {
-      setState({ taskId: sourceTaskId ?? current.taskId, taskStartPending: false, taskStartRequestId: null, composerText: text, activeTaskSkills: [] });
+      // Restore the USER'S text and attachments. The formatted block is
+      // regenerated from the retained items on the next send, so the textarea
+      // never fills with a copy of the context payload.
+      setState({
+        taskId: sourceTaskId ?? current.taskId,
+        taskStartPending: false,
+        taskStartRequestId: null,
+        composerText: currentText,
+        editorContexts: retainedEditorContexts,
+        activeTaskSkills: [],
+      });
       toast("error", String(e));
     }
   };
@@ -133,9 +238,23 @@ export function Composer() {
           </div>
         </div>
         <div class="composer-input-row">
-          <button class="composer-plus" title="Add a project folder" aria-label="Add a project folder" onClick={() => void addWorkspace()}>
+          <button class="composer-plus" title="Attach local files" aria-label="Attach local files" onClick={() => fileInput.current?.click()}>
             <svg viewBox="0 0 20 20"><path d="M10 3v14M3 10h14" /></svg>
           </button>
+          <div class="composer-menu-anchor">
+            <button class="composer-plus" title="Add editor context" aria-label="Add editor context" aria-haspopup="menu"
+              aria-expanded={menu === "editor"} onClick={() => setMenu(menu === "editor" ? null : "editor")}>
+              <Icon name="code" size={17} />
+            </button>
+            {menu === "editor" ? (
+              <EditorContextMenu
+                docs={s.editorDocs ?? []}
+                workspaceReady={!!s.activeWorkspacePath}
+                onAdd={addEditorDoc}
+              />
+            ) : null}
+          </div>
+          <input ref={fileInput} class="attachment-input" type="file" multiple accept=".pdf,.docx,.txt,.md,.markdown,.csv,.json,.log,image/png,image/jpeg,image/gif,image/webp" aria-label="Choose files to attach" onChange={(event: any) => { void addAttachments(event.currentTarget.files); event.currentTarget.value = ""; }} />
           <textarea
             ref={ref}
             rows={1}
@@ -147,13 +266,20 @@ export function Composer() {
               if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); }
             }}
           />
-          <button class="composer-mic" title="Voice input is not available yet" aria-label="Voice input unavailable" disabled>
-            <svg viewBox="0 0 20 20"><rect x="7" y="2.5" width="6" height="10" rx="3" /><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v3M7 18h6" /></svg>
-          </button>
           <button class="send-btn" title={taskBusy ? "A task is running" : "Send task"} aria-label="Send task" onClick={() => void send()} disabled={!hasText || readOnly || taskBusy}>
             <svg viewBox="0 0 20 20"><path d="m3 9 14-6-5.5 14-2.2-6.3L3 9Z" /><path d="m9.3 10.7 3.5-3.5" /></svg>
           </button>
         </div>
+        {editorContexts.length || attachments.length ? <div class="attachment-list" aria-label="Attached context">
+          {editorContexts.map((item) => <div class="attachment-item editor-context-item" key={item.key} data-editor-context={item.key}>
+            <span class="attachment-file" title={item.path}>{item.path}</span><small>{editorContextDetail(item)}</small>
+            <button class="ghost" aria-label={`Remove editor context ${item.path}`} onClick={() => removeEditorAttachment(item.key)}>Remove</button>
+          </div>)}
+          {attachments.map((attachment) => <div class="attachment-item" key={attachment.id}>
+            <span class="attachment-file" title={attachment.file.name}>{attachment.file.name}</span><small>{attachment.status}</small>
+            <button class="ghost" aria-label={`Remove ${attachment.file.name}`} onClick={() => removeAttachment(attachment.id)}>Remove</button>
+          </div>)}
+        </div> : null}
         <div class="prompt-chips" aria-label="Prompt starters">
           <button onClick={() => setState({ composerText: PROMPTS["Project review"] })}><Icon name="layers" size={14} /> Project review</button>
           <button onClick={() => setState({ composerText: PROMPTS["Image brief"] })}><Icon name="spark" size={14} /> Image brief</button>
@@ -217,6 +343,27 @@ function providerLabel(s: any): string {
   if (id === "ollama") return `Ollama${s.settings?.providers?.ollama?.model ? ` · ${s.settings.providers.ollama.model}` : ""}`;
   if (id === "lmstudio") return `LM Studio${s.settings?.providers?.lmstudio?.model ? ` · ${s.settings.providers.lmstudio.model}` : ""}`;
   return "Manual relay";
+}
+
+function EditorContextMenu(props: { docs: DocRec[]; workspaceReady: boolean; onAdd: (doc: DocRec) => void }) {
+  return (
+    <div class="menu editor-context-menu" role="menu" aria-label="Open editor files">
+      <div class="menu-head">Share editor context</div>
+      {!props.workspaceReady ? <div class="menu-note">Choose a project folder first.</div> : null}
+      {props.workspaceReady && props.docs.length === 0
+        ? <div class="menu-note">No editor documents open. Open a file in Files first.</div>
+        : null}
+      {props.docs.map((doc) => (
+        <button role="menuitem" key={doc.path} title={doc.path} onClick={() => props.onAdd(doc)}>
+          <span class="editor-context-name">{docName(doc.path)}{docDirty(doc) ? " • unsaved" : ""}</span>
+          <small class="editor-context-dir">{docDir(doc.path) || "workspace root"}</small>
+        </button>
+      ))}
+      {props.docs.length > 0 ? (
+        <div class="menu-note">Shares a snapshot of the current editor buffer, including unsaved changes at share time. To send only a selected range, select it in Files and use the share button there. At most {MAX_EDITOR_CONTEXT_ITEMS} files.</div>
+      ) : null}
+    </div>
+  );
 }
 
 function ModeMenu({ onPick }: { onPick: (mode: string) => void }) {
