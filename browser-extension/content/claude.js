@@ -17,6 +17,7 @@
     message.querySelector(`[${PANEL_ATTR}]`)?.remove();
     const panel = document.createElement('div');
     panel.setAttribute(PANEL_ATTR, 'true');
+    panel.setAttribute('data-neelima-own', 'true');
     panel.setAttribute('role', 'status');
     panel.style.cssText = 'margin:8px 4px;padding:9px 11px;border:1px solid #777;border-radius:8px;background:#f5f5f5;color:#161616;font:12px/1.5 system-ui;white-space:normal;';
     panel.textContent = text;
@@ -28,6 +29,7 @@
     if (!candidate(raw)) return;
     const button = document.createElement('button');
     button.setAttribute(BUTTON_ATTR, 'true');
+    button.setAttribute('data-neelima-own', 'true');
     button.type = 'button';
     button.textContent = 'Review in Neelima';
     button.style.cssText = 'display:inline-flex;align-items:center;gap:6px;margin:8px 4px;padding:7px 11px;border:1px solid #8a8a8a;border-radius:8px;background:#202124;color:#fff;font:600 12px system-ui;cursor:pointer;z-index:2147483647;';
@@ -51,12 +53,17 @@
     });
     message.appendChild(button);
   }
-  function scan() {
-    if (document.visibilityState === 'hidden') return;
-    for (const selector of SELECTORS) document.querySelectorAll(selector).forEach(addButton);
+  // One debounced observer over CHANGED nodes only (content/scan-scheduler.js).
+  // If the shared scheduler is missing, fall back to the old full scan so a
+  // manifest mistake degrades behaviour instead of disabling the button.
+  if (window.__NEELIMA_SCAN__) {
+    window.__NEELIMA_SCAN__.watch({ selectors: SELECTORS, onNode: addButton });
+  } else {
+    const scan = () => {
+      if (document.visibilityState === 'hidden') return;
+      for (const selector of SELECTORS) document.querySelectorAll(selector).forEach(addButton);
+    };
+    scan();
+    new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true });
   }
-  scan();
-  const observer = new MutationObserver(scan);
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-  document.addEventListener('visibilitychange', scan);
 })();

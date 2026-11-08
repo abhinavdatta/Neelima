@@ -43,7 +43,7 @@ export function SearchPane() {
           <div class="row-item" key={t.id}>
             <button class="link" onClick={async () => {
               const entries = await cmd.historyOpen(t.id);
-              setState({ entries, openTask: t, view: "task", pendingCalls: [] });
+              setState({ entries, openTask: t, view: "chat", taskId: null, pendingCalls: [], commandChunks: {} });
             }}>{t.title}</button>
             <span class="dim">{t.workspace} · {t.status} · {new Date(t.started_ms).toLocaleString()}</span>
           </div>

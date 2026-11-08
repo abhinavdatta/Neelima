@@ -1,10 +1,12 @@
 // Automations pane: live agent activity, running-command output, emergency stop.
 import { toast, useStore } from "../store";
 import { cmd } from "../tauri";
+import { isAgentRunning } from "../agentState";
+import { ExecutionHistory } from "./ExecutionHistory";
 
 export function AutomationsPane() {
   const s = useStore();
-  const running = s.agentState !== "idle" && s.agentState !== "done" && s.agentState !== "error";
+  const running = isAgentRunning(s.agentState);
   return (
     <div class="pane">
       <h2>Automations</h2>
@@ -22,6 +24,9 @@ export function AutomationsPane() {
         {Object.entries(s.commandChunks).map(([id, out]) => (
           <pre class="tool-out" key={id}>[{id}] {out.slice(-3000)}</pre>
         ))}
+      </div>
+      <div class="card">
+        <ExecutionHistory />
       </div>
       <div class="card">
         <h3>Checkpoints</h3>

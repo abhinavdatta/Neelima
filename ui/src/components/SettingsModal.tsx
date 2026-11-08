@@ -6,6 +6,9 @@ import { cmd } from "../tauri";
 import type { Settings } from "../types";
 import { Icon } from "./Icon";
 import { DEFAULT_CUSTOM_THEME, parseCustomTheme } from "../theme";
+import { SkillsPanel } from "./SkillsPanel";
+
+const DEFAULT_CONTEXT = { enabled: true, web_budget_tokens: 6000, local_budget_tokens: 2500, max_files: 12 };
 
 export function SettingsModal() {
   const s = useStore();
@@ -117,6 +120,7 @@ export function SettingsModal() {
     { id: "appearance", label: "Appearance", icon: "spark" },
     { id: "providers", label: "Providers", icon: "grid" },
     { id: "models", label: "Local models", icon: "terminal" },
+    { id: "skills", label: "Skills", icon: "code" },
     { id: "safety", label: "Safety", icon: "settings" },
     { id: "about", label: "About", icon: "mail" },
   ] as const;
@@ -277,6 +281,21 @@ export function SettingsModal() {
                   },
                 },
               })} />
+            <span>Reply timeout (s)</span>
+            <input type="number" min={10} max={3600} step={10}
+              value={draft.providers.ollama?.timeout_secs ?? 600}
+              onChange={(e: any) => save({
+                ...draft,
+                providers: {
+                  ...draft.providers,
+                  ollama: {
+                    ...draft.providers.ollama,
+                    url: draft.providers.ollama?.url ?? "http://localhost:11434",
+                    model: draft.providers.ollama?.model ?? null,
+                    timeout_secs: Math.min(3600, Math.max(10, Number(e.currentTarget.value) || 600)),
+                  },
+                },
+              })} />
           </div>
           <div class="row-item">
             <b>LM Studio</b>
@@ -291,6 +310,55 @@ export function SettingsModal() {
             <button class="ghost" title={dirty ? "Save settings before testing the draft URL" : "Test the saved LM Studio URL"} disabled={!!s.settings && (draft.providers.lmstudio?.url || "http://localhost:1234") !== (s.settings.providers.lmstudio?.url || "http://localhost:1234")} onClick={() => void testLocal("lmstudio")}>Test</button>
             {localStatus.lmstudio ? <small class="local-status">{localStatus.lmstudio}</small> : null}
           </div>
+          <div class="row-item">
+            <span>LM Studio reply timeout (s)</span>
+            <input type="number" min={10} max={3600} step={10}
+              value={draft.providers.lmstudio?.timeout_secs ?? 600}
+              onChange={(e: any) => save({
+                ...draft,
+                providers: {
+                  ...draft.providers,
+                  lmstudio: {
+                    ...draft.providers.lmstudio,
+                    url: draft.providers.lmstudio?.url ?? "http://localhost:1234",
+                    model: draft.providers.lmstudio?.model ?? null,
+                    timeout_secs: Math.min(3600, Math.max(10, Number(e.currentTarget.value) || 600)),
+                  },
+                },
+              })} />
+          </div>
+          <h3>Project context</h3>
+          <p class="dim">Before a task is sent, Neelima matches your prompt against workspace file names and text locally and attaches the best files. No embeddings, no network, no index file. These limits decide how much may be attached.</p>
+          <div class="row-item">
+            <b>Browser providers</b>
+            <input type="number" min={256} max={32000} step={250}
+              value={draft.context?.web_budget_tokens ?? DEFAULT_CONTEXT.web_budget_tokens}
+              onChange={(e: any) => save({ ...draft, context: { ...(draft.context ?? DEFAULT_CONTEXT), web_budget_tokens: Math.min(32000, Math.max(256, Number(e.currentTarget.value) || DEFAULT_CONTEXT.web_budget_tokens)) } })} />
+            <span>tokens</span>
+            <b>Local models</b>
+            <input type="number" min={256} max={32000} step={250}
+              value={draft.context?.local_budget_tokens ?? DEFAULT_CONTEXT.local_budget_tokens}
+              onChange={(e: any) => save({ ...draft, context: { ...(draft.context ?? DEFAULT_CONTEXT), local_budget_tokens: Math.min(32000, Math.max(256, Number(e.currentTarget.value) || DEFAULT_CONTEXT.local_budget_tokens)) } })} />
+            <span>tokens</span>
+          </div>
+          <div class="row-item">
+            <span>Maximum files per prompt</span>
+            <input type="number" min={1} max={24} step={1}
+              value={draft.context?.max_files ?? DEFAULT_CONTEXT.max_files}
+              onChange={(e: any) => save({ ...draft, context: { ...(draft.context ?? DEFAULT_CONTEXT), max_files: Math.min(24, Math.max(1, Number(e.currentTarget.value) || DEFAULT_CONTEXT.max_files)) } })} />
+          </div>
+          <div class="row-item">
+            <label>
+              <input type="checkbox" checked={draft.context?.enabled ?? DEFAULT_CONTEXT.enabled}
+                onChange={(e: any) => save({ ...draft, context: { ...(draft.context ?? DEFAULT_CONTEXT), enabled: e.currentTarget.checked } })} /> Attach project context by default (can be changed per task in the composer)
+            </label>
+          </div>
+        </section> : null}
+
+        {activeTab === "skills" ? <section class="skills-settings-section">
+          <h3>Skills</h3>
+          <p class="dim">Skills add reusable guidance you can attach to any task from the composer. Their text is untrusted: they cannot change permissions or run anything.</p>
+          <SkillsPanel />
         </section> : null}
 
         {activeTab === "safety" ? <section>

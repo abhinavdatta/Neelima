@@ -18,6 +18,24 @@ pub struct CallRecord {
     pub status: String,
     #[serde(default)]
     pub output: String,
+    /// Phase 3P CP6: the action-ledger id minted for this exact call, when a
+    /// ledger is managed. Metadata only (no values); optional so transcripts
+    /// written before CP6 keep deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    /// CP8: when the call began (Unix ms). Optional so pre-CP8 transcripts
+    /// keep deserializing; absent is shown as unknown, never as zero time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<u64>,
+    /// CP8: wall-clock execution duration, measured around the existing
+    /// executor path. None for rejected/refused calls and legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// CP8: the child's real exit code for `run_command`, when one was
+    /// observed. Timeout/cancel may report the terminated child's code; a
+    /// spawn/wait failure has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 // Wrapper so args can be any JSON value while staying Send-friendly for events.
@@ -65,6 +83,8 @@ pub struct TranscriptEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskMeta {
     pub id: String,
+    #[serde(default)]
+    pub conversation_id: String,
     pub title: String,
     pub started_ms: u64,
     #[serde(default)]
@@ -118,6 +138,20 @@ impl HistoryStore {
         valid_task_id(id) && self.task_dir(id).join("meta.json").is_file()
     }
 
+    pub fn read_task_meta(&self, id: &str) -> Result<TaskMeta, String> {
+        if !valid_task_id(id) {
+            return Err("invalid task ID".into());
+        }
+        let bytes = std::fs::read(self.task_dir(id).join("meta.json")).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "task not found".to_string()
+            } else {
+                error.to_string()
+            }
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+
     pub fn create_task(
         &self,
         id: &str,
@@ -125,8 +159,22 @@ impl HistoryStore {
         workspace: &str,
         provider: &str,
     ) -> Result<TaskMeta, String> {
+        self.create_task_in_conversation(id, id, title, workspace, provider)
+    }
+
+    pub fn create_task_in_conversation(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        title: &str,
+        workspace: &str,
+        provider: &str,
+    ) -> Result<TaskMeta, String> {
         if !valid_task_id(id) {
             return Err("invalid task ID".into());
+        }
+        if !valid_task_id(conversation_id) {
+            return Err("invalid conversation ID".into());
         }
         let id = id.to_string();
         let dir = self.task_dir(&id);
@@ -135,6 +183,7 @@ impl HistoryStore {
         }
         let meta = TaskMeta {
             id: id.clone(),
+            conversation_id: conversation_id.to_string(),
             title: title.chars().take(80).collect(),
             started_ms: now_ms(),
             ended_ms: None,
@@ -333,7 +382,7 @@ fn last_transcript_entry_id(root: &std::path::Path) -> u64 {
             Ok(file) => file,
             Err(_) => continue,
         };
-        for line in BufReader::new(file).lines().flatten() {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
             if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(&line) {
                 max_id = max_id.max(entry.id);
             }
@@ -403,6 +452,30 @@ mod tests {
     }
 
     #[test]
+    fn continuation_tasks_keep_their_stable_conversation_id() {
+        let (store, root) = store("conversation-id");
+        let conversation = "11111111111111111111111111111111";
+        let first = "22222222222222222222222222222222";
+        let second = "33333333333333333333333333333333";
+        let original = store
+            .create_task_in_conversation(first, conversation, "first", "workspace", "web:chat")
+            .unwrap();
+        let continuation = store
+            .create_task_in_conversation(
+                second,
+                &original.conversation_id,
+                "follow up",
+                "workspace",
+                "web:chat",
+            )
+            .unwrap();
+        assert_eq!(original.conversation_id, conversation);
+        assert_eq!(continuation.conversation_id, conversation);
+        assert_ne!(continuation.id, original.id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn transcript_entry_is_persisted_at_most_once_by_entry_id() {
         let (history, root) = store("append-once");
         let task_id = "dddddddddddddddddddddddddddddddd";
@@ -463,6 +536,62 @@ mod tests {
             .create_task(next, "retry", "workspace", "manual")
             .unwrap();
         assert_eq!(history.list_tasks(10).len(), 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn call_execution_metadata_roundtrips_and_legacy_rows_default_to_unknown() {
+        let (history, root) = store("execution-metadata");
+        let task_id = "88888888888888888888888888888888";
+        history
+            .create_task(task_id, "execution metadata", "workspace", "manual")
+            .unwrap();
+        let entry = TranscriptEntry {
+            id: 7,
+            ts: 100,
+            kind: "tool_calls".into(),
+            text: String::new(),
+            calls: vec![CallRecord {
+                id: "c1".into(),
+                tool: "run_command".into(),
+                args: Value2(serde_json::json!({"command": "cargo test"})),
+                status: "ok".into(),
+                output: "2 passed".into(),
+                action_id: Some("act-123".into()),
+                started_ms: Some(1_000),
+                duration_ms: Some(42),
+                exit_code: Some(0),
+            }],
+            diff: None,
+            injection_warning: None,
+        };
+        history.append(task_id, &entry).unwrap();
+        let calls = history.read_transcript(task_id, 10).unwrap().remove(0).calls;
+        assert_eq!(calls[0].started_ms, Some(1_000));
+        assert_eq!(calls[0].duration_ms, Some(42));
+        assert_eq!(calls[0].exit_code, Some(0));
+        assert_eq!(calls[0].action_id.as_deref(), Some("act-123"));
+
+        // A fresh store over the same root (the app-restart case) must read
+        // the same metadata back; the transcript, not memory, is authoritative.
+        let reopened = HistoryStore::new(root.clone());
+        let reread = reopened.read_transcript(task_id, 10).unwrap().remove(0).calls;
+        assert_eq!(reread[0].exit_code, Some(0));
+        assert_eq!(reread[0].duration_ms, Some(42));
+        assert_eq!(reread[0].action_id.as_deref(), Some("act-123"));
+
+        // A transcript written before CP8 has none of the new fields. It must
+        // still load, with `None` meaning unknown (never a fabricated zero).
+        let legacy_id = "99999999999999999999999999999999";
+        history
+            .create_task(legacy_id, "legacy", "workspace", "manual")
+            .unwrap();
+        let legacy = "{\"id\":8,\"ts\":0,\"kind\":\"tool_calls\",\"calls\":[{\"id\":\"old\",\"tool\":\"run_command\",\"status\":\"error\",\"output\":\"failed\"}]}\n";
+        std::fs::write(history.task_dir(legacy_id).join("transcript.jsonl"), legacy).unwrap();
+        let old = history.read_transcript(legacy_id, 10).unwrap().remove(0).calls;
+        assert_eq!(old[0].started_ms, None);
+        assert_eq!(old[0].duration_ms, None);
+        assert_eq!(old[0].exit_code, None);
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -8,7 +8,7 @@
     "stop_button": "button[aria-label=\"Stop response\"], button[aria-label=\"Stop Response\"]",
     "messages": "div[data-testid=\"assistant-message\"], .font-claude-message",
     "new_chat": null,
-    "logged_in": "div[contenteditable=\"true\"]",
+    "logged_in": null,
     "logged_out": "a[href*=\"/login\"], [aria-label*=\"Log in\"], [data-testid=\"login-button\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 20000 },

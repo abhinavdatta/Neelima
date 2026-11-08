@@ -8,7 +8,7 @@
     "stop_button": null,
     "messages": "model-response, div[aria-label*=\"Model response\"]",
     "new_chat": null,
-    "logged_in": "rich-textarea div[contenteditable=\"true\"].ql-editor, div.ql-editor[contenteditable=\"true\"]",
+    "logged_in": null,
     "logged_out": "a[href*=\"accounts.google.com/ServiceLogin\"], [aria-label=\"Sign in\"]"
   },
   "input": { "kind": "contenteditable", "max_chars": 16000 },

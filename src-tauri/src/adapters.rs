@@ -22,6 +22,11 @@ pub struct Selectors {
     /// several sites hide or replace the send button when the composer is
     /// empty, which makes an input+send check false-negative forever.
     pub logged_out: Option<String>,
+    /// Selector for the USER's own turn inside the conversation. Used to
+    /// confirm that a submitted prompt actually entered the chat. When absent,
+    /// the runtime falls back to a built-in provider list and finally to a
+    /// text match against the messages container.
+    pub user_message: Option<String>,
 }
 
 impl Default for Selectors {
@@ -34,6 +39,7 @@ impl Default for Selectors {
             new_chat: None,
             logged_in: None,
             logged_out: None,
+            user_message: None,
         }
     }
 }
@@ -209,9 +215,86 @@ fn ensure_file(path: &PathBuf, contents: &str, previous_defaults: &[&str]) -> Re
         let trimmed = existing.trim();
         if previous_defaults.contains(&trimmed) {
             std::fs::write(path, contents).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        // A shipped default can also drift WITHOUT staying byte-identical: an
+        // older build rewrote the seeded file (e.g. patch-release formatting),
+        // leaving it without the later domain guard, auth domains or login,
+        // submission and user-turn selectors. Byte comparison misses that, so
+        // the pane kept loading a login flow it could not complete and could
+        // not confirm a signed-in session. Fill only the fields this copy is
+        // missing/empty on; never overwrite a value the user set.
+        if let (Ok(mut current), Ok(default)) = (
+            serde_json::from_str::<serde_json::Value>(&existing),
+            serde_json::from_str::<serde_json::Value>(contents),
+        ) {
+            let built_in = current
+                .get("built_in")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if built_in && merge_missing_fields(&mut current, &default) {
+                let pretty = serde_json::to_string_pretty(&current).map_err(|e| e.to_string())?;
+                std::fs::write(path, format!("{pretty}\n")).map_err(|e| e.to_string())?;
+            }
         }
     }
     Ok(())
+}
+
+/// Copy the bundled default's security/login fields into a stale built-in copy
+/// when (and only when) the user's copy has none. Returns true when anything
+/// changed, so the caller rewrites the file once and the change is visible on
+/// disk (the adapter stays user-editable).
+fn merge_missing_fields(current: &mut serde_json::Value, default: &serde_json::Value) -> bool {
+    fn is_empty(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Null => true,
+            serde_json::Value::String(text) => text.trim().is_empty(),
+            serde_json::Value::Array(items) => items.is_empty(),
+            _ => false,
+        }
+    }
+    fn fill(
+        target: &mut serde_json::Map<String, serde_json::Value>,
+        source: &serde_json::Value,
+        key: &str,
+    ) -> bool {
+        let Some(wanted) = source.get(key).filter(|value| !is_empty(value)) else {
+            return false;
+        };
+        let missing = target.get(key).map(is_empty).unwrap_or(true);
+        if !missing {
+            return false;
+        }
+        target.insert(key.to_string(), wanted.clone());
+        true
+    }
+    let Some(source) = default.as_object() else {
+        return false;
+    };
+    let Some(target) = current.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["allowed_domain", "auth_domains", "login_url_patterns"] {
+        changed |= fill(target, default, key);
+    }
+    let source_selectors = source.get("selectors").cloned().unwrap_or_default();
+    if !target.contains_key("selectors") {
+        target.insert("selectors".into(), serde_json::json!({}));
+    }
+    if let Some(selectors) = target.get_mut("selectors").and_then(|v| v.as_object_mut()) {
+        for key in [
+            "logged_in",
+            "logged_out",
+            "user_message",
+            "stop_button",
+            "new_chat",
+        ] {
+            changed |= fill(selectors, &source_selectors, key);
+        }
+    }
+    changed
 }
 
 /// Spawn a hot-reload watcher for the adapters dir (a single tiny directory —
@@ -282,6 +365,58 @@ mod tests {
         assert_eq!(custom_read, custom, "customized copy must be preserved");
         let cg = list.iter().find(|a| a.id == "chatgpt").unwrap();
         assert!(cg.selectors.logged_out.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_stale_builtin_copy_field_by_field() {
+        let dir =
+            std::env::temp_dir().join(format!("neelima-adapters-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // An intermediate seeded copy: right id, built_in, but none of the
+        // later domain/login/submission fields. Not byte-identical to any
+        // legacy constant, which is precisely the old migration's blind spot.
+        std::fs::write(
+            dir.join("chatgpt.json"),
+            r##"{
+  "id": "chatgpt",
+  "name": "My ChatGPT",
+  "url": "https://chatgpt.com/",
+  "selectors": {
+    "input": "#prompt-textarea",
+    "send_button": "#send",
+    "stop_button": null,
+    "messages": "main"
+  },
+  "input": { "kind": "contenteditable", "max_chars": 9000 },
+  "quiet_ms": 2000,
+  "response_timeout_ms": 420000,
+  "built_in": true
+}"##,
+        )
+        .unwrap();
+        let _ = load_all(&dir).unwrap();
+        let migrated: Adapter =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("chatgpt.json")).unwrap())
+                .unwrap();
+        // Security and login fields are filled from the current default.
+        assert_eq!(migrated.allowed_domain, "chatgpt.com");
+        assert!(migrated
+            .auth_domains
+            .contains(&"auth.openai.com".to_string()));
+        assert!(migrated
+            .login_url_patterns
+            .iter()
+            .any(|pattern| pattern.contains("/auth/login")));
+        assert!(migrated.selectors.logged_in.is_some());
+        assert!(migrated.selectors.user_message.is_some());
+        assert!(migrated.selectors.stop_button.is_some());
+        // User customizations survive untouched.
+        assert_eq!(migrated.name, "My ChatGPT");
+        assert_eq!(migrated.selectors.input, "#prompt-textarea");
+        assert_eq!(migrated.selectors.send_button, "#send");
+        assert_eq!(migrated.input.max_chars, Some(9000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -358,8 +493,8 @@ mod tests {
                 .logged_in
                 .as_deref()
                 .unwrap()
-                .contains("prompt"),
-            "ChatGPT requires the composer selector to detect the logged-in state"
+                .contains("profile"),
+            "ChatGPT requires an account/profile marker to detect the logged-in state"
         );
     }
 

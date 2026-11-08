@@ -38,8 +38,18 @@ impl CommandGuard {
 
     /// Returns Err(reason) when the command must not run at all.
     pub fn check(&self, command: &str) -> Result<(), String> {
+        // Phase 4: match the denylist against a terminator-masked copy so a
+        // quote or parenthesis cannot hide a destructive segment. Masking is
+        // 1:1 (bytes/offsets are unchanged), and the ORIGINAL command is what
+        // runs — this is matching-only.
+        let masked = mask_terminators(command);
         for re in &self.deny {
-            if let Some(m) = re.find(command) {
+            // Phase 4: match the ORIGINAL and the masked copy. A union can only
+            // add detections, so a pattern that needs a literal `)` (the
+            // fork-bomb rule) keeps working on the original while a path
+            // followed by a quote/backtick is caught on the masked copy.
+            let hit = re.find(command).or_else(|| re.find(&masked));
+            if let Some(m) = hit {
                 return Err(format!(
                     "blocked by deny pattern {}: matched {:?}",
                     re.as_str(),
@@ -62,12 +72,15 @@ impl CommandGuard {
         // segment independently so a harmless prefix cannot hide a destructive tail.
         let segments = Self::split_command_segments(command);
         segments.iter().any(|segment| {
-            self.ask.iter().any(|re| re.is_match(segment))
+            let masked = mask_terminators(segment);
+            self.ask
+                .iter()
+                .any(|re| re.is_match(segment) || re.is_match(&masked))
                 || Self::extra_always_ask_patterns().iter().any(|pattern| {
                     RegexBuilder::new(pattern)
                         .case_insensitive(true)
                         .build()
-                        .map(|re| re.is_match(segment))
+                        .map(|re| re.is_match(segment) || re.is_match(&masked))
                         .unwrap_or(true)
                 })
         })
@@ -76,8 +89,9 @@ impl CommandGuard {
     fn split_command_segments(command: &str) -> Vec<&str> {
         // Conservative lexical split. Splitting inside quoted strings can cause
         // extra approval prompts, which is safer than missing a destructive command.
+        const SPLIT_CHARS: &[char] = &['&', '|', ';', '\n', '\r'];
         command
-            .split(|c| matches!(c, '&' | '|' | ';' | '\n' | '\r'))
+            .split(SPLIT_CHARS)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect()
@@ -91,8 +105,39 @@ impl CommandGuard {
             r"\bshutil\.rmtree\s*\(",
             r"\bpython(?:3)?\s+-c\b[^\n]*(shutil\.rmtree|os\.remove|os\.unlink)",
             r"\bremove-item\b[^|;]*-recurse",
+            // Ownership / ACL tampering and link creation are workspace-escape
+            // and privilege vectors even when the path looks ordinary.
+            r"\btakeown\b",
+            r"\bicacls\b",
+            r"\bmklink\b",
+            r"new-item\b[^|;]*-itemtype\s+symboliclink",
+            // Destructive truncation, including repo internals.
+            r"\btruncate\b[^|;]*\s-s\s*0\b",
+            r"\btruncate\b[^|;]*\.git\b",
+            // git clean with any force/-d flag, including combined shorts
+            // (-fd, -xfd). A dry run (-n) stays quiet.
+            r"\bgit\s+clean\b[^|;]*-[a-z]*[fd]",
         ]
     }
+}
+
+/// Phase 4: replace command metacharacters that typically TERMINATE a path
+/// (" ' backtick ] , < > ! ?) with spaces, for pattern matching only. Without
+/// this, `` echo `rm -rf ~` `` and `bash -c "rm -rf ~"` never matched the
+/// home-delete patterns, because those require whitespace or end-of-string
+/// after the path. The guard always checks the ORIGINAL command alongside the
+/// masked one, so a pattern that needs a literal character (the fork-bomb rule
+/// needs `:(){...};:`) is never weakened. The mapping is byte-for-byte the
+/// byte-for-byte the same length, so regex offsets stay valid and the reported
+/// match text is unchanged.
+fn mask_terminators(command: &str) -> String {
+    command
+        .chars()
+        .map(|c| match c {
+            '"' | '\'' | '`' | ')' | ']' | '}' | ',' | '<' | '>' | '!' | '?' => ' ',
+            _ => c,
+        })
+        .collect()
 }
 
 fn compile(pattern: &str) -> Result<regex::Regex, String> {
@@ -223,6 +268,37 @@ mod tests {
         assert!(!g.needs_ask("npm test"));
     }
 
+    /// Every one of these is destructive or system-level on a supported
+    /// platform: it must be blocked outright OR force an approval. A form that
+    /// silently passes would be a real escape from the guard.
+    #[test]
+    fn additional_dangerous_forms_are_blocked_or_require_approval() {
+        let g = CommandGuard::new(&[], &[]).unwrap();
+        let mut missed: Vec<String> = Vec::new();
+        for cmd in [
+            r"del /f /s /q C:\*",
+            r"del /f /s /q %USERPROFILE%\Documents",
+            r"cmd /c rd /s /q %USERPROFILE%",
+            r#"powershell -Command "Remove-Item -LiteralPath C:\ -Recurse -Force""#,
+            r"takeown /f C:\ /r /d y",
+            r"icacls C:\ /reset /t",
+            r"git clean -xfd",
+            r"truncate -s 0 .git/config",
+            r"diskpart",
+            r"bcdedit /set safeboot minimal",
+            r"format C: /q",
+            r"mklink /D C:\link C:\Windows",
+        ] {
+            if g.check(cmd).is_ok() && !g.needs_ask(cmd) {
+                missed.push(cmd.to_string());
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "dangerous forms neither blocked nor asked: {missed:?}"
+        );
+    }
+
     #[test]
     fn compound_commands_cannot_hide_destructive_segments() {
         let g = CommandGuard::new(&[], &[]).unwrap();
@@ -234,6 +310,71 @@ mod tests {
             "Get-ChildItem C:\\ | Remove-Item -Recurse",
         ] {
             assert!(g.needs_ask(cmd), "must ask before: {cmd}");
+        }
+    }
+
+    /// Phase 4: a destructive command must not become quiet because it is
+    /// chained, nested in a substitution, quoted inside another interpreter, or
+    /// separated by a newline.
+    #[test]
+    fn chained_and_nested_forms_still_force_approval() {
+        let g = CommandGuard::new(&[], &[]).unwrap();
+        for cmd in [
+            "ls; rm -rf ~",
+            "echo hi && rm -rf $HOME",
+            "echo `rm -rf ~`",
+            "$(rm -rf ~)",
+            "bash -c \"rm -rf ~\"",
+            "cmd /c \"rm -rf ~\"",
+            "python -c \"import os;os.system('rm -rf ~')\"",
+            "echo keep\r\nrm -rf ~",
+        ] {
+            assert!(g.needs_ask(cmd), "must ask before: {cmd}");
+        }
+    }
+
+    /// Phase 4: an allowlist entry must not be able to launder a command the
+    /// denylist already rejects, and matching stays case-insensitive.
+    #[test]
+    fn allowlist_cannot_override_the_denylist_and_matching_is_case_insensitive() {
+        let g = CommandGuard::new(&["cargo".to_string()], &[]).unwrap();
+        assert!(g.check("cargo build").is_ok());
+        assert!(
+            g.check("cargo build && rm -rf /").is_err(),
+            "deny wins over the allowlist"
+        );
+        let plain = CommandGuard::new(&[], &[]).unwrap();
+        assert!(plain.check("RM -RF /").is_err(), "uppercase rm");
+        assert!(
+            plain.check("PowerShell -Enc AAAA").is_err(),
+            "uppercase pwsh"
+        );
+        assert!(plain.needs_ask("RM -RF ~"));
+    }
+
+    /// Phase 4: base64-encoded PowerShell payloads, including the short -e/-ec
+    /// aliases the old `-enc`-only pattern missed. Benign switches must NOT be
+    /// caught, or the guard becomes a nuisance instead of a control.
+    #[test]
+    fn encoded_powershell_payloads_are_blocked_without_false_positives() {
+        let g = CommandGuard::new(&[], &[]).unwrap();
+        let blob = "SQBFAFgAIABpAHQAcwAgAGEAIABiAGEAcwBlADYANAA=";
+        for cmd in [
+            format!("powershell -e {blob}"),
+            format!("pwsh -ec {blob}"),
+            format!("powershell -enco {blob}"),
+            format!("powershell -EncodedCommand {blob}"),
+            format!("cmd /c powershell -e {blob}"),
+            format!("PowerShell -E {blob}"),
+        ] {
+            assert!(g.check(&cmd).is_err(), "must be blocked: {cmd}");
+        }
+        for cmd in [
+            "powershell -ExecutionPolicy Bypass -File setup.ps1",
+            "powershell -NoProfile -Command \"Get-ChildItem\"",
+            "pwsh -Command \"Write-Output hi\"",
+        ] {
+            assert!(g.check(cmd).is_ok(), "must stay runnable: {cmd}");
         }
     }
 }

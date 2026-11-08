@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_HOTKEY: &str = "CmdOrCtrl+Alt+Shift+X";
 pub const DEFAULT_RESULT_CAP: usize = 30 * 1024;
 pub const DEFAULT_MAX_ITERATIONS: u32 = 25;
+/// Phase 3Q-2b: remembered Files explorer width (CSS pixels).
+pub const DEFAULT_EXPLORER_WIDTH: u32 = 272;
+/// Hard bounds for a persisted width. The UI clamps to the window (220–480);
+/// these only stop a hand-edited file from collapsing a pane to nothing.
+pub const MIN_EXPLORER_WIDTH: u32 = 160;
+pub const MAX_EXPLORER_WIDTH: u32 = 1200;
+/// Step 3: project-context token budgets are bounded at save time so a
+/// hand-edited settings file cannot ask for an unbounded prompt.
+pub const MIN_CONTEXT_TOKENS: usize = 256;
+pub const MAX_CONTEXT_TOKENS: usize = 32_000;
+pub const MAX_CONTEXT_FILES: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +81,10 @@ pub struct LocalProvider {
     /// truncates the preamble). Default 8192.
     #[serde(default)]
     pub num_ctx: Option<u32>,
+    /// Step 2 (G): explicit reply deadline for this local runtime, in
+    /// seconds. Default 600; validated 10..=3600 at save time.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,6 +95,35 @@ pub struct Providers {
     pub ollama: Option<LocalProvider>,
     #[serde(default)]
     pub lmstudio: Option<LocalProvider>,
+}
+
+/// Step 3: how much workspace text may be attached to a task prompt.
+/// Budgets are per provider kind because a browser chat and a small local
+/// model have very different practical limits; nothing here is a network or
+/// embedding setting — selection is lexical and local.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextSettings {
+    /// Include automatically selected workspace files in a task's first
+    /// message. Read-only: it never grants filesystem or approval rights.
+    pub enabled: bool,
+    /// Token budget for browser providers and the manual relay.
+    pub web_budget_tokens: usize,
+    /// Token budget for Ollama / LM Studio.
+    pub local_budget_tokens: usize,
+    /// Hard cap on how many files one prompt may carry.
+    pub max_files: usize,
+}
+
+impl Default for ContextSettings {
+    fn default() -> Self {
+        ContextSettings {
+            enabled: true,
+            web_budget_tokens: 6_000,
+            local_budget_tokens: 2_500,
+            max_files: 12,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,9 +149,15 @@ pub struct Settings {
     pub shell: Option<String>,
     /// Global emergency-stop hotkey. Kills running commands and halts the loop.
     pub hotkey: String,
+    /// Phase 3Q-2b: width of the Files explorer split, in CSS pixels. Stored so
+    /// the workspace reopens at the size the user chose. `#[serde(default)]` on
+    /// Settings makes an older settings.json (without this field) load cleanly.
+    pub explorer_width: u32,
     pub workspaces: Vec<WorkspaceEntry>,
     pub active_workspace_id: Option<String>,
     pub providers: Providers,
+    /// Step 3: project-context retrieval limits (local, lexical, read-only).
+    pub context: ContextSettings,
     /// User-editable allowlist applied to run_command (regex, case-insensitive).
     pub command_allow: Vec<String>,
     /// User-editable denylist applied to run_command (regex, case-insensitive),
@@ -129,9 +179,11 @@ impl Default for Settings {
             command_timeout_secs: 120,
             shell: None,
             hotkey: DEFAULT_HOTKEY.into(),
+            explorer_width: DEFAULT_EXPLORER_WIDTH,
             workspaces: Vec::new(),
             active_workspace_id: None,
             providers: Providers::default(),
+            context: ContextSettings::default(),
             command_allow: Vec::new(),
             command_deny: Vec::new(),
             update_check_opt_in: false,
@@ -229,14 +281,30 @@ fn validate_settings(next: &Settings) -> Result<(), String> {
     if next.max_iterations == 0 || next.max_iterations > 200 {
         return Err("max_iterations must be 1..=200".into());
     }
+    // Phase 4: this value feeds the command runner's deadline arithmetic, so a
+    // hand-edited file cannot ask for an unbounded (or zero) command lifetime.
+    if !(1..=86_400).contains(&next.command_timeout_secs) {
+        return Err("command_timeout_secs must be 1..=86400".into());
+    }
     if next.result_cap_bytes < 1024 || next.result_cap_bytes > 1024 * 1024 {
         return Err("result_cap_bytes must be 1KB..1MB".into());
+    }
+    // Phase 3Q-2b: a persisted split width must stay a usable pane size.
+    if !(MIN_EXPLORER_WIDTH..=MAX_EXPLORER_WIDTH).contains(&next.explorer_width) {
+        return Err(format!(
+            "explorer_width must be {MIN_EXPLORER_WIDTH}..={MAX_EXPLORER_WIDTH} pixels"
+        ));
     }
     for (name, provider) in [
         ("Ollama", next.providers.ollama.as_ref()),
         ("LM Studio", next.providers.lmstudio.as_ref()),
     ] {
         if let Some(provider) = provider {
+            // Local-only rule: a saved endpoint must be loopback. Rejected at
+            // save time so a hand-edited settings file can never point the
+            // agent's prompts at a hosted AI service.
+            crate::providers::ensure_local_endpoint(&provider.url)
+                .map_err(|e| format!("{name}: {e}"))?;
             if provider
                 .num_ctx
                 .is_some_and(|n| !(1..=1_048_576).contains(&n))
@@ -249,7 +317,28 @@ fn validate_settings(next: &Settings) -> Result<(), String> {
             {
                 return Err(format!("{name} temperature must be 0..=2"));
             }
+            if provider
+                .timeout_secs
+                .is_some_and(|t| !(10..=3600).contains(&t))
+            {
+                return Err(format!("{name} reply timeout must be 10..=3600 seconds"));
+            }
         }
+    }
+    if !(MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&next.context.web_budget_tokens) {
+        return Err(format!(
+            "web context budget must be {MIN_CONTEXT_TOKENS}..={MAX_CONTEXT_TOKENS} tokens"
+        ));
+    }
+    if !(MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&next.context.local_budget_tokens) {
+        return Err(format!(
+            "local context budget must be {MIN_CONTEXT_TOKENS}..={MAX_CONTEXT_TOKENS} tokens"
+        ));
+    }
+    if next.context.max_files == 0 || next.context.max_files > MAX_CONTEXT_FILES {
+        return Err(format!(
+            "context file limit must be 1..={MAX_CONTEXT_FILES}"
+        ));
     }
     for profile in &next.providers.web {
         if let Some(url) = profile.url.as_deref() {
@@ -286,7 +375,9 @@ pub fn always_ask_patterns() -> &'static [&'static str] {
         r"\bremove-item\b.*(-recurse|-force).*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.)",
         r"\bremove-item\b.*(~|\$HOME|%USERPROFILE%|%HOMEDRIVE%%HOMEPATH%|\$env:USERPROFILE|[a-z]:[/\\]|\.\.).*(-recurse|-force)",
         r"\brm\s+-[^ ]*r[^ ]*\s+/\*",
-        r#"\bshutil\.rmtree\b\s*\(\s*(['"])~?[\w.]*/[a-z]"#,
+        // Phase 4: the quote is optional because the guard matches a copy of the
+        // command with quotes masked; making it optional only ADDS matches.
+        r#"\bshutil\.rmtree\b\s*\(\s*(['"])?~?[\w.]*/[a-z]"#,
         // Destructive git
         r"\bgit\s+(push|pull)\b[^|;]*--force\b",
         r"\bgit\s+push\b[^|;]*\s-f(\s|$)",
@@ -317,6 +408,11 @@ pub fn default_deny_patterns() -> &'static [&'static str] {
         r"\bdd\s+if=.*of=/dev/",
         r"(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|fi)?sh\b",
         r"(iex|invoke-expression)\b",
+        // Phase 4: base64-encoded PowerShell payloads. The classic `-enc` form
+        // is matched above even with a short token; `-e`/`-ec`/`-enco`/longer
+        // aliases only matter when a base64 blob follows, which is what this
+        // pattern pins down (so `-ExecutionPolicy` is NOT caught by it).
+        r"(powershell|pwsh)\b[^\n]*\s-(e|ec|enc|enco|encoded|encodedcommand)\s+[A-Za-z0-9+/=]{16,}",
         r"(powershell|pwsh)\b.*\s-enc(odedcommand)?(\s|$)",
         r":\(\)\s*\{.*\}\s*;\s*:",
         r"\bchmod\s+-R\s+777\s+/(\s|$)",
@@ -368,12 +464,17 @@ mod tests {
             context_chars: None,
             temperature: Some(0.7),
             num_ctx: Some(0),
+            timeout_secs: None,
         });
         assert!(store.set(settings.clone()).is_err());
         settings.providers.ollama.as_mut().unwrap().num_ctx = Some(8192);
         settings.providers.ollama.as_mut().unwrap().temperature = Some(2.1);
         assert!(store.set(settings.clone()).is_err());
         settings.providers.ollama.as_mut().unwrap().temperature = Some(0.7);
+        // Step 2 (G): the reply timeout is validated like the other knobs.
+        settings.providers.ollama.as_mut().unwrap().timeout_secs = Some(5);
+        assert!(store.set(settings.clone()).is_err());
+        settings.providers.ollama.as_mut().unwrap().timeout_secs = Some(300);
         assert!(store.set(settings).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -453,6 +554,61 @@ mod tests {
 
         assert!(store.set(next).is_err());
         assert_eq!(store.get().max_iterations, DEFAULT_MAX_ITERATIONS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_without_explorer_width_still_load() {
+        // A settings.json written before Phase 3Q-2b has no explorer_width.
+        // `#[serde(default)]` must fill the documented default rather than
+        // failing the load and silently resetting the user's configuration.
+        let legacy = serde_json::json!({
+            "theme": "dark",
+            "permission_mode": "ask_all",
+            "max_iterations": 25,
+            "result_cap_bytes": DEFAULT_RESULT_CAP,
+            "command_timeout_secs": 120,
+            "hotkey": DEFAULT_HOTKEY,
+            "workspaces": [],
+            "update_check_opt_in": false
+        });
+        let parsed: Settings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.explorer_width, DEFAULT_EXPLORER_WIDTH);
+
+        // A remembered width round-trips through serialization for the UI.
+        let saved = Settings {
+            explorer_width: 331,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&saved).unwrap();
+        assert_eq!(json["explorer_width"], 331);
+    }
+
+    #[test]
+    fn explorer_width_is_validated() {
+        let dir = std::env::temp_dir().join(format!("neelima-settings-width-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+
+        let ok = Settings {
+            explorer_width: 220,
+            ..Default::default()
+        };
+        assert!(store.set(ok).is_ok());
+
+        let too_narrow = Settings {
+            explorer_width: MIN_EXPLORER_WIDTH - 1,
+            ..Default::default()
+        };
+        assert!(store.set(too_narrow).is_err());
+        // A rejected save must not publish the bad value in memory.
+        assert_eq!(store.get().explorer_width, 220);
+
+        let too_wide = Settings {
+            explorer_width: MAX_EXPLORER_WIDTH + 1,
+            ..Default::default()
+        };
+        assert!(store.set(too_wide).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

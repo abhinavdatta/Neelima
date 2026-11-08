@@ -9,7 +9,8 @@
     "messages": "#messages .msg",
     "new_chat": null,
     "logged_in": null,
-    "logged_out": null
+    "logged_out": null,
+    "user_message": ".msg.user"
   },
   "input": { "kind": "textarea", "max_chars": 8000 },
   "quiet_ms": 300,

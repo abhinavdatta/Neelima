@@ -6,11 +6,35 @@ import { setState, toast, useStore } from "../store";
 import { cmd } from "../tauri";
 import { Icon } from "./Icon";
 import type { TranscriptEntry } from "../types";
+import { providerStateLabel } from "../providerStatus";
+import { executionStatusLabel, formatExecutionDuration, formatExitCode } from "../executionHistory";
 
 export function Chat() {
   const s = useStore();
   const bottom = useRef<HTMLDivElement>(null);
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: "smooth" }); }, [s.entries.length, s.pendingCalls.length]);
+
+  // Approval-card lifecycle: a decision that can no longer be honoured (its
+  // request timed out, was refused, or timed out while the agent moved on)
+  // must not sit in the column indefinitely. Rules live in
+  // ui/src/approvalLifecycle.ts (unit-tested); here we act on the store.
+  const awaitingDecision =
+    s.pendingCalls.length > 0 &&
+    ["awaiting_approval", "executing"].includes(s.agentState);
+  useEffect(() => {
+    if (awaitingDecision || s.bridgeApproval) return;
+    const count = s.pendingCalls.length;
+    if (count === 0) return;
+    const t = setTimeout(() => {
+      setState((st) => (st.pendingCalls.length ? { pendingCalls: [] } : {}));
+      toast(
+        "warn",
+        `Cleared ${count} stale approval prompt${count === 1 ? "" : "s"}: the underlying request can no longer be decided. Nothing was auto-approved.`,
+      );
+    }, 400);
+    return () => clearTimeout(t);
+  }, [awaitingDecision, s.bridgeApproval, s.pendingCalls.length, s.agentState]);
+
 
   const readOnly = s.view === "task";
 
@@ -20,6 +44,9 @@ export function Chat() {
       {s.entries.map((e) => <Entry key={`${e.ts}-${e.id}`} e={e} taskId={s.taskId ?? s.openTask?.id ?? ""} readOnly={readOnly} />)}
 
       {s.pendingCalls.length > 0 ? <ApprovalCard /> : null}
+      {s.bridgeApproval ? <BridgeApprovalCard /> : null}
+      {s.agentState === "waiting_for_ai" && s.providerSelected !== "manual" ? <ProviderWaitCard /> : null}
+      {s.streamText && s.agentState === "waiting_for_ai" ? <StreamPreview text={s.streamText} /> : null}
       {s.relayOutbound && s.agentState === "waiting_for_ai" ? <RelayCard /> : null}
       <div ref={bottom} />
     </div>
@@ -41,7 +68,10 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
   if (e.kind === "tool_calls") {
     return (
       <div class="msg-block">
-        {e.calls.map((c) => (
+        {e.calls.map((c) => {
+          const duration = formatExecutionDuration(c.duration_ms ?? null);
+          const exit = formatExitCode(c.exit_code ?? null);
+          return (
           <details class={`tool-card status-${c.status}`} key={c.id}>
             <summary class="tool-head">
               <span class={`dot ${c.status}`} />
@@ -50,7 +80,7 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
               <span class={`risk risk-${c.tool === "read_file" || c.tool === "list_dir" || c.tool === "glob" || c.tool === "grep" ? "read" : c.tool === "run_command" ? "command" : "write"}`}>
                 {c.tool === "run_command" ? "command" : c.tool.startsWith("read") || ["list_dir", "glob", "grep"].includes(c.tool) ? "read" : "write"}
               </span>
-              <span class="tool-status-label">{c.status}</span>
+              <span class="tool-status-label">{executionStatusLabel(c.status)}</span>
             </summary>
             <div class="tool-detail">
               {e.diff ? (
@@ -58,12 +88,18 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
                   <button class="link" onClick={() => setState({ diffEntry: { taskId, entryId: e.id } })}>View diff</button>
                 )
               ) : null}
+            {duration || exit || c.action_id ? <div class="tool-meta">
+              {duration ? <span>{duration}</span> : null}
+              {exit ? <span>{exit}</span> : null}
+              {c.action_id ? <span title={c.action_id}>action {c.action_id.slice(0, 12)}…</span> : null}
+            </div> : null}
             <pre class="tool-args">{JSON.stringify(c.args, null, 1)?.slice(0, 400)}</pre>
             {c.output ? <pre class="tool-out">{c.output.slice(0, 4000)}</pre> : null}
             {e.injection_warning ? <div class="inj-warn"><Icon name="alert" size={15} /> {e.injection_warning}</div> : null}
             </div>
           </details>
-        ))}
+          );
+        })}
       </div>
     );
   }
@@ -77,6 +113,20 @@ function Entry({ e, taskId, readOnly }: { e: TranscriptEntry; taskId: string; re
     return <div class="err-row"><Icon name="close" size={14} /> {e.text}</div>;
   }
   // system
+  // Continuation headers carry the entire compressed prior transcript as one
+  // wall of protocol text; collapse them to a one-line toggle (expandable for
+  // the full record).
+  if (e.text.startsWith("You are continuing a previous task in this workspace.")) {
+    return (
+      <details class="sys-continued">
+        <summary>Continued from a previous task — prior context carried over</summary>
+        <pre>{e.text}</pre>
+      </details>
+    );
+  }
+  // Internal bridge telemetry: which transport handled the send. Kept in the
+  // task log, but it is not conversation content — don't paint it in chat.
+  if (e.text.startsWith("protocol preamble sent to ")) return null;
   return <div class="sys-row">{e.text}</div>;
 }
 
@@ -125,6 +175,111 @@ function ApprovalCard() {
         <button class="btn-ok" disabled={!allChosen || submitting} onClick={() => void submit(allDecisions)}>{submitting ? "Submitting…" : "Submit decisions"}</button>
       </div>
       {!allChosen ? <div class="dim">Choose Approve or Reject for every item before submitting. Unselected items are never implicitly rejected.</div> : null}
+    </div>
+  );
+}
+
+function BridgeApprovalCard() {
+  const s = useStore();
+  const [submitting, setSubmitting] = useState(false);
+  const request = s.bridgeApproval!;
+  const decide = async (approved: boolean) => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await cmd.bridgeApprove(request.request_id, approved);
+      setState({ bridgeApproval: null });
+      toast("info", approved ? "Browser request approved and executed by Neelima." : "Browser request rejected; nothing was executed.");
+    } catch (e) {
+      setSubmitting(false);
+      // The request may have already timed out or been decided elsewhere.
+      toast("error", `Could not submit the decision: ${String(e)}`);
+    }
+  };
+  return (
+    <div class="approval-card">
+      <div class="approval-head">Approval required — browser extension request</div>
+      <div class="approval-item">
+        <span class="risk risk-high">{request.risk === "high" ? "high" : "read"}</span>
+        <span class="tool-name">{request.tool}</span>
+        <span class="dim">requested by {request.site}</span>
+        <pre class="tool-args">{JSON.stringify(request.args, null, 1)?.slice(0, 300)}</pre>
+        <div class="approval-actions">
+          <button class="btn-ok" disabled={submitting} onClick={() => void decide(true)}>Approve</button>
+          <button class="btn-no" disabled={submitting} onClick={() => void decide(false)}>Reject</button>
+        </div>
+        <div class="dim">Nothing runs until you decide. The request times out after 2 minutes.</div>
+      </div>
+    </div>
+  );
+}
+
+export function ProviderWaitCard() {
+  const s = useStore();
+  const requestState = s.providerRequest ? providerStateLabel(s.providerRequest.state) : "waiting";
+  const [elapsed, setElapsed] = useState(0);
+  const [capturing, setCapturing] = useState(false);
+  const [captureNote, setCaptureNote] = useState<string | null>(null);
+  useEffect(() => {
+    setElapsed(0);
+    const t = setInterval(() => setElapsed((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [s.taskId]);
+  const isWeb = s.providerSelected.startsWith("web:");
+  const isLocal = s.providerSelected === "ollama" || s.providerSelected === "lmstudio";
+  const providerName = isWeb
+    ? (s.providers?.web ?? []).find((p: any) => p.id === s.providerSelected.slice(4))?.name ?? "the provider"
+    : s.providerSelected === "ollama" ? "Ollama"
+    : s.providerSelected === "lmstudio" ? "LM Studio"
+    : "the provider";
+  const capture = async () => {
+    if (capturing) return;
+    setCapturing(true);
+    try {
+      const r = await cmd.captureReply();
+      setCaptureNote(r.delivered
+        ? "Reply captured and delivered to the conversation."
+        : (r.reason ?? "No reply is visible on the provider page yet."));
+    } catch (e) {
+      setCaptureNote(`Capture failed: ${String(e)}`);
+    } finally {
+      setCapturing(false);
+    }
+  };
+  return (
+    <div class="approval-card">
+      <div class="approval-head">Waiting for {providerName}'s reply… {elapsed}s</div>
+      <div class="approval-item">
+        <div class="dim">The reply appears here automatically as soon as the provider finishes. The provider keeps working while you use other parts of Neelima.</div>
+        <div class="dim">Request: {requestState}{s.providerRequest?.provider ? ` · ${s.providerRequest.provider}` : ""}</div>
+        {s.providerEventNote ? <div class="dim">{s.providerEventNote}</div> : null}
+        {isWeb ? (
+          <div class="approval-actions">
+            <button class="btn-ok" disabled={capturing} onClick={() => void capture()}>{capturing ? "Capturing…" : "Capture current reply"}</button>
+            <button class="btn-no" onClick={() => { setState({ view: "provider", providerAuthOpen: true }); cmd.webviewMode("provider").catch(() => {}); }}>Open provider window</button>
+          </div>
+        ) : isLocal ? (
+          <div class="approval-actions">
+            <button class="btn-no" onClick={() => setState({ settingsOpen: true })}>Open Settings</button>
+          </div>
+        ) : null}
+        {captureNote ? <div class="dim">{captureNote}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function StreamPreview({ text }: { text: string }) {
+  // Display-only: the tail keeps this cheap for long file-writing replies.
+  const tail = text.length > 2400 ? text.slice(-2400) : text;
+  return (
+    <div class="stream-block">
+      <div class="stream-head">
+        <span class="stream-dot" />
+        <span>Live reply…</span>
+        <span class="dim">{text.length.toLocaleString()} chars</span>
+      </div>
+      <pre>{tail}</pre>
     </div>
   );
 }

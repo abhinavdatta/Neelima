@@ -6,10 +6,11 @@
     "input": "[data-testid=\"prompt-textarea\"], div#prompt-textarea[contenteditable=\"true\"], #prompt-textarea, div[contenteditable=\"true\"]",
     "send_button": "button[data-testid=\"send-button\"], button[aria-label=\"Send prompt\"]",
     "stop_button": "button[data-testid=\"stop-button\"], button[aria-label=\"Stop streaming\"]",
-    "messages": "main [data-message-author-role=\"assistant\"], div[data-message-author-role=\"assistant\"]",
+    "messages": "main [data-message-author-role=\"assistant\"], div[data-message-author-role=\"assistant\"], [data-message-role=\"assistant\"], [data-turn=\"assistant\"], [data-content-search-unit-key$=\":assistant\"], [data-chatgpt-search-unit-key$=\":assistant\"]",
     "new_chat": "a[aria-label=\"New chat\"], button[aria-label=\"New chat\"]",
-    "logged_in": "[data-testid=\"prompt-textarea\"], div#prompt-textarea[contenteditable=\"true\"], #prompt-textarea, div[contenteditable=\"true\"]",
-    "logged_out": "[aria-label=\"Log in or sign up\"], a[data-testid=\"login-button\"], a[href*=\"/auth/login\"], form[action*=\"login\"], button[data-testid=\"welcome-login-button\"]"
+    "logged_in": "[aria-label=\"Open profile menu\"], [data-testid=\"profile-button\"]",
+    "logged_out": "[aria-label=\"Log in or sign up\"], a[data-testid=\"login-button\"], a[href*=\"/auth/login\"], form[action*=\"login\"], button[data-testid=\"welcome-login-button\"]",
+    "user_message": "[data-message-author-role=\"user\"], [data-message-role=\"user\"], [data-turn=\"user\"], button[data-user-message-bubble]"
   },
   "input": { "kind": "contenteditable", "max_chars": 20000 },
   "quiet_ms": 2000,

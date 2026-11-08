@@ -32,10 +32,25 @@ pub enum Parsed {
     Neither,
 }
 
-/// Extract tool calls from an assistant reply.
+/// Extract tool calls from an assistant reply./// Phase 4 bounds: model output is untrusted input, so both the parsing work
+/// and the approval batch a single reply can create are capped BEFORE anything
+/// is validated or executed. 32 blocks x 512 KiB is the absolute worst case
+/// one reply can make us hold, and the web bridge already caps an entire
+/// assistant message at 512 KiB (`bridge::MAX_BRIDGE_MSG`).
+pub const MAX_TOOL_CALLS_PER_REPLY: usize = 32;
+pub const MAX_TOOL_BLOCK_BYTES: usize = 512 * 1024;
+pub const MAX_CALL_ID_BYTES: usize = 64;
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+
 pub fn parse_reply(reply: &str, nonce: Option<&str>) -> Parsed {
     let cleaned = strip_page_artifacts(reply);
     let blocks = extract_tool_blocks(&cleaned);
+    if blocks.len() > MAX_TOOL_CALLS_PER_REPLY {
+        return Parsed::Error(format!(
+            "{} tool blocks in one reply (limit {MAX_TOOL_CALLS_PER_REPLY}): split the work across replies",
+            blocks.len()
+        ));
+    }
     if !blocks.is_empty() {
         let mut calls = Vec::new();
         for block in blocks {
@@ -50,7 +65,8 @@ pub fn parse_reply(reply: &str, nonce: Option<&str>) -> Parsed {
                             calls.push(call);
                         } else {
                             return Parsed::Error(format!(
-                                "tool block id {:?} rejected: missing or wrong security nonce \"k\" (expected \"{expected}\"). Include \"k\":\"{expected}\" at the top level of the tool JSON.", call.id
+                                "tool block id {:?} rejected: missing or wrong security nonce \"k\" (expected \"{expected}\"). Include \"k\":\"{expected}\" at the top level of the tool JSON.",
+                                call.id
                             ));
                         }
                     } else {
@@ -58,6 +74,17 @@ pub fn parse_reply(reply: &str, nonce: Option<&str>) -> Parsed {
                     }
                 }
                 Err(e) => return Parsed::Error(e),
+            }
+        }
+        // Phase 4: approval decisions are matched BY ID, so two calls sharing an
+        // id would be governed by a single click. Unique ids are required.
+        let mut seen = std::collections::BTreeSet::new();
+        for call in &calls {
+            if !seen.insert(call.id.clone()) {
+                return Parsed::Error(format!(
+                    "duplicate tool call id {:?} in one reply: every call needs a unique id so approvals cannot be applied to the wrong call",
+                    call.id
+                ));
             }
         }
         return Parsed::Calls(calls);
@@ -81,7 +108,7 @@ pub fn display_reply(reply: &str, parsed: &Parsed) -> String {
     while let Some(line) = lines.next() {
         let hidden_protocol = is_open_fence(line) || is_result_open_fence(line);
         if hidden_protocol {
-            while let Some(body_line) = lines.next() {
+            for body_line in lines.by_ref() {
                 if is_close_fence(body_line) {
                     break;
                 }
@@ -186,6 +213,12 @@ fn clean_block(body: &str) -> String {
 
 /// Parse one block into a ToolCall, applying JSON fixups.
 pub fn parse_block(block: &str) -> Result<ToolCall, String> {
+    if block.len() > MAX_TOOL_BLOCK_BYTES {
+        return Err(format!(
+            "tool block is {} bytes (limit {MAX_TOOL_BLOCK_BYTES}): split the work into smaller calls",
+            block.len()
+        ));
+    }
     let first = block
         .find('{')
         .ok_or("no JSON object found in tool block")?;
@@ -209,9 +242,16 @@ pub fn parse_block(block: &str) -> Result<ToolCall, String> {
         let raw_call: RawCall =
             serde_json::from_value(v).map_err(|e| format!("invalid call shape: {e}"))?;
         let id = as_string(&raw_call.id).ok_or("missing string field 'id'")?;
+        validate_call_id(&id)?;
         let tool = as_string(&raw_call.tool).ok_or("missing string field 'tool'")?;
         if tool.is_empty() {
             return Err("field 'tool' is empty".into());
+        }
+        if tool.len() > MAX_TOOL_NAME_BYTES {
+            return Err(format!(
+                "field 'tool' is {} bytes (limit {MAX_TOOL_NAME_BYTES})",
+                tool.len()
+            ));
         }
         Ok(ToolCall {
             id,
@@ -348,13 +388,33 @@ fn as_string(v: &Value) -> Option<String> {
     }
 }
 
+/// Phase 4: ids key the approval decision lookup and the history records, so
+/// they must be non-empty, bounded and free of control characters.
+fn validate_call_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("field 'id' must not be empty".into());
+    }
+    if id.len() > MAX_CALL_ID_BYTES {
+        return Err(format!(
+            "field 'id' is {} bytes (limit {MAX_CALL_ID_BYTES})",
+            id.len()
+        ));
+    }
+    if id.chars().any(char::is_control) {
+        return Err("field 'id' must not contain control characters".into());
+    }
+    Ok(())
+}
+
 fn detect_done(text: &str) -> Option<String> {
-    let re = regex::Regex::new(r"(?im)^\s*(?:DONE|done)\s*[:：]\s*(.+)$").unwrap();
-    re.captures(text).map(|c| {
-        c.get(1)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_default()
-    })
+    // B4/3I: the terminal anchor is still a line that STARTS with "DONE:" —
+    // gate strength unchanged. Only how much we capture grows: the whole
+    // rest of the message, so a preamble-instructed no-tool reply can lead
+    // with DONE and still carry its complete multi-line answer (or a fenced
+    // code block) as the user-visible summary instead of one truncated line.
+    let re = regex::Regex::new(r"(?im)^\s*(?:DONE|done)\s*[:：][ \t]*").unwrap();
+    let m = re.find(text)?;
+    Some(text[m.end()..].trim().to_string())
 }
 
 pub fn truncate(s: &str, max: usize) -> &str {
@@ -417,6 +477,7 @@ pub fn preamble(
 - You will receive results as ```result blocks with matching ids. Send your next batch only after results arrive.
 - Neelima calls are handled by this text protocol; they do not appear as provider-native tools. When workspace work is needed, emit the requested ```tool block instead of claiming the tools are unavailable.
 - When the task is complete, reply exactly "DONE: <one-line summary>" and nothing else.
+- No-tool answers: if you can complete the request WITHOUT any tools, do it immediately in ONE reply — its FIRST line must be "DONE:" followed by the complete answer (multi-line and code fences allowed), ending the task without a reminder round. Plain prose without a leading DONE line is not final.
 - If a call fails, read the error and fix the call. Never invent results.
 
 TOOLS
@@ -547,6 +608,40 @@ mod tests {
         assert_eq!(v["output"], "hello\nworld");
     }
 
+    /// Phase 3I: a no-tool reply that leads with DONE carries its complete
+    /// multi-line answer. Single-line DONE still works; a mid-text DONE with
+    /// trailing prose is now fully captured instead of one truncated line.
+    #[test]
+    fn done_captures_multiline_answer() {
+        let reply = "Let me answer without tools.\nDONE: Here is the answer\nLine two of the answer\n\n```rust\nfn main() {}\n```";
+        match parse_reply(reply, None) {
+            Parsed::Done(summary) => {
+                assert!(summary.starts_with("Here is the answer"));
+                assert!(summary.contains("Line two of the answer"));
+                assert!(summary.contains("```rust"));
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    /// Phase 3I fallback invariant: plain prose WITHOUT a leading DONE line
+    /// still gets the reminder round (Parsed::Neither), never false-final.
+    #[test]
+    fn prose_without_done_is_not_final() {
+        let reply = "Here is the complete answer for you.";
+        assert!(matches!(parse_reply(reply, None), Parsed::Neither));
+    }
+
+    /// Tool blocks still win over a DONE line (multi-step tasks unaffected).
+    #[test]
+    fn done_with_tool_block_is_calls_not_done() {
+        let reply = "Refactor first.\nDONE: after this\n```tool\n{\"id\":\"1\",\"tool\":\"read_file\",\"args\":{\"path\":\"src/main.rs\"}}\n```";
+        match parse_reply(reply, None) {
+            Parsed::Calls(calls) => assert_eq!(calls.len(), 1),
+            other => panic!("expected calls, got {other:?}"),
+        }
+    }
+
     #[test]
     fn preamble_contains_protocol() {
         let p = preamble(
@@ -631,6 +726,94 @@ mod tests {
                 assert_eq!(calls[0].id, "1");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    fn block(id: &str, tool: &str) -> String {
+        format!("```tool\n{{\"id\":\"{id}\",\"tool\":\"{tool}\",\"args\":{{}}}}\n```")
+    }
+
+    /// Phase 4: a single reply can open at most a bounded approval batch.
+    #[test]
+    fn too_many_tool_blocks_in_one_reply_are_rejected() {
+        let within: String = (0..MAX_TOOL_CALLS_PER_REPLY)
+            .map(|i| block(&i.to_string(), "list_dir"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match parse_reply(&within, None) {
+            Parsed::Calls(calls) => assert_eq!(calls.len(), MAX_TOOL_CALLS_PER_REPLY),
+            other => panic!("the boundary reply must still parse: {other:?}"),
+        }
+
+        let over: String = (0..=MAX_TOOL_CALLS_PER_REPLY)
+            .map(|i| block(&i.to_string(), "list_dir"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        match parse_reply(&over, None) {
+            Parsed::Error(e) => assert!(
+                e.contains(&format!("limit {MAX_TOOL_CALLS_PER_REPLY}")),
+                "{e}"
+            ),
+            other => panic!("an oversized batch must be refused: {other:?}"),
+        }
+    }
+
+    /// Phase 4: bounds are checked before the JSON is parsed, so a hostile
+    /// block cannot make us allocate/parse an unbounded blob.
+    #[test]
+    fn an_oversized_tool_block_is_refused_before_parsing() {
+        let content = "a".repeat(MAX_TOOL_BLOCK_BYTES);
+        let block_text = format!(
+            "{{\"id\":\"1\",\"tool\":\"write_file\",\"args\":{{\"path\":\"x.txt\",\"content\":\"{content}\"}}}}"
+        );
+        match parse_block(&block_text) {
+            Ok(_) => panic!("an oversized block must be refused"),
+            Err(e) => assert!(e.contains("bytes (limit"), "{e}"),
+        }
+    }
+
+    /// Phase 4: ids key approval decisions and history records.
+    #[test]
+    fn call_ids_must_be_present_bounded_and_control_free() {
+        let ok = parse_block(&block("1", "read_file"));
+        assert!(ok.is_ok());
+
+        let cases = [
+            ("{\"id\":\"\",\"tool\":\"read_file\",\"args\":{}}", "must not be empty"),
+            (
+                "{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"tool\":\"read_file\",\"args\":{}}",
+                "bytes (limit",
+            ),
+            (
+                "{\"id\":\"a\\nb\",\"tool\":\"read_file\",\"args\":{}}",
+                "control characters",
+            ),
+        ];
+        for (raw, expected) in cases {
+            match parse_block(raw) {
+                Ok(_) => panic!("{raw} must be rejected"),
+                Err(e) => assert!(e.contains(expected), "expected {expected:?}, got {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_tool_name_is_refused() {
+        let name = "t".repeat(MAX_TOOL_NAME_BYTES + 1);
+        match parse_block(&block("1", &name)) {
+            Ok(_) => panic!("an oversized tool name must be refused"),
+            Err(e) => assert!(e.contains("field 'tool' is"), "{e}"),
+        }
+    }
+
+    /// Phase 4: approvals are matched by id, so duplicated ids in one reply
+    /// would let a single click govern two different calls.
+    #[test]
+    fn duplicate_call_ids_in_one_reply_are_rejected() {
+        let reply = format!("{}\n{}", block("7", "list_dir"), block("7", "delete_file"));
+        match parse_reply(&reply, None) {
+            Parsed::Error(e) => assert!(e.contains("duplicate tool call id"), "{e}"),
+            other => panic!("duplicate ids must be refused: {other:?}"),
         }
     }
 }

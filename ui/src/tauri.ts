@@ -11,7 +11,23 @@ export const cmd = {
   workspaceRemove: (id: string) => invoke<{ removed: string; path: string }>("ui_workspace_remove", { id }),
   workspaceRename: (id: string, name: string) => invoke<{ id: string; name: string }>("ui_workspace_rename", { id, name }),
   workspaceOpenInExplorer: (id?: string) => invoke<void>("ui_workspace_open_in_explorer", { id: id ?? null }),
-  tree: (path: string) => invoke<{ path: string; entries: { name: string; dir: boolean; path: string }[] }>("ui_tree", { path }),
+  // CP5: the listing reports whether it was capped (and how many entries could
+  // not be read) so the explorer can state the truth instead of implying the
+  // folder is complete.
+  tree: (path: string) => invoke<{ path: string; entries: { name: string; dir: boolean; path: string }[]; truncated?: boolean; limit?: number; unreadable?: number }>("ui_tree", { path }),
+  filePreview: (path: string, offset = 0) => invoke<{ path: string; content: string; offset: number; line_limit: number; size_bytes: number; has_more: boolean }>("ui_file_preview", { path, offset }),
+  fileText: (path: string) => invoke<{ path: string; content: string; bytes: number }>("ui_file_text", { path }),
+  // Checkpoint 4: `expectedOriginal` is the exact baseline the reviewed diff
+  // was computed against; the Rust command re-verifies it against the disk
+  // right before the atomic replacement and rejects with "CONFLICT::…" when
+  // the file changed externally. It is REQUIRED (CP4 closeout): there is no
+  // baseline-free save path, on either side of the boundary.
+  fileSave: (path: string, content: string, expectedOriginal: string) =>
+    invoke<{ path: string; bytes: number; lines: number }>("ui_file_save", {
+      path,
+      content,
+      expectedOriginal,
+    }),
   settingsGet: () => invoke<Settings>("ui_settings_get"),
   settingsSet: (s: Settings) => invoke<Settings>("ui_settings_set", { next: s }),
   adaptersList: () => invoke<Adapter[]>("ui_adapters_list"),
@@ -24,14 +40,24 @@ export const cmd = {
   providerClearSession: (profileId: string) => invoke<void>("ui_provider_clear_session", { profileId }),
   providersList: () => invoke<any>("ui_providers_list"),
   providerDiagnose: () => invoke<any>("ui_provider_diagnose"),
+  requestLog: () => invoke<any[]>("ui_request_log"),
+  providerMarkSignedIn: () => invoke<void>("ui_provider_mark_signed_in"),
+  captureReply: () => invoke<{ delivered: boolean; len?: number; reason?: string }>("ui_capture_reply"),
+  providerProbe: (providerId: string) => invoke<{ ok: boolean; ready: boolean; reply: string; elapsed_ms: number; request_id: string | null }>("ui_provider_probe", { providerId }),
   modelsLocal: (kind: "ollama" | "lmstudio") => invoke<string[]>("ui_models_local", { kind }),
-  taskStart: (prompt: string, providerId: string, requestId: string, skillIds: string[] = [], skillBudget = 8192) => invoke<string>("ui_task_start", { prompt, providerId, skillIds, skillBudget, requestId }),
+  contextPreview: (prompt: string, providerId: string, exclude: string[] = [], taskId: string | null = null) =>
+    invoke<import("./contextPreview").ContextPreview>("ui_context_preview", { prompt, providerId, exclude, taskId }),
+  taskStart: (prompt: string, providerId: string, requestId: string, skillIds: string[] = [], skillBudget = 8192, context: { enabled: boolean; exclude: string[] } = { enabled: true, exclude: [] }) =>
+    invoke<string>("ui_task_start", { prompt, providerId, skillIds, skillBudget, requestId, context }),
   taskStop: () => invoke<void>("ui_task_stop"),
-  taskContinue: (taskId: string, providerId: string) => invoke<string>("ui_task_continue", { taskId, providerId }),
+  taskContinue: (taskId: string, providerId: string, prompt: string, requestId: string, context: { enabled: boolean; exclude: string[] } = { enabled: true, exclude: [] }) =>
+    invoke<string>("ui_task_continue", { taskId, providerId, prompt, requestId, context }),
   approve: (decisions: { id: string; approved: boolean }[]) => invoke<void>("ui_approve", { decisions }),
+  bridgeApprove: (requestId: string, approved: boolean, reason?: string) => invoke<boolean>("browser_bridge_decide", { requestId, approved, reason: reason ?? null }),
   relayReply: (text: string) => invoke<void>("ui_relay_reply", { text }),
   webviewMode: (mode: "provider" | "chat") => invoke<void>("ui_webview_mode", { mode }),
   webviewRect: (x: number, y: number, w: number, h: number) => invoke<void>("ui_webview_rect", { x, y, w, h }),
+  syncViewport: () => invoke<void>("ui_sync_viewport"),
   termCreate: () => invoke<number>("ui_terminal_create"),
   termWrite: (id: number, data: string) => invoke<void>("ui_terminal_write", { id, data }),
   termResize: (id: number, rows: number, cols: number) => invoke<void>("ui_terminal_resize", { id, rows, cols }),

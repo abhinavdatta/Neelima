@@ -2,7 +2,7 @@
 
 export interface WorkspaceEntry { id: string; name: string; path: string }
 export interface WebProfile { id: string; adapter_id: string; name: string; url?: string | null }
-export interface LocalCfg { url: string; model?: string | null; context_chars?: number | null; temperature?: number | null; num_ctx?: number | null }
+export interface LocalCfg { url: string; model?: string | null; context_chars?: number | null; temperature?: number | null; num_ctx?: number | null; timeout_secs?: number | null }
 export interface Adapter {
   id: string; name: string; url: string; built_in: boolean; allowed_domain?: string;
   selectors: { input: string; send_button: string; stop_button?: string | null; messages: string; new_chat?: string | null; logged_in?: string | null; logged_out?: string | null };
@@ -18,14 +18,24 @@ export interface Settings {
   command_timeout_secs: number;
   shell?: string | null;
   hotkey: string;
+  /** Phase 3Q-2b: remembered width of the Files explorer split (CSS px). */
+  explorer_width?: number;
   workspaces: WorkspaceEntry[];
   active_workspace_id?: string | null;
   providers: { web: WebProfile[]; ollama?: LocalCfg | null; lmstudio?: LocalCfg | null };
+  /// Step 3: local, lexical project-context retrieval limits.
+  context?: { enabled: boolean; web_budget_tokens: number; local_budget_tokens: number; max_files: number };
   command_allow: string[];
   command_deny: string[];
   update_check_opt_in: boolean;
 }
-export interface CallRecord { id: string; tool: string; args: any; status: string; output: string }
+export interface CallRecord {
+  id: string; tool: string; args: any; status: string; output: string;
+  action_id?: string | null;
+  started_ms?: number | null;
+  duration_ms?: number | null;
+  exit_code?: number | null;
+}
 export interface DiffInfo { path: string; old: string; new: string }
 export interface TranscriptEntry {
   id: number; ts: number; kind: string; text: string;

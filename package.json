@@ -1,0 +1,13 @@
+{
+  "name": "neelima",
+  "private": true,
+  "scripts": {
+    "test:rust": "node scripts/test-rust.mjs",
+    "test:adapters": "node --test src-tauri/tests/adapter-runtime.test.js src-tauri/tests/adapter-runtime-jsdom.test.js src-tauri/tests/adapter-content.test.js",
+    "test:ui": "node --test ui/tests/provider-status.test.js ui/tests/provider-wait-card.test.js ui/tests/context-preview.test.js ui/tests/context-picker.test.js ui/tests/attachments.test.js ui/tests/agent-state.test.js ui/tests/file-edit.test.js ui/tests/uiPrimitives.test.js ui/tests/tabs-jsdom.test.js ui/tests/approval-lifecycle.test.js ui/tests/editorSetup.test.js ui/tests/editorHost-jsdom.test.js ui/tests/editorTabs.test.js ui/tests/editorTabs-jsdom.test.js ui/tests/savePipeline-jsdom.test.js ui/tests/fileTree.test.js ui/tests/fileTree-jsdom.test.js ui/tests/previewCache.test.js ui/tests/splitPane.test.js ui/tests/fileMenu.test.js ui/tests/workspace-switch.test.js ui/tests/agentChanges.test.js ui/tests/terminal.test.js ui/tests/terminal-jsdom.test.js ui/tests/executionHistory.test.js ui/tests/executionHistory-jsdom.test.js ui/tests/editorContext.test.js ui/tests/editorContext-composer-jsdom.test.js ui/tests/editorContext-selection-jsdom.test.js ui/tests/uiPrimitives.test.js",
+    "test:extension": "node --test browser-extension/tests/background.test.js browser-extension/tests/protocol.test.js browser-extension/tests/scan-scheduler.test.js browser-extension/tests/provider-content-script.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

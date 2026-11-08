@@ -1,0 +1,9 @@
+{
+  "name": "com.neelima.browser_bridge",
+  "description": "Neelima Browser Bridge Native Messaging Host",
+  "path": "%LOCALAPPDATA%\\Neelima\\neelima_native_host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://gcjjbofmdcdfdofapeefmdgkldpibokp/"
+  ]
+}

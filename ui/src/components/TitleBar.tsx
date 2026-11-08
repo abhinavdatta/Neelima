@@ -2,11 +2,12 @@ import { setState, useStore, toast } from "../store";
 import { cmd } from "../tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Icon } from "./Icon";
+import { isAgentRunning } from "../agentState";
 
 export function TitleBar() {
   const s = useStore();
   const workspace = s.activeWorkspacePath?.split(/[\\/]/).pop() ?? "Choose a project to begin";
-  const running = s.agentState !== "idle" && s.agentState !== "done" && s.agentState !== "error";
+  const running = isAgentRunning(s.agentState);
 
   return (
     <header class="titlebar">
